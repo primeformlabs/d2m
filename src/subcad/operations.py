@@ -3619,6 +3619,7 @@ class TubeProfileOp(HollowBoreOp):
 class NativeSurfaceOp(PureToleranceOp):
     """Fixed-axis surfaces cut by the selected physical cutter path."""
     process: str = "mill"
+    depth: float = 0.0
 
     def __post_init__(self):
         from .milling_replay import finite
@@ -3633,10 +3634,13 @@ class NativeSurfaceOp(PureToleranceOp):
         self.feeds_speeds = get_feeds_speeds(_resolve_fs_tool_type(self.tool.tool_type), self.tool.diameter, self.material)
 
     def apply(self, shape):
-        from .milling_replay import replay_pass
+        from .milling_replay import replay_pass, validate_cutter
+        validate_cutter(self.tool, cutting_depth=0)
         if self.face_selector != ">Z":
             raise ValueError("Native surface milling requires a positive Z setup. Another cutter axis needs an explicit path transform.")
         paths = self._surface_paths(shape)
+        self.depth = max(0, shape.val().BoundingBox().zmax - min(move.position[2]
+            for path in paths for move in path.moves if move.move_type in {"feed", "plunge"}))
         self._surface_toolpath = _new_toolpath(self.operation_name, self.tool, self.feeds_speeds,
             metadata={"coordinate_system": "part_mm", "tool_axis": [0, 0, 1], "cutter_compensation": "geometry_applied"})
         self._material_pass_states, self._pass_reports = [], []

@@ -18,6 +18,7 @@ def test_plane_removal_uses_the_absolute_stock_datum_and_retains_each_row():
     record = result.process_plan()["operations"][-1]
     assert record["geometry_fidelity"] == "exact_cutter_sweep"
     assert record["achieved_tolerance_estimate_mm"] is None
+    assert record["depth_mm"] == pytest.approx(3)
     assert len(result._state_history) == len(record["material_passes"]) + 1
     volumes = [state["shape"].val().Volume() for state in result._state_history]
     assert all(after <= before + 1e-7 for before, after in zip(volumes, volumes[1:]))
@@ -83,6 +84,25 @@ def test_surface_selection_uses_only_the_owned_inventory_scope():
     assert record["tool_selection"]["inventory_revision"] == "physical-inventory"
     with tool_inventory([], strict=True), pytest.raises(ValueError, match="flat_endmill"):
         Stock.rectangular(8, 8, 6).surface_mill({"type": "plane", "height_mm": 1})
+
+
+def test_surface_uses_shallow_owned_cutter_passes_instead_of_an_invented_initial_depth():
+    tool = ToolSpec("flat_endmill", 1, flute_length=0.5, stickout_mm=2, reach_mm=0.5,
+        catalog_id="OWNED-SHALLOW", physical_assembly={"owned": True})
+    with tool_inventory([tool], strict=True):
+        result = Stock.rectangular(4, 4, 4).surface_mill({"type": "plane", "height_mm": 1}, tolerance_mm=0.3)
+    assert result.volume == pytest.approx(48)
+    assert result.process_plan()["operations"][-1]["depth_mm"] == pytest.approx(1)
+
+
+@pytest.mark.parametrize("tool,reason", [
+    (ToolSpec("flat_endmill", float("nan")), "cutter diameter"),
+    (ToolSpec("flat_endmill", 2, flute_length=0), "flute length"),
+    (ToolSpec("flat_endmill", 2, corner_radius=0.5), "bull nose"),
+])
+def test_invalid_cutter_values_have_specific_reasons_before_path_generation(tool, reason):
+    with pytest.raises(ValueError, match=reason):
+        Stock.rectangular(8, 8, 6).surface_mill({"type": "plane", "height_mm": 1}, tool=tool)
 
 
 def test_dome_cuts_native_material_with_the_ball_cutter_and_retains_a_previous_hole():
