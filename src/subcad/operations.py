@@ -598,6 +598,7 @@ class FaceMillOp(MachiningOperation):
                     min_diameter_mm=10.0,
                     min_flute_length_mm=self.depth,
                     feature="face_mill",
+                    alternative_tool_types=("face_mill",),
                     reason="prefer widest available tool for facing",
                     prefer_largest=True,
                 ),

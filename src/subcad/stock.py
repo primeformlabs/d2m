@@ -34,6 +34,7 @@ from .geometry import (
 from .process_plan import ProcessPlan
 from .profiles import profile_span_yx
 from .tool_library import ToolSpec
+from .tool_selection import validate_inventory_tool
 
 
 def _profile_bounds_for_stock(profile) -> tuple[float, float]:
@@ -150,6 +151,7 @@ class Stock:
 
     def _apply_op(self, op) -> "Stock":
         """Apply a machining operation: modify shape, record in plan, return new Stock."""
+        validate_inventory_tool(getattr(op, "tool", None), depth=getattr(op, "depth", 0.0))
         if getattr(op, "sequence_number", 0) == 0:
             op.sequence_number = self._next_op_number
 

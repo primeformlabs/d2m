@@ -73,6 +73,7 @@ class ToolSpec:
     replacement_cost: float = 0.0
     expected_life_minutes: float = 0.0
     cost_per_cutting_min: float = 0.0
+    physical_assembly: Optional[dict] = None
 
     @property
     def radius(self) -> float:
@@ -105,7 +106,9 @@ class ToolSpec:
             "replacement_cost": self.replacement_cost,
             "expected_life_minutes": self.expected_life_minutes,
             "cost_per_cutting_min": self.cost_per_cutting_min,
-            "assembly": self.default_assembly().to_dict(),
+            "assembly": dict(self.physical_assembly) if self.physical_assembly is not None else {
+                **self.default_assembly().to_dict(), "geometry_status": "approximate", "owned": False,
+            },
             "label": self.label,
         }
 

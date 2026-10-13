@@ -13,7 +13,7 @@ python -m pip wheel --no-deps . --wheel-dir dist
 Install the wheel in the CAD environment:
 
 ```text
-python -m pip install --no-deps dist/d2o_subcad-0.2.0-py3-none-any.whl
+python -m pip install --no-deps dist/d2o_subcad-0.2.2-py3-none-any.whl
 ```
 
 Use `from subcad import Stock` from an installed package.
@@ -50,3 +50,23 @@ The operation plan does not claim an achieved tolerance without measurement or v
 Milling pocket roughing uses the cutter radius and retains the corner material that its tool cannot remove.
 The separate finish operation removes that material with its own tool.
 A requested sharp inside corner receives a specific review reason.
+
+Version 0.2.2 adds an isolated inventory scope for each preview:
+
+```python
+from subcad import Stock, ToolSpec, tool_inventory
+
+with tool_inventory(owned_tools, revision=inventory_hash, strict=True):
+    result = Stock.rectangular(30, 30, 20).pocket(
+        width=12, length=15, depth=3, corner_radius=3)
+```
+
+The caller supplies `owned_tools` from its qualified physical assemblies.
+The scope copies the tools and preserves the inventory revision in each selection result.
+Concurrent previews do not change the shared catalogue.
+Strict selection rejects missing tools and unlisted explicit cutters.
+Flute length and projection must cover the required cutting depth.
+A missing finishing cutter stops the operation.
+Actual holder metadata remains in `ToolSpec.physical_assembly`.
+Generated holder metadata has `owned=false` and `geometry_status=approximate`.
+This selection scope does not verify feeds, fixtures, or manufacturing readiness.
