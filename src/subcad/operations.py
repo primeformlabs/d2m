@@ -3327,16 +3327,36 @@ class TurningOp(PureToleranceOp):
             rpm = turning_geometry.finite(rpm, "spindle speed", positive=True)
         if metadata.get("requires_spindle_phase") and rpm is not None:
             feed = turning_geometry.finite(metadata["pitch_mm"], "thread pitch", positive=True) * rpm
+        direction = self.feeds_speeds.get("spindle_direction")
+        phase = self.feeds_speeds.get("spindle_phase_start_radians")
+        if direction is not None and (isinstance(direction, bool) or direction not in {-1, 1}):
+            raise ValueError("The spindle direction must be +1 or -1 in the spindle frame.")
+        if phase is not None:
+            phase = turning_geometry.finite(phase, "spindle phase")
+        phase_available = direction is not None and phase is not None and rpm is not None and feed is not None
         path = Toolpath(self.operation_name, tool_type=self.tool.tool_type, tool_diameter_mm=self.tool.diameter,
             feed_mm_min=feed, spindle_rpm=rpm, metadata={"process": "turn", "spindle_axis": self.axis,
                 "spindle_origin_mm": list(self.origin), "coordinate_system": "part_mm", "radius_mode": True,
                 "verification_status": "not_verified", "requires_owned_tool": self.requires_owned_tool,
                 "requires_feed_speed_release": feed is None or rpm is None,
                 "tool_compensation": "not_applied", "roughing_passes": "not_generated", **metadata})
+        bounds = self._incoming_bounds
+        path.metadata.update(stock_to_spindle_matrix=turning_geometry.stock_to_spindle_matrix(self.axis, self.origin),
+            incoming_spindle_bounds_mm={"min": [bounds.xmin, bounds.ymin, bounds.zmin],
+                "max": [bounds.xmax, bounds.ymax, bounds.zmax]},
+            spindle_phase_status="recorded" if phase_available else "unavailable",
+            spindle_direction=direction, spindle_phase_reference="positive_local_X",
+            source="cam_intent")
         for kind, radius, axial in points:
             path.append(ToolpathMove(kind, turning_geometry.spindle_point_to_world(radius, axial, self.axis, self.origin),
                 feed=feed if kind == "feed" else None, spindle_rpm=rpm,
                 metadata={"spindle_radius_mm": radius, "spindle_z_mm": axial}))
+        if phase_available:
+            for index, move in enumerate(path.moves):
+                if index:
+                    minutes = move.time_minutes_from(path.moves[index - 1], feed, path.rapid_rate_mm_min)
+                    phase += direction * rpm * math.tau * minutes
+                move.metadata["spindle_phase_radians"] = phase
         return path
 
 
@@ -3468,8 +3488,12 @@ class TurnThreadOp(TurningOp):
         depth = self.thread_depth if self.thread_depth is not None else self.pitch / 2
         radius = self.diameter / 2 if self.internal else self.diameter / 2 - depth
         clearance = max(0, radius - depth - 2) if self.internal else self._incoming_radius + 2
-        return self._path([("rapid", clearance, self._front + self.pitch), ("rapid", radius, self._front),
-            ("feed", radius, self._front - self.length), ("retract", clearance, self._front - self.length)],
+        sign = self.feeds_speeds.get("spindle_direction")
+        increasing = sign in {-1, 1} and sign * (1 if self.left_handed else -1) > 0
+        start, end = (self._front - self.length, self._front) if increasing else (self._front, self._front - self.length)
+        approach = start - self.pitch if increasing else start + self.pitch
+        return self._path([("rapid", clearance, approach), ("rapid", radius, start),
+            ("feed", radius, end), ("retract", clearance, end)],
             strategy="synchronized_threading", pitch_mm=self.pitch, left_handed=self.left_handed, requires_spindle_phase=True)
 
     def to_dict(self) -> dict:

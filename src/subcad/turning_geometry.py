@@ -54,6 +54,19 @@ def spindle_point_to_world(radius: float, axial: float, axis: str = "Z", origin:
     return tuple(value + offset for value, offset in zip(points[axis], origin))
 
 
+def stock_to_spindle_matrix(axis: str = "Z", origin: Any = (0, 0, 0)) -> list[float]:
+    """Column-major rigid transform matching to_spindle, including its radial plane."""
+    axis, origin = frame(axis, origin)
+    rows = {"Z": ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+        "X": ((0, 0, -1), (0, 1, 0), (1, 0, 0)),
+        "-X": ((0, 0, 1), (0, 1, 0), (-1, 0, 0)),
+        "Y": ((1, 0, 0), (0, 0, -1), (0, 1, 0)),
+        "-Y": ((1, 0, 0), (0, 0, 1), (0, -1, 0)),
+        "-Z": ((1, 0, 0), (0, -1, 0), (0, 0, -1))}[axis]
+    return [value for column in range(3) for value in (*[row[column] for row in rows], 0)] + [
+        *[-sum(value * offset for value, offset in zip(row, origin)) for row in rows], 1]
+
+
 def checked(shape: Any, previous: Any) -> Any:
     if not shape.solids().vals() or not shape.val().isValid() or shape.val().Volume() <= 1e-9:
         raise ValueError("The Turning operation leaves no valid material.")
