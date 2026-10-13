@@ -466,16 +466,24 @@ def face_mill_cut(shape: "cq.Workplane", depth: float, *, face_selector: str = "
     if depth <= 0.001:
         return shape  # nothing to remove
 
+    if face_selector not in {">X", "<X", ">Y", "<Y", ">Z", "<Z"}:
+        raise ValueError("Face milling requires a cardinal stock face.")
+    if not math.isfinite(depth):
+        raise ValueError("The facing depth must be finite.")
     bbox = shape.val().BoundingBox()
-    # Cover the entire top face with a slightly oversized rectangle
-    face_length = (bbox.xmax - bbox.xmin) + 2.0
-    face_width = (bbox.ymax - bbox.ymin) + 2.0
-
-    return (
-        shape.faces(face_selector).workplane()
-        .rect(face_length, face_width)
-        .cutBlind(-depth)
-    )
+    dimensions = [bbox.xlen, bbox.ylen, bbox.zlen]
+    centers = [(bbox.xmin + bbox.xmax) / 2,
+               (bbox.ymin + bbox.ymax) / 2,
+               (bbox.zmin + bbox.zmax) / 2]
+    normal = "XYZ".index(face_selector[1])
+    sign = 1 if face_selector[0] == ">" else -1
+    if depth >= dimensions[normal]:
+        raise ValueError("The facing depth must preserve remaining stock.")
+    centers[normal] += sign * (dimensions[normal] - depth) / 2
+    dimensions = [value + 2.0 if index != normal else depth
+                  for index, value in enumerate(dimensions)]
+    cutter = cq.Workplane("XY").box(*dimensions).translate(tuple(centers))
+    return shape.cut(cutter)
 
 
 def rectangular_pocket_cut(

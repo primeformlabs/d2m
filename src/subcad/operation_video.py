@@ -649,7 +649,7 @@ def _operation_moves(op: dict, mesh_bbox: dict) -> list[dict]:
     elif isinstance(data, list):
         records = data
 
-    if not records:
+    if not records and op.get("toolpath_status") != "unavailable":
         try:
             from .stock import _op_to_simple_toolpath
 
@@ -658,10 +658,25 @@ def _operation_moves(op: dict, mesh_bbox: dict) -> list[dict]:
             records = []
 
     moves = []
-    top_z = 0.0 if isinstance(data, dict) and data.get("metadata", {}).get("coordinate_system") == "part_mm" else float(mesh_bbox.get("z_max", 0.0))
+    metadata = data.get("metadata", {}) if isinstance(data, dict) else {}
+    coordinate_system = metadata.get("coordinate_system")
+    top_z = 0.0 if coordinate_system in {"part_mm", "stock_mm"} else float(mesh_bbox.get("z_max", 0.0))
+    tool_frame = metadata.get("tool_frame")
+    orientation = None
+    if tool_frame:
+        import numpy as np
+        from scipy.spatial.transform import Rotation
+
+        matrix = np.column_stack([tool_frame[key] for key in ("x_axis", "y_axis", "z_axis")])
+        x, y, z, w = Rotation.from_matrix(matrix).as_quat()
+        orientation = [float(w), float(x), float(y), float(z)]
     for record in records:
         normalized = _normalize_move(record, top_z)
         if normalized is not None:
+            if coordinate_system == "stock_mm":
+                normalized["coordinate_system"] = coordinate_system
+            if orientation is not None:
+                normalized["pose"]["orientation"] = orientation[:]
             moves.append(normalized)
     return moves
 
@@ -899,6 +914,8 @@ def _is_cutting_move(move: dict, end_position: list[float]) -> bool:
     move_type = _move_type(move)
     if move_type not in _CUTTING_MOVES:
         return False
+    if move.get("coordinate_system") == "stock_mm":
+        return bool(end_position)
     program = move.get("program_position") or []
     if len(program) >= 3:
         return float(program[2]) <= 0.0

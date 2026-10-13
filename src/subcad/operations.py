@@ -25,6 +25,7 @@ import math
 from typing import Any, Optional, Tuple
 
 from .geometry import (
+    compute_bounding_box,
     face_mill_cut,
     rectangular_pocket_cut,
     sloped_rectangular_cut,
@@ -53,6 +54,7 @@ from .tool_library import ToolSpec, ToolCatalog
 from .tool_selection import ToolRequirement, ToolSelectionResult, select_or_fallback, select_tool
 from .material import get_feeds_speeds
 from .toolpath import Toolpath, ToolpathMove
+from .face_motion import FaceMotionFrame, rounded_contour
 from . import turning_geometry
 
 # ---------------------------------------------------------------------------
@@ -614,6 +616,7 @@ class FaceMillOp(MachiningOperation):
     # ------------------------------------------------------------------
 
     def apply(self, shape):
+        self._motion_frame = FaceMotionFrame(compute_bounding_box(shape), self.face_selector)
         return face_mill_cut(shape, self.depth, face_selector=self.face_selector)
 
     def to_dict(self) -> dict:
@@ -637,40 +640,51 @@ class FaceMillOp(MachiningOperation):
 
     def to_toolpath(self) -> Toolpath:
         stepover = self.stepover if self.stepover is not None else _tool_stepover(self.tool, 0.7, 0.1)
-        span_x = max(self.tool.diameter * 4.0, stepover * 4.0)
-        span_y = max(self.tool.diameter * 2.0, stepover * 2.0)
+        frame = getattr(self, "_motion_frame", None)
+        if frame is None:
+            raise ValueError("Apply face milling to the incoming stock before creating its toolpath.")
+        if not math.isfinite(self.depth) or self.depth <= 0.001:
+            raise ValueError("The facing depth does not produce a material-removal path.")
+        if self.tool.diameter <= 0 or not math.isfinite(stepover) or not 0 < stepover <= self.tool.diameter:
+            raise ValueError("The facing stepover must be positive and no greater than the cutter diameter.")
+        umin, umax, vmin, vmax = frame.footprint
+        radius = self.tool.radius
+        x0, x1 = umin - radius, umax + radius
+        span_x, span_y = umax - umin, vmax - vmin
         tp = _new_toolpath(
             "face_mill",
             self.tool,
             self.feeds_speeds,
             metadata={
-                "nominal_span_x_mm": span_x,
-                "nominal_span_y_mm": span_y,
+                "stock_span_x_mm": span_x,
+                "stock_span_y_mm": span_y,
                 "tool_selection": _tool_selection_dict(self.tool_selection),
             },
         )
         feed = _feed_rate(self.feeds_speeds)
-        y = -span_y / 2.0
+        # Include both edges. Never leave an uncovered final lane.
+        lanes = max(1, math.ceil(span_y / stepover))
+        lane_y = [vmin + span_y * index / lanes for index in range(lanes + 1)]
+        y = lane_y[0]
         direction = 1
         lane_count = 0
-        _move(tp, "rapid", -span_x / 2.0, y, tp.safe_z)
-        _move(tp, "plunge", -span_x / 2.0, y, -abs(self.depth), feed=feed)
-        while y <= span_y / 2.0 + 1e-9:
+        _move(tp, "rapid", x0, y, tp.safe_z)
+        _move(tp, "plunge", x0, y, -abs(self.depth), feed=feed)
+        for index, y in enumerate(lane_y):
             lane_count += 1
-            x = span_x / 2.0 if direction > 0 else -span_x / 2.0
+            x = x1 if direction > 0 else x0
             _move(tp, "feed", x, y, -abs(self.depth), feed=feed)
-            y += stepover
-            if y <= span_y / 2.0 + 1e-9:
-                _move(tp, "feed", x, y, -abs(self.depth), feed=feed)
+            if index < lanes:
+                _move(tp, "feed", x, lane_y[index + 1], -abs(self.depth), feed=feed)
             direction *= -1
         _move(tp, "retract", tp.moves[-1].position[0], tp.moves[-1].position[1], tp.safe_z)
-        return _attach_pass_plan(tp, _pass_plan(
+        return frame.bind(_attach_pass_plan(tp, _pass_plan(
             strategy="face_mill",
             tool=self.tool,
             depth_levels=[-abs(self.depth)],
             lane_count=lane_count,
             pass_type="facing",
-        ))
+        )))
 
 
 # ---------------------------------------------------------------------------
@@ -755,6 +769,7 @@ class PocketOp(MachiningOperation):
     def apply(self, shape):
         if self.tool.diameter <= 0 or self.tool.diameter > min(self.width, self.length):
             raise ValueError("The milling cutter does not fit the pocket opening.")
+        self._motion_frame = FaceMotionFrame(compute_bounding_box(shape), self.face_selector)
         result = rectangular_pocket_cut(
             shape,
             self.cx, self.cy,
@@ -803,8 +818,21 @@ class PocketOp(MachiningOperation):
     def to_toolpath(self) -> Toolpath:
         stepover = _tool_stepover(self.tool, 0.5, 0.1)
         stepdown = _tool_stepdown(self.tool, 0.5, 0.5)
-        half_w = max(self.width / 2.0 - self.tool.radius, 0.0)
-        half_l = max(self.length / 2.0 - self.tool.radius, 0.0)
+        if self.tool.diameter <= 0 or self.tool.diameter > min(self.width, self.length):
+            raise ValueError("The milling cutter does not fit the pocket opening.")
+        half_x = max(self.length / 2.0 - self.tool.radius, 0.0)
+        half_y = max(self.width / 2.0 - self.tool.radius, 0.0)
+        contour_radius = max(self.corner_radius, self.tool.radius) - self.tool.radius
+        chord_error = 0.002
+        frame = getattr(self, "_motion_frame", None)
+        depth = self.depth
+        if self.base_height is not None:
+            if frame is None:
+                raise ValueError("A pocket base height requires the incoming stock bounds.")
+            height = frame.bounds["z_max"] - frame.bounds["z_min"]
+            depth = height - self.base_height
+            if depth > self.depth + 1e-9:
+                raise ValueError("The pocket cut does not reach the access face. Its toolpath is unavailable.")
         tp = _new_toolpath(
             "finish_pocket" if self.pass_role == "finishing" else "rough_pocket",
             self.tool,
@@ -814,23 +842,26 @@ class PocketOp(MachiningOperation):
                 "length_mm": self.length,
                 "tool_selection": _tool_selection_dict(self.tool_selection),
                 "following_finish_operation": self.finish_op is not None,
+                "coordinate_system": "face_local_mm",
+                "chord_error_mm": chord_error,
             },
         )
         feed = _feed_rate(self.feeds_speeds)
         _move(tp, "rapid", self.cx, self.cy, tp.safe_z)
-        depth_levels = _depth_levels(self.depth, stepdown)
+        depth_levels = _depth_levels(depth, stepdown)
+        final_inset = min(half_x, half_y)
+        insets = [0.0]
+        while insets[-1] < final_inset - 1e-9:
+            insets.append(min(insets[-1] + stepover, final_inset))
         max_lanes = 1
         for z in depth_levels:
             _move(tp, "plunge", self.cx, self.cy, z, feed=feed)
-            inset = 0.0
             lane_count = 0
-            while inset <= min(half_w, half_l) + 1e-9:
+            for inset in insets:
                 lane_count += 1
-                x0, x1 = self.cx - half_w + inset, self.cx + half_w - inset
-                y0, y1 = self.cy - half_l + inset, self.cy + half_l - inset
-                for x, y in ((x1, y0), (x1, y1), (x0, y1), (x0, y0), (x1, y0)):
-                    _move(tp, "feed", x, y, z, feed=feed)
-                inset += stepover
+                for x, y in rounded_contour(half_x - inset, half_y - inset,
+                                            contour_radius - inset, chord_error):
+                    _move(tp, "feed", self.cx + x, self.cy + y, z, feed=feed)
             max_lanes = max(max_lanes, lane_count)
             _move(tp, "feed", self.cx, self.cy, z, feed=feed)
         _move(tp, "retract", self.cx, self.cy, tp.safe_z)
@@ -846,7 +877,8 @@ class PocketOp(MachiningOperation):
         if self.pass_role == "finishing":
             pass_plan["finishing_passes"] = pass_plan["roughing_passes"]
             pass_plan["roughing_passes"] = 0
-        return _attach_pass_plan(tp, pass_plan)
+        tp = _attach_pass_plan(tp, pass_plan)
+        return frame.bind(tp) if frame is not None else tp
 
 
 @dataclass
