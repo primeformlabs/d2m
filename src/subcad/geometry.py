@@ -635,18 +635,8 @@ def drill_hole(
     if not _HAS_CADQUERY:
         raise RuntimeError("cadquery is not available")
 
-    cx_rel, cy_rel = _to_face_coords(shape, face_selector, cx, cy)
-
-    try:
-        wp = _selected_face_workplane(shape, face_selector).center(cx_rel, cy_rel).circle(diameter / 2.0)
-        if through:
-            return wp.cutThruAll()
-        else:
-            return wp.cutBlind(-depth)
-    except Exception:
-        if face_selector in {">Y", "<Y", ">X", "<X"}:
-            return _side_drill_fallback(shape, cx, cy, diameter, depth, through, face_selector)
-        raise
+    from .drill_geometry import drill_cut
+    return drill_cut(shape, cx, cy, diameter, depth, through, face_selector=face_selector)
 
 
 def countersink_cut(

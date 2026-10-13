@@ -3,6 +3,8 @@ import math
 from pathlib import Path
 import tempfile
 
+import cadquery as cq
+
 import subcad
 from subcad import Stock, ToolSpec, compare_to_target, get_feeds_speeds, list_materials, to_sim_tool
 from simulation.material_removal import MaterialRemovalEngine
@@ -32,4 +34,9 @@ with tempfile.TemporaryDirectory() as directory:
     result.to_stl(str(path))
     assert path.stat().st_size > 100
 
-print("Installed runtime: imports, material rules, tool conversion, target comparison, native pockets, Turning states, operation plans, and STL export pass.")
+curved = Stock.round_bar(40, 20, axis="X").turn_od(18, 40)
+cross_drilled = curved.drill(diameter=4, depth=20, through=True, face_selector=">Z", spot_drill=False)
+finished = cross_drilled.turn_od(16, 40)
+assert finished.volume < math.pi * 8 ** 2 * 40
+assert not finished._shape.val().isInside(cq.Vector(0, 0, 0))
+print("Installed runtime: imports, material rules, tool conversion, target comparison, native pockets, Turning states, curved-stock drilling, operation plans, and STL export pass.")
