@@ -938,9 +938,13 @@ def profile_contour_cut(
     *,
     side: str = "outside",
     face_selector: str = ">Z",
+    tool=None,
+    stepdown: float = 1.0,
 ) -> "cq.Workplane":
-    """Contour an arbitrary profile; current B-Rep cut uses profile pocket CSG."""
-    return profile_pocket_cut(shape, profile, depth, face_selector=face_selector, through=False)
+    """Cut the selected cutter channel without discarding uncut material."""
+    from .profile_milling import run_profile_contour
+    return run_profile_contour(shape, profile, depth=depth, side=side,
+        face_selector=face_selector, tool=tool, stepdown=stepdown)[0]
 
 
 def thin_wall_pocket_cut(

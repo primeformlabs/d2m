@@ -2871,29 +2871,75 @@ class ProfileCutoutOp(ProfilePocketOp):
 
 @dataclass
 class ProfileContourOp(ContourOp):
-    """Arbitrary profile contour operation."""
+    """Selected-cutter contour channel on the requested profile side."""
 
     profile: Any = field(default_factory=dict)
     side: str = "outside"
+    finish_allowance: float = 0.1
+    chord_error: float = 0.01
+
+    def __post_init__(self):
+        from .milling_replay import finite
+        finite(self.depth, "contour depth", positive=True)
+        finite(self.stepdown, "contour stepdown", positive=True)
+        if self.side not in {"inside", "outside"}:
+            raise ValueError("The profile contour side must be inside or outside.")
+        if self.tool is None:
+            width, length = _profile_bounds(self.profile)
+            maximum = min(width, length) * 0.8 if self.side == "inside" else None
+            self.tool, self.tool_selection = _select_inventory_tool(
+                ToolRequirement("flat_endmill", max_diameter_mm=maximum,
+                    min_flute_length_mm=self.depth, feature="profile_contour",
+                    reason="selected cutter for the compensated profile contour", prefer_largest=True),
+                ToolSpec("flat_endmill", min(10, maximum) if maximum is not None else 10))
+        self.feeds_speeds = get_feeds_speeds(_resolve_fs_tool_type(self.tool.tool_type), self.tool.diameter, self.material)
+        self.position = None
 
     def apply(self, shape):
-        return profile_contour_cut(
-            shape,
-            self.profile,
-            self.depth,
-            side=self.side,
-            face_selector=self.face_selector,
-        )
+        from .profile_milling import run_profile_contour
+        result, self._contour_toolpath, self._material_pass_states, self._pass_reports = run_profile_contour(
+            shape, self.profile, tool=self.tool, depth=self.depth, side=self.side,
+            face_selector=self.face_selector, stepdown=self.stepdown, finish_allowance=self.finish_allowance,
+            chord_error=self.chord_error, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds))
+        self._contour_toolpath.metadata["tool"] = _tool_dict(self.tool)
+        self._contour_toolpath.metadata["tool_selection"] = _tool_selection_dict(self.tool_selection)
+        return result
+
+    def to_toolpath(self):
+        if not hasattr(self, "_contour_toolpath"):
+            raise ValueError("The profile contour path requires the incoming material state.")
+        return self._contour_toolpath
 
     def to_dict(self) -> dict:
         data = super().to_dict()
+        passes = getattr(self, "_pass_reports", [])
+        reasons = [
+            "The contour cuts a cutter-width channel. Exterior waste and interior material remain until a separate removal operation.",
+            "Contour entry requires a verified entry or an existing opening.",
+            "The contour requires independent target, fixture, feed, and spindle verification.",
+        ]
+        if self.side == "inside":
+            reasons.append("The selected cutter leaves inside corner material. Sharp inside corners require another operation.")
+        if any(row["profile_fidelity"] == "linearized_curve" for row in passes):
+            reasons.append("Curved contour paths use linear segments. The requested part tolerance is not verified.")
+        if not (self.tool.physical_assembly or {}).get("owned"):
+            reasons.append("The contour requires an owned physical cutter assembly.")
         data.update({
             "operation": "profile_contour",
             "profile": _profile_payload(self.profile),
             "side": self.side,
             "process": "mill",
             "coverage_family": "arbitrary_profile_2_5d",
-            "manufacturing_completeness": "pure_operation",
+            "manufacturing_completeness": "requires_validation",
+            "geometry_status": "requires_review",
+            "geometry_fidelity": "linearized_profile_cutter_replay" if any(row["profile_fidelity"] == "linearized_curve" for row in passes) else "exact_cutter_sweep",
+            "toolpath_status": "unverified",
+            "achieved_tolerance_estimate_mm": None,
+            "cutter_compensation": "geometry_applied",
+            "finish_allowance_mm": self.finish_allowance,
+            "chord_error_mm": self.chord_error,
+            "material_passes": passes,
+            "review_reasons": reasons,
         })
         return data
 
