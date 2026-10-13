@@ -3245,7 +3245,7 @@ class PureToleranceOp(MachiningOperation):
         )
 
     def apply(self, shape):
-        return shape
+        raise ValueError(f"The {self.operation_name} operation has no native material-removal implementation.")
 
     def to_dict(self) -> dict:
         return {
@@ -3255,17 +3255,17 @@ class PureToleranceOp(MachiningOperation):
             "path": _profile_payload(self.path),
             "strategy": self.strategy,
             "target_tolerance_mm": self.tolerance_mm,
-            "achieved_tolerance_estimate_mm": self.tolerance_mm,
+            "achieved_tolerance_estimate_mm": None,
             "sampling_resolution_mm": max(self.tolerance_mm / 2.0, 0.01),
             "surface_strategy": self.strategy,
-            "verification_status": "requires_target_compare",
+            "verification_status": "not_verified",
             "depth_mm": self.depth,
             "tool_type": self.tool.tool_type,
             "tool_diameter_mm": self.tool.diameter,
             "tool": _tool_dict(self.tool),
             "feeds_speeds": self.feeds_speeds if "error" not in self.feeds_speeds else None,
             "coverage_family": "pure_tolerance_machining",
-            "manufacturing_completeness": "pure_operation",
+            "manufacturing_completeness": "requires_validation",
         }
 
     def to_toolpath(self) -> Toolpath:
@@ -3510,6 +3510,13 @@ class MillTurnSetupOp(PureToleranceOp):
     axis: str = "Z"
     work_offset: str = "G54"
 
+    def apply(self, shape):
+        # Setup instructions do not remove material.
+        return shape
+
+    def to_toolpath(self):
+        return []
+
     def to_dict(self) -> dict:
         data = super().to_dict()
         data.update({"axis": self.axis, "work_offset": self.work_offset})
@@ -3665,15 +3672,116 @@ class TubeProfileOp(HollowBoreOp):
 
 
 @dataclass
-class SurfaceMillOp(PureToleranceOp):
+class NativeSurfaceOp(PureToleranceOp):
+    """Fixed-axis surfaces cut by the selected physical cutter path."""
+    process: str = "mill"
+    depth: float = 0.0
+
+    def __post_init__(self):
+        from .milling_replay import finite
+        finite(self.tolerance_mm, "surface tolerance", positive=True)
+        if self.tool is None:
+            reference = getattr(self, "surface_ref", {})
+            kind = "flat_endmill" if isinstance(reference, dict) and reference.get("type") == "plane" else "ball_endmill"
+            self.tool, self.tool_selection = _select_inventory_tool(
+                ToolRequirement(kind, max_diameter_mm=6, feature=self.operation_name,
+                    reason="selected cutter for native fixed-axis surface replay", prefer_largest=True),
+                ToolSpec(kind, 6, inventory_count=0))
+        self.feeds_speeds = get_feeds_speeds(_resolve_fs_tool_type(self.tool.tool_type), self.tool.diameter, self.material)
+
+    def apply(self, shape):
+        from .milling_replay import replay_pass, validate_cutter
+        validate_cutter(self.tool, cutting_depth=0)
+        if self.face_selector != ">Z":
+            raise ValueError("Native surface milling requires a positive Z setup. Another cutter axis needs an explicit path transform.")
+        paths = self._surface_paths(shape)
+        self.depth = max(0, shape.val().BoundingBox().zmax - min(move.position[2]
+            for path in paths for move in path.moves if move.move_type in {"feed", "plunge"}))
+        self._surface_toolpath = _new_toolpath(self.operation_name, self.tool, self.feeds_speeds,
+            metadata={"coordinate_system": "part_mm", "tool_axis": [0, 0, 1], "cutter_compensation": "geometry_applied"})
+        self._material_pass_states, self._pass_reports = [], []
+        result, cumulative_sweep = shape, None
+        for index, path in enumerate(paths, 1):
+            start = len(self._surface_toolpath.moves)
+            before = result.val().Volume()
+            source = result if self.tool.tool_type == "flat_endmill" else shape
+            previous = None if self.tool.tool_type == "flat_endmill" else cumulative_sweep
+            result, report, cumulative_sweep = replay_pass(source, path, self.tool,
+                sample_interval_mm=path.metadata["sample_interval_mm"], previous_sweep=previous, return_sweep=True)
+            self._surface_toolpath.moves.extend(path.moves)
+            report.update(pass_index=index, pass_role=path.metadata["pass_role"], move_start_index=start,
+                move_end_index=len(self._surface_toolpath.moves), removed_volume_mm3=before - result.val().Volume())
+            self._pass_reports.append(report)
+            self._material_pass_states.append({"shape": result, "pass_index": index, "pass_role": path.metadata["pass_role"],
+                "label": f"After {self.operation_name} pass {index}", "geometry_replay": report})
+        if shape.val().Volume() - result.val().Volume() <= 1e-8:
+            raise ValueError("The surface path does not remove material from the incoming stock.")
+        self._surface_toolpath.metadata["material_passes"] = self._pass_reports
+        return result
+
+    def _raster_passes(self, bounds, tip_height):
+        from .milling_replay import finite, raster_paths
+        maximum = finite((self.tool.safe_limits or {}).get("max_stepdown_mm", self.tool.diameter / 2),
+            "maximum surface stepdown", positive=True)
+        maximum = min(maximum, self.tool.diameter / 2)
+        # Determine the required lower plane from the actual surface envelope.
+        # Each level retains high target regions; it never flattens the dome.
+        lower = min(tip_height(bounds.xmin, bounds.ymin), tip_height(bounds.xmax, bounds.ymax))
+        depth = max(0, bounds.zmax - lower)
+        levels = max(1, math.ceil(depth / maximum))
+        if levels > 100:
+            raise ValueError("The surface exceeds the native depth-pass limit. Divide the operation into smaller regions.")
+        paths = []
+        for level in range(1, levels + 1):
+            limit = bounds.zmax - depth * level / levels
+            rows = raster_paths(bounds, lambda x, y: max(limit, tip_height(x, y)), tool=self.tool,
+                operation=self.operation_name, tolerance_mm=self.tolerance_mm,
+                feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds))
+            for row in rows:
+                row.metadata.update(pass_role="finishing" if level == levels else "roughing",
+                    depth_level_index=level, maximum_stepdown_mm=maximum)
+            paths.extend(rows)
+            if len(paths) > 1000:
+                raise ValueError("The surface exceeds the native pass-state limit. Divide the operation into smaller regions.")
+        return paths
+
+    def to_toolpath(self):
+        if not hasattr(self, "_surface_toolpath"):
+            raise ValueError("The native surface path requires the incoming material state.")
+        return self._surface_toolpath
+
+    def to_dict(self):
+        data = super().to_dict()
+        passes = getattr(self, "_pass_reports", [])
+        sampled = any(row["geometry_fidelity"] == "sampled_cutter" for row in passes)
+        reasons = ["The surface path requires independent target, fixture, feed, and spindle verification."]
+        if sampled:
+            reasons.append("Variable-height cutter moves use pose sampling. The requested surface tolerance is not verified.")
+        if not (self.tool.physical_assembly or {}).get("owned"):
+            reasons.append("The surface operation requires an owned physical cutter assembly.")
+        data.update(geometry_status="requires_review", geometry_fidelity="sampled_cutter" if sampled else "exact_cutter_sweep",
+            review_reasons=reasons, material_passes=passes, manufacturing_completeness="requires_validation",
+            toolpath_status="unverified", cutter_compensation="geometry_applied", face_selector=self.face_selector)
+        return data
+
+
+@dataclass
+class SurfaceMillOp(NativeSurfaceOp):
     operation_name: str = "surface_mill"
-    process: str = "5axis"
     surface_ref: Any = field(default_factory=dict)
 
-    def to_dict(self) -> dict:
-        data = super().to_dict()
-        data.update({"surface_ref": _profile_payload(self.surface_ref)})
-        return data
+    def _surface_paths(self, shape):
+        from .milling_replay import finite
+        if not isinstance(self.surface_ref, dict) or self.surface_ref.get("type") != "plane":
+            raise ValueError("The surface requires explicit geometry. Native SurfaceMillOp accepts type plane and height_mm; unresolved references are unavailable.")
+        height = finite(self.surface_ref.get("height_mm"), "surface height")
+        bounds = shape.val().BoundingBox()
+        if not bounds.zmin < height < bounds.zmax:
+            raise ValueError("The surface height must lie inside the incoming material bounds.")
+        return self._raster_passes(bounds, lambda x, y: height)
+
+    def to_dict(self):
+        return {**super().to_dict(), "surface_ref": _profile_payload(self.surface_ref)}
 
 
 @dataclass
@@ -3695,13 +3803,41 @@ class LoftMillOp(PureToleranceOp):
 
 
 @dataclass
-class DomeMillOp(PureToleranceOp):
+class DomeMillOp(NativeSurfaceOp):
     operation_name: str = "dome_mill"
-    process: str = "5axis"
+    process: str = "mill"
     radius: float = 5.0
     height: float = 2.0
     cx: float = 0.0
     cy: float = 0.0
+
+    def _surface_paths(self, shape):
+        from .milling_replay import finite
+        radius = finite(self.radius, "dome base radius", positive=True)
+        height = finite(self.height, "dome height", positive=True)
+        cx, cy = finite(self.cx, "dome X position"), finite(self.cy, "dome Y position")
+        if height > radius:
+            raise ValueError("A fixed-axis dome height cannot exceed its base radius. The overhang requires another setup.")
+        if self.tool.tool_type != "ball_endmill":
+            raise ValueError("Dome milling requires a ball end mill for cutter compensation.")
+        bounds = shape.val().BoundingBox()
+        if height >= bounds.zlen:
+            raise ValueError("The dome height must leave material below its base.")
+        if cx - radius < bounds.xmin or cx + radius > bounds.xmax or cy - radius < bounds.ymin or cy + radius > bounds.ymax:
+            raise ValueError("The complete dome footprint must lie inside the incoming stock bounds.")
+        sphere_radius = (radius * radius + height * height) / (2 * height)
+        base = bounds.zmax - height
+        sphere_center = base + height - sphere_radius
+        cutter_radius = self.tool.radius
+        def tip_height(x, y):
+            radial2 = (x - cx) ** 2 + (y - cy) ** 2
+            offset_radius = sphere_radius + cutter_radius
+            sphere_height = sphere_center + math.sqrt(max(0, offset_radius ** 2 - radial2))
+            # The plane and expanded sphere form the ball-center envelope.
+            # The allowance is planned stock. Independent verification must
+            # check path-chord and scallop errors against the target.
+            return max(base + cutter_radius, sphere_height) - cutter_radius + self.tolerance_mm / 4
+        return self._raster_passes(bounds, tip_height)
 
     def to_dict(self) -> dict:
         data = super().to_dict()

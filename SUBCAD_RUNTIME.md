@@ -13,7 +13,7 @@ python -m pip wheel --no-deps . --wheel-dir dist
 Install the wheel in the CAD environment:
 
 ```text
-python -m pip install --no-deps dist/d2o_subcad-0.2.2-py3-none-any.whl
+python -m pip install --no-deps dist/d2o_subcad-0.2.3-py3-none-any.whl
 ```
 
 Use `from subcad import Stock` from an installed package.
@@ -70,3 +70,33 @@ A missing finishing cutter stops the operation.
 Actual holder metadata remains in `ToolSpec.physical_assembly`.
 Generated holder metadata has `owned=false` and `geometry_status=approximate`.
 This selection scope does not verify feeds, fixtures, or manufacturing readiness.
+
+Version 0.2.3 adds native fixed-axis surface cutter replay.
+`surface_mill({"type": "plane", "height_mm": z})` cuts the incoming material to an absolute part height.
+`dome_mill(radius, height)` uses a compensated ball end mill path.
+Its base lies `height` below the incoming top surface.
+The native result includes cutter scallops and the planned allowance.
+It does not replace that result with an ideal dome.
+The code preserves incoming holes and translated part coordinates.
+Each roughing row and finishing row retains its material state.
+Each exported pass has a separate mesh path and content hash.
+
+Constant-height and supported spherical sweeps use exact cutter solids.
+Other variable-height moves use pose sampling and report that approximation.
+Boolean failures stop the operation. They do not return unchanged material as a machined result.
+Surface plans keep achieved tolerance unknown and manufacturing verification incomplete.
+The current native surface setup uses the positive Z cutter axis.
+Other axes require explicit path transforms and further verification.
+
+`replay_milling_independently()` uses the separate tri-dexel ray/cutter engine.
+It replays cutting moves from the actual incoming material.
+It preserves absolute part coordinates and ignores rapid moves for material removal.
+Its target comparison reports sampled overcut and undercut.
+Finite grid sampling does not prove the requested tolerance.
+Fixture, holder clearance, feed, and spindle checks remain required.
+
+Unresolved surface references remain unavailable.
+Sweep, loft, hollow-bore, and wire operations currently have no native material-removal implementation.
+They raise specific errors. Their public API names do not prove geometry coverage.
+Mill-turn setup remains a non-cutting instruction.
+Complete Milling coverage and independent Turning replay remain open in issues #5 and #3.
