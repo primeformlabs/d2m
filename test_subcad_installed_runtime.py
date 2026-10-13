@@ -6,7 +6,7 @@ import tempfile
 import cadquery as cq
 
 import subcad
-from subcad import Stock, ToolSpec, compare_to_target, get_feeds_speeds, list_materials, to_sim_tool
+from subcad import Stock, ToolSpec, compare_to_target, get_feeds_speeds, list_materials, to_sim_tool, replay_milling_independently
 from simulation.material_removal import MaterialRemovalEngine
 from simulation.tri_dexel import TriDexelModel
 
@@ -39,4 +39,29 @@ cross_drilled = curved.drill(diameter=4, depth=20, through=True, face_selector="
 finished = cross_drilled.turn_od(16, 40)
 assert finished.volume < math.pi * 8 ** 2 * 40
 assert not finished._shape.val().isInside(cq.Vector(0, 0, 0))
-print("Installed runtime: imports, material rules, tool conversion, target comparison, native pockets, Turning states, curved-stock drilling, operation plans, and STL export pass.")
+plane_stock = Stock.rectangular(8, 8, 6)
+plane_tool = ToolSpec("flat_endmill", 4)
+plane = plane_stock.surface_mill({"type": "plane", "height_mm": 1}, tool=plane_tool, tolerance_mm=0.3)
+assert abs(plane.volume - 256) < 1e-6
+assert len(plane._state_history) > 3
+from subcad import Toolpath
+_, replay = replay_milling_independently(plane_stock,
+    Toolpath.from_dict(plane.process_plan()["operations"][-1]["toolpath"]), plane_tool,
+    resolution_mm=0.5, target=plane)
+assert replay["target_comparison"]["status"] == "sampled_match"
+assert replay["manufacturing_ready"] is False
+dome_stock = Stock.rectangular(8, 8, 8)
+dome_stock._shape = dome_stock._shape.cut(cq.Workplane("XY", origin=(0, 0, -5)).circle(0.5).extrude(10))
+dome = dome_stock.dome_mill(2.5, 1, tool=ToolSpec("ball_endmill", 2,
+    safe_limits={"max_stepdown_mm": 0.5}), tolerance_mm=0.3)
+assert dome.volume < dome_stock.volume
+assert not dome._shape.val().isInside(cq.Vector(0, 0, 2))
+assert not dome._shape.val().isInside(cq.Vector(3.5, 3.5, 3.6))
+assert {row["pass_role"] for row in dome.process_plan()["operations"][-1]["material_passes"]} == {"roughing", "finishing"}
+try:
+    plane_stock.surface_mill({"id": "missing_patch"})
+except ValueError as error:
+    assert "explicit geometry" in str(error)
+else:
+    raise AssertionError("An unresolved surface cannot prove material removal.")
+print("Installed runtime: imports, material rules, tool conversion, target comparison, native pockets, Turning states, curved-stock drilling, surface passes, independent Milling replay, operation plans, and STL export pass.")

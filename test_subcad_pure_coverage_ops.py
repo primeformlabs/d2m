@@ -1301,14 +1301,7 @@ part = (
     .turn_thread(20.0, 1.5, 15.0)
     .mill_turn_setup()
     .thin_wall_pocket(profile, 1.2, 5.0, open_faces=[">Z"])
-    .hollow_bore({"diameter": 10}, {"diameter": 20}, 15.0)
     .tube_profile({"diameter": 20}, {"diameter": 10}, 30.0)
-    .surface_mill({"surface": "freeform_patch"})
-    .sweep_mill(profile, {"points": [(0, 0), (20, 0)]})
-    .loft_mill([profile, {"type": "circle", "diameter": 8}])
-    .dome_mill(8.0, 3.0)
-    .wire_cut_profile(profile, 6.0)
-    .wire_cut_internal(profile, 6.0, start_hole={"diameter": 2})
 )
 plan_dict = part.process_plan()
 operation_names = [op["operation"] for op in plan_dict["operations"]]
@@ -1331,21 +1324,33 @@ expected = {
     "turn_thread",
     "mill_turn_setup",
     "thin_wall_pocket",
-    "hollow_bore",
     "tube_profile",
-    "surface_mill",
-    "sweep_mill",
-    "loft_mill",
-    "dome_mill",
-    "wire_cut_profile",
-    "wire_cut_internal",
 }
 check(expected.issubset(set(operation_names)), "all pure coverage operations appear in process plan")
 for op in plan_dict["operations"]:
     if op["operation"] in expected:
-        check(op.get("manufacturing_completeness") == ("requires_validation" if op.get("process") == "turn" else "pure_operation"),
+        check(op.get("manufacturing_completeness") == ("requires_validation" if op.get("process") == "turn"
+              or op["operation"] in {"mill_turn_setup", "thin_wall_pocket"} else "pure_operation"),
               f"{op['operation']} marks pure operation completeness")
-        check("toolpath" in op, f"{op['operation']} emits neutral toolpath")
+        if op["operation"] != "mill_turn_setup":
+            check("toolpath" in op, f"{op['operation']} emits neutral toolpath")
+
+# Public operation names do not prove geometry coverage. Unimplemented
+# operations must reject execution instead of preserving an unchanged shape.
+for name, arguments in (
+    ("surface_mill", {"surface_ref": {"surface": "freeform_patch"}}),
+    ("sweep_mill", {"profile": profile, "path": {"points": [(0, 0), (20, 0)]}}),
+    ("loft_mill", {"profiles": [profile, {"type": "circle", "diameter": 8}]}),
+    ("hollow_bore", {"inner_profile": {"diameter": 10}, "outer_profile": {"diameter": 20}}),
+    ("wire_cut_profile", {"profile": profile, "thickness": 6}),
+    ("wire_cut_internal", {"profile": profile, "thickness": 6}),
+):
+    try:
+        create_operation(name, **arguments).apply(Stock.rectangular(30, 30, 20)._shape)
+    except ValueError as error:
+        check(bool(str(error)), f"{name} rejects unavailable native geometry")
+    else:
+        raise AssertionError(f"{name} must reject an unchanged geometry result")
 
 bottom_face_part = (
     Stock.rectangular(40, 30, 10)

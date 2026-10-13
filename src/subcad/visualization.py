@@ -183,7 +183,9 @@ def _export_stock_states(stock: Any, out: Path, plan: dict) -> list[dict]:
             continue
 
         sequence_number = state.get("sequence_number", index)
-        filename = f"stock_state_{int(sequence_number):03d}.stl"
+        pass_index = state.get("pass_index")
+        suffix = f"_pass_{int(pass_index):04d}" if pass_index is not None else ""
+        filename = f"stock_state_{int(sequence_number):03d}{suffix}.stl"
         path = states_dir / filename
         export_stl(shape, str(path))
 
@@ -194,6 +196,8 @@ def _export_stock_states(stock: Any, out: Path, plan: dict) -> list[dict]:
         states.append({
             "index": len(states),
             "sequence_number": sequence_number,
+            "pass_index": pass_index,
+            "pass_role": state.get("pass_role"),
             "operation": op.get("operation") or state.get("operation"),
             "label": label,
             "path": f"states/{filename}",

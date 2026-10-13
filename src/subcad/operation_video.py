@@ -662,6 +662,10 @@ def _operation_moves(op: dict, mesh_bbox: dict) -> list[dict]:
     for record in records:
         normalized = _normalize_move(record, top_z)
         if normalized is not None:
+            if isinstance(data, dict) and data.get("metadata", {}).get("coordinate_system") == "part_mm":
+                # Cutting classification uses depth below the incoming top.
+                # Mesh coordinates already use the absolute part datum.
+                normalized["program_position"][2] -= float(mesh_bbox.get("z_max", 0.0))
             moves.append(normalized)
     return moves
 

@@ -171,12 +171,17 @@ class Stock:
                 "label": "Initial stock",
                 "shape": self._shape,
             })
-        state_history.append({
-            "sequence_number": op.sequence_number,
-            "operation": getattr(op, "operation_name", op.__class__.__name__),
-            "label": f"After OP {op.sequence_number}",
-            "shape": new_shape,
-        })
+        passes = getattr(op, "_material_pass_states", None)
+        if passes:
+            state_history.extend({**state, "sequence_number": op.sequence_number,
+                "operation": getattr(op, "operation_name", op.__class__.__name__)} for state in passes)
+        else:
+            state_history.append({
+                "sequence_number": op.sequence_number,
+                "operation": getattr(op, "operation_name", op.__class__.__name__),
+                "label": f"After OP {op.sequence_number}",
+                "shape": new_shape,
+            })
 
         # Serialize fixture and setups for the plan. Runtime FixtureSpec/Setup
         # objects win, but context-only setup intent must survive operation chains.
@@ -2555,6 +2560,8 @@ def _toolpath_from_serialized(toolpath_data, *, z_offset: float = 0.0) -> list:
     import numpy as np
 
     if isinstance(toolpath_data, dict):
+        if toolpath_data.get("metadata", {}).get("coordinate_system") == "part_mm":
+            z_offset = 0.0
         if "moves" in toolpath_data:
             toolpath_data = toolpath_data["moves"]
         elif "positions" in toolpath_data:
