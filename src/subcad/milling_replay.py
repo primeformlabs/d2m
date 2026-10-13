@@ -13,6 +13,27 @@ from .pocket_geometry import rounded_rectangle
 from .toolpath import Toolpath, ToolpathMove
 
 
+def _boolean(first, others, operation: str, *, tolerance: float | None = None):
+    """Avoid kernel thread fan-out for the small solids in each surface pass."""
+    import cadquery as cq
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Common, BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+    from OCP.TopTools import TopTools_ListOfShape
+    job = {"cut": BRepAlgoAPI_Cut, "fuse": BRepAlgoAPI_Fuse, "common": BRepAlgoAPI_Common}[operation]()
+    arguments, tools = TopTools_ListOfShape(), TopTools_ListOfShape()
+    arguments.Append(first.wrapped)
+    for shape in others:
+        tools.Append(shape.wrapped)
+    job.SetArguments(arguments)
+    job.SetTools(tools)
+    job.SetRunParallel(False)
+    if tolerance is not None:
+        job.SetFuzzyValue(tolerance)
+    job.Build()
+    if not job.IsDone() or job.Shape().IsNull():
+        raise ValueError("The native Milling Boolean operation failed. The cutter geometry requires review.")
+    return cq.Shape.cast(job.Shape())
+
+
 def finite(value: Any, name: str, *, positive: bool = False) -> float:
     if isinstance(value, bool):
         raise ValueError(f"The {name} must be finite.")
@@ -47,7 +68,7 @@ def _cutter(tool):
         return cq.Solid.makeCylinder(radius, tool.flute_length)
     sphere = cq.Workplane("XY").sphere(radius).val().translate((0, 0, radius))
     shank = cq.Solid.makeCylinder(radius, tool.flute_length - radius, cq.Vector(0, 0, radius))
-    return sphere.fuse(shank)
+    return _boolean(sphere, [shank], "fuse")
 
 
 def _horizontal_sweep(tool, start, end):
@@ -70,7 +91,7 @@ def _horizontal_sweep(tool, start, end):
     bridge = cq.Solid.makeCylinder(radius, length, center_start, cq.Vector(dx / length, dy / length, 0))
     first = cq.Workplane("XY").sphere(radius).val().translate(center_start)
     last = cq.Workplane("XY").sphere(radius).val().translate(center_end)
-    return upper.fuse(bridge, first, last)
+    return _boolean(upper, [bridge, first, last], "fuse")
 
 
 def _ball_sweep(radius, start, end):
@@ -85,7 +106,7 @@ def _ball_sweep(radius, start, end):
     direction = cq.Vector(*[(end[axis] - start[axis]) / distance for axis in range(3)])
     bridge = cq.Solid.makeCylinder(radius, distance, first_center, direction)
     last = cq.Workplane("XY").sphere(radius).val().translate(last_center)
-    return first.fuse(bridge, last)
+    return _boolean(first, [bridge, last], "fuse")
 
 
 def replay_pass(shape, path: Toolpath, tool, *, sample_interval_mm: float = 0.25,
@@ -147,7 +168,7 @@ def replay_pass(shape, path: Toolpath, tool, *, sample_interval_mm: float = 0.25
     # union. Empty approach sweeps must not create tangent external shells.
     removals = []
     for solid in cutters:
-        common = solid.intersect(shape.val()) if tool.tool_type == "ball_endmill" else solid
+        common = _boolean(solid, [shape.val()], "common") if tool.tool_type == "ball_endmill" else solid
         if common.Volume() > 1e-9:
             if not common.isValid():
                 raise ValueError("The surface cutter intersection is not a valid solid.")
@@ -158,7 +179,7 @@ def replay_pass(shape, path: Toolpath, tool, *, sample_interval_mm: float = 0.25
         if united is None:
             united, group = group[0], group[1:]
         if group:
-            united = united.fuse(*group, tol=1e-7)
+            united = _boolean(united, group, "fuse", tolerance=1e-7)
     if united is not None:
         # Same-domain cleaning can damage adjoining spherical pass faces.
         # Keep the valid Boolean topology for ball-cutter removal unions.
@@ -166,7 +187,7 @@ def replay_pass(shape, path: Toolpath, tool, *, sample_interval_mm: float = 0.25
             united = united.clean()
         if not united.isValid():
             raise ValueError("The surface cutter sweep is not a valid solid.")
-        result = result.cut(united, clean=False)
+        result = shape.newObject([_boolean(shape.val(), [united], "cut")])
     topology_repaired = False
     if result.solids().vals() and not result.val().isValid():
         volume_before = result.val().Volume()
