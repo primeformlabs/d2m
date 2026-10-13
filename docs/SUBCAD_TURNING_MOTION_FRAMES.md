@@ -29,3 +29,21 @@ The paths remain CAM intent.
 Roughing passes, tool compensation, fixtures, collisions, and controller NC still need separate verification.
 Insert cutting profiles must come from the selected tool geometry.
 A holder outline cannot define an insert cutting profile.
+
+## Continuous program clock
+
+Call `Stock.process_plan(continuous_turning_phase=True)` to export consecutive Turning paths with one continuous spindle clock.
+The exporter copies the plan and preserves the original operation-level export.
+It uses the first path's explicit initial phase.
+Later paths retain phase from the preceding path.
+
+The clock requires the same identified insert profile, setup, spindle frame, speed, and rotation direction.
+The exporter authors non-cutting rapid transport between the recorded endpoints.
+The transport uses radial clearance from the incoming stock bounds and insert profile.
+Its collision status remains unverified.
+The exported positions and phase include this transport time.
+
+An insert, setup, speed, or direction change requires a recorded transition.
+Missing transition data makes the phase unavailable for the remaining Turning block.
+A new block after another process needs explicit initial phase inputs.
+The clock remains CAM intent with `manufacturing_ready: false`.
