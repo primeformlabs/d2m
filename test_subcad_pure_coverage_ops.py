@@ -1297,7 +1297,7 @@ part = (
     .turn_face(0.0)
     .turn_od(20.0, 40.0)
     .turn_id(10.0, 20.0)
-    .turn_groove(2.0, 1.0, 12.0)
+    .turn_groove(2.0, 1.0, -5.0)
     .turn_thread(20.0, 1.5, 15.0)
     .mill_turn_setup()
     .thin_wall_pocket(profile, 1.2, 5.0, open_faces=[">Z"])
@@ -1343,7 +1343,7 @@ expected = {
 check(expected.issubset(set(operation_names)), "all pure coverage operations appear in process plan")
 for op in plan_dict["operations"]:
     if op["operation"] in expected:
-        check(op.get("manufacturing_completeness") == "pure_operation",
+        check(op.get("manufacturing_completeness") == ("requires_validation" if op.get("process") == "turn" else "pure_operation"),
               f"{op['operation']} marks pure operation completeness")
         check("toolpath" in op, f"{op['operation']} emits neutral toolpath")
 

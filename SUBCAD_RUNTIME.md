@@ -13,7 +13,7 @@ python -m pip wheel --no-deps . --wheel-dir dist
 Install the wheel in the CAD environment:
 
 ```text
-python -m pip install --no-deps dist/d2o_subcad-0.1.0-py3-none-any.whl
+python -m pip install --no-deps dist/d2o_subcad-0.2.0-py3-none-any.whl
 ```
 
 Use `from subcad import Stock` from an installed package.
@@ -35,8 +35,18 @@ Each operation requires native geometry, toolpath replay, fixture clearance, and
 D2O issues #255 and #260 track the customer requirements.
 Combined routes must retain the actual material result, datum, and fixture change between operations.
 
-The native Turning audit found unchanged material for facing, outside turning, boring, grooving, and threading.
-These APIs currently record the operation through `PureToleranceOp`.
-They do not provide usable native Turning material states.
-The operation plan and its raster toolpath do not prove a completed Turning operation.
-Turning geometry and lathe toolpath replay require further implementation.
+Version 0.2 models actual material removal for facing, outside turning, boring, grooves, profiles, and generic V threads.
+`Stock.round_bar()` supports signed X, Y, and Z spindle axes and a part datum.
+The native cuts preserve the incoming material and preceding Milling features.
+Each operation retains its actual material state.
+The Turning timeline uses those native states and reports independent tool replay as incomplete.
+Neutral Turning paths use spindle radius and axial coordinates. They do not use Milling raster paths.
+The Milling postprocessor does not emit those Turning moves.
+
+Thread geometry uses a generic V profile. Thread-standard verification remains incomplete.
+Owned tool selection, roughing passes, compensation, fixture clearance, and independent lathe replay remain incomplete.
+The operation plan does not claim an achieved tolerance without measurement or verification.
+
+Milling pocket roughing uses the cutter radius and retains the corner material that its tool cannot remove.
+The separate finish operation removes that material with its own tool.
+A requested sharp inside corner receives a specific review reason.

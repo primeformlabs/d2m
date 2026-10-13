@@ -222,8 +222,10 @@ class Stock:
         if hasattr(op, "to_toolpath"):
             try:
                 toolpath = op.to_toolpath()
-            except Exception:
+            except Exception as error:
                 toolpath = []
+                op_dict["toolpath_status"] = "unavailable"
+                op_dict["toolpath_reason"] = str(error)
             if toolpath:
                 serialized_toolpath = _serialize_toolpath(toolpath)
                 if serialized_toolpath:
@@ -602,6 +604,21 @@ class Stock:
         )
 
     @classmethod
+    def round_bar(cls, length: float, diameter: float, material: str = "aluminum_6061", *,
+                  axis: str = "Z", origin: Tuple[float, float, float] = (0, 0, 0)) -> "Stock":
+        """Create actual round stock in the spindle's part coordinate frame."""
+        from .turning_geometry import finite, frame, from_spindle
+
+        length = finite(length, "stock length", positive=True)
+        diameter = finite(diameter, "stock diameter", positive=True)
+        axis, origin = frame(axis, origin)
+        shape = from_spindle(create_cylindrical_stock(diameter, length), axis, origin)
+        dims = {"diameter": diameter, "height": length, "length": length, "stock_form": "round_bar",
+            "axis": axis, "spindle_origin_mm": list(origin)}
+        return cls(_shape=shape, _material=material, _plan=ProcessPlan(material=material, stock_dimensions=dims),
+            _stock_dims=dims)
+
+    @classmethod
     def from_step(
         cls,
         path: str,
@@ -698,6 +715,7 @@ class Stock:
         # If PocketOp auto-created a finish op, apply it too
         finish = getattr(op, "finish_op", None)
         if finish is not None:
+            finish.face_selector = op.face_selector
             finish.sequence_number = result._next_op_number
             result = result._apply_op(finish)
 
@@ -1857,48 +1875,63 @@ class Stock:
             height=height, tool=tool, material=self._material,
         ))
 
-    def turn_profile(self, profile, *, axis: str = "Z",
+    def _turning_frame(self, axis=None, origin=None) -> dict:
+        return {"axis": axis or self._stock_dims.get("axis", "Z"),
+            "origin": origin if origin is not None else self._stock_dims.get("spindle_origin_mm", (0, 0, 0))}
+
+    def turn_profile(self, profile, *, axis: Optional[str] = None, origin=None,
                      stock_diameter: Optional[float] = None,
                      tool: Optional[ToolSpec] = None) -> "Stock":
         from .operations import TurnProfileOp
         return self._apply_op(TurnProfileOp(
-            profile=profile, axis=axis, stock_diameter=stock_diameter,
+            profile=profile, **self._turning_frame(axis, origin), stock_diameter=stock_diameter,
             tool=tool, material=self._material,
         ))
 
-    def turn_face(self, z: float, *, tool: Optional[ToolSpec] = None) -> "Stock":
+    def turn_face(self, z: float, *, axis: Optional[str] = None, origin=None, side: str = "front",
+                  tool: Optional[ToolSpec] = None) -> "Stock":
         from .operations import TurnFaceOp
-        return self._apply_op(TurnFaceOp(z=z, tool=tool, material=self._material))
+        return self._apply_op(TurnFaceOp(z=z, **self._turning_frame(axis, origin), side=side, tool=tool, material=self._material))
 
     def turn_od(self, diameter: float, length: float, *,
+                axis: Optional[str] = None, origin=None, start_z: Optional[float] = None,
                 tool: Optional[ToolSpec] = None) -> "Stock":
         from .operations import TurnODOp
         return self._apply_op(TurnODOp(
             diameter=diameter, length=length, tool=tool, material=self._material,
+            **self._turning_frame(axis, origin), start_z=start_z,
         ))
 
     def turn_id(self, diameter: float, depth: float, *,
+                axis: Optional[str] = None, origin=None, start_z: Optional[float] = None,
                 tool: Optional[ToolSpec] = None) -> "Stock":
         from .operations import TurnIDOp
         return self._apply_op(TurnIDOp(
             diameter=diameter, length=depth, depth=depth,
             tool=tool, material=self._material,
+            **self._turning_frame(axis, origin), start_z=start_z,
         ))
 
     def turn_groove(self, width: float, depth: float, z: float, *,
+                    axis: Optional[str] = None, origin=None, diameter: Optional[float] = None, internal: bool = False,
                     tool: Optional[ToolSpec] = None) -> "Stock":
         from .operations import TurnGrooveOp
         return self._apply_op(TurnGrooveOp(
             width=width, depth=depth, z=z, tool=tool, material=self._material,
+            **self._turning_frame(axis, origin), diameter=diameter, internal=internal,
         ))
 
     def turn_thread(self, diameter: float, pitch: float, length: float, *,
                     internal: bool = False,
+                    axis: Optional[str] = None, origin=None, start_z: Optional[float] = None,
+                    thread_depth: Optional[float] = None, angle: float = 60.0, left_handed: bool = False,
                     tool: Optional[ToolSpec] = None) -> "Stock":
         from .operations import TurnThreadOp
         return self._apply_op(TurnThreadOp(
             diameter=diameter, pitch=pitch, length=length, internal=internal,
             tool=tool, material=self._material,
+            **self._turning_frame(axis, origin), start_z=start_z,
+            thread_depth=thread_depth, angle=angle, left_handed=left_handed,
         ))
 
     def mill_turn_setup(self, axis: str = "Z", work_offset: str = "G54") -> "Stock":

@@ -156,6 +156,7 @@ def export_visualization_package(
 
 
 def _export_stock_states(stock: Any, out: Path, plan: dict) -> list[dict]:
+    import hashlib
     from .geometry import export_stl
 
     operations_by_sequence = {
@@ -198,6 +199,12 @@ def _export_stock_states(stock: Any, out: Path, plan: dict) -> list[dict]:
             "path": f"states/{filename}",
             "format": "stl",
             "role": "stock_state",
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "volume_mm3": state["shape"].val().Volume(),
+            "geometry_fidelity": op.get("geometry_fidelity", "unknown"),
+            "verification_status": op.get("verification_status", "not_run"),
+            "coordinate_frame": {"basis": "stock_world", "units": "mm", "spindle_axis": op.get("axis"),
+                "spindle_origin_mm": op.get("spindle_origin_mm", [0, 0, 0])},
         })
 
     return states

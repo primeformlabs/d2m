@@ -53,6 +53,7 @@ from .tool_library import ToolSpec, ToolCatalog
 from .tool_selection import ToolRequirement, ToolSelectionResult, select_or_fallback, select_tool
 from .material import get_feeds_speeds
 from .toolpath import Toolpath, ToolpathMove
+from . import turning_geometry
 
 # ---------------------------------------------------------------------------
 # Tool-type mapping for feeds/speeds lookup
@@ -690,6 +691,7 @@ class PocketOp(MachiningOperation):
     length: float = 30.0
     depth: float = 5.0
     corner_radius: float = 0.0
+    pass_role: str = "roughing"
     base_height: Optional[float] = None
 
     tool: Optional[ToolSpec] = None
@@ -723,12 +725,12 @@ class PocketOp(MachiningOperation):
         # Auto-finish: a large tool cannot reach into a tight corner radius
         if self.corner_radius > 0 and self.tool.radius > self.corner_radius:
             finish_tool_dia = self.corner_radius * 2.0
-            try:
-                finish_tool = ToolCatalog.get_best_for(
-                    "flat_endmill", max(finish_tool_dia, 2.0)
-                )
-            except ValueError:
-                finish_tool = ToolSpec("flat_endmill", max(finish_tool_dia, 2.0))
+            finish_tool, finish_selection = _select_inventory_tool(
+                ToolRequirement("flat_endmill", max_diameter_mm=finish_tool_dia,
+                    min_flute_length_mm=self.depth, feature="pocket_corner_finish",
+                    reason="end mill radius must fit the requested corner", prefer_largest=True),
+                ToolSpec("flat_endmill", finish_tool_dia, inventory_count=0),
+            )
 
             # Only create a finish op if the finish tool is actually smaller
             if finish_tool.diameter < self.tool.diameter:
@@ -739,33 +741,34 @@ class PocketOp(MachiningOperation):
                     length=self.length,
                     depth=self.depth,
                     corner_radius=self.corner_radius,
+                    pass_role="finishing",
                     base_height=self.base_height,
                     tool=finish_tool,
                     material=self.material,
                     sequence_number=self.sequence_number + 1,
                 )
+                self.finish_op.tool_selection = finish_selection
 
     # ------------------------------------------------------------------
 
     def apply(self, shape):
+        if self.tool.diameter <= 0 or self.tool.diameter > min(self.width, self.length):
+            raise ValueError("The milling cutter does not fit the pocket opening.")
         result = rectangular_pocket_cut(
             shape,
             self.cx, self.cy,
             self.width, self.length,
             self.depth,
-            self.corner_radius,
+            max(self.corner_radius, self.tool.radius),
             face_selector=self.face_selector,
             base_height=self.base_height,
         )
-        # Apply finish pass if one was created
-        if self.finish_op is not None:
-            self.finish_op.face_selector = self.face_selector
-            result = self.finish_op.apply(result)
+        # Stock records and applies the separate finish operation after roughing.
         return result
 
     def to_dict(self) -> dict:
         d: dict = {
-            "operation": "rough_pocket",
+            "operation": "finish_pocket" if self.pass_role == "finishing" else "rough_pocket",
             "tool_type": self.tool.tool_type,
             "tool_diameter_mm": self.tool.diameter,
             "tool": _tool_dict(self.tool),
@@ -776,6 +779,12 @@ class PocketOp(MachiningOperation):
                 "depth": self.depth,
             },
             "corner_radius_mm": self.corner_radius,
+            "modeled_corner_radius_mm": max(self.corner_radius, self.tool.radius),
+            "pass_role": self.pass_role,
+            "verification_status": "not_verified",
+            "geometry_status": "requires_review" if self.corner_radius == 0 else "modeled",
+            "geometry_review_reasons": ["The milling cutter leaves rounded corners. The sharp inside corner needs another process or a design change."]
+                if self.corner_radius == 0 else [],
             "base_height_mm": self.base_height,
             "position": list(self.position) if self.position else None,
             "face_selector": self.face_selector,
@@ -796,13 +805,14 @@ class PocketOp(MachiningOperation):
         half_w = max(self.width / 2.0 - self.tool.radius, 0.0)
         half_l = max(self.length / 2.0 - self.tool.radius, 0.0)
         tp = _new_toolpath(
-            "rough_pocket",
+            "finish_pocket" if self.pass_role == "finishing" else "rough_pocket",
             self.tool,
             self.feeds_speeds,
             metadata={
                 "width_mm": self.width,
                 "length_mm": self.length,
                 "tool_selection": _tool_selection_dict(self.tool_selection),
+                "following_finish_operation": self.finish_op is not None,
             },
         )
         feed = _feed_rate(self.feeds_speeds)
@@ -823,17 +833,19 @@ class PocketOp(MachiningOperation):
             max_lanes = max(max_lanes, lane_count)
             _move(tp, "feed", self.cx, self.cy, z, feed=feed)
         _move(tp, "retract", self.cx, self.cy, tp.safe_z)
-        if self.finish_op is not None:
-            tp.metadata["finish_toolpath"] = self.finish_op.to_toolpath().to_dict()
-        return _attach_pass_plan(tp, _pass_plan(
+        pass_plan = _pass_plan(
             strategy="rectangular_pocket",
             tool=self.tool,
             depth_levels=depth_levels,
             lane_count=max_lanes,
-            pass_type="roughing",
-            rest_machining=self.finish_op is not None,
-            finish_passes=1 if self.finish_op is not None else 0,
-        ))
+            pass_type=self.pass_role,
+            rest_machining=self.pass_role == "finishing",
+            finish_passes=0,
+        )
+        if self.pass_role == "finishing":
+            pass_plan["finishing_passes"] = pass_plan["roughing_passes"]
+            pass_plan["roughing_passes"] = 0
+        return _attach_pass_plan(tp, pass_plan)
 
 
 @dataclass
@@ -3242,118 +3254,196 @@ class PureToleranceOp(MachiningOperation):
 
 
 @dataclass
-class TurnProfileOp(PureToleranceOp):
-    operation_name: str = "turn_profile"
+class TurningOp(PureToleranceOp):
+    """Actual material geometry with an explicit, unreleased spindle path."""
     process: str = "turn"
     axis: str = "Z"
+    origin: Any = (0, 0, 0)
+    start_z: Optional[float] = None
+
+    def __post_init__(self):
+        self.axis, self.origin = turning_geometry.frame(self.axis, self.origin)
+        self.requires_owned_tool = self.tool is None or not self.tool.catalog_id or self.tool.inventory_count <= 0
+        if self.tool is None:
+            self.tool = ToolSpec("turning_insert", 0.0, inventory_count=0)
+        self.feeds_speeds = dict(self.tool.preferred_feeds_speeds or {})
+
+    def _prepare(self, shape):
+        local = turning_geometry.to_spindle(shape, self.axis, self.origin)
+        self._incoming_bounds = local.val().BoundingBox()
+        self._incoming_radius = turning_geometry.radial_extent(local)
+        self._front = self._incoming_bounds.zmax if self.start_z is None else turning_geometry.finite(self.start_z, "start position")
+        return local
+
+    def to_dict(self) -> dict:
+        data = super().to_dict()
+        data.update(axis=self.axis, spindle_origin_mm=list(self.origin), start_z_mm=self.start_z,
+            achieved_tolerance_estimate_mm=None, verification_status="not_verified",
+            geometry_status="modeled", geometry_fidelity="exact", manufacturing_completeness="requires_validation",
+            toolpath_status="unverified", requires_owned_tool=self.requires_owned_tool,
+            review_reasons=["The Turning toolpath needs feed, spindle, fixture, and tool verification."])
+        if self.requires_owned_tool:
+            data["review_reasons"].append("The Turning operation needs an owned tool assembly.")
+        return data
+
+    def _path(self, points: list[tuple[str, float, float]], **metadata) -> Toolpath:
+        feed, rpm = self.feeds_speeds.get("feed_rate_mm_min"), self.feeds_speeds.get("rpm")
+        if feed is not None:
+            feed = turning_geometry.finite(feed, "feed", positive=True)
+        if rpm is not None:
+            rpm = turning_geometry.finite(rpm, "spindle speed", positive=True)
+        if metadata.get("requires_spindle_phase") and rpm is not None:
+            feed = turning_geometry.finite(metadata["pitch_mm"], "thread pitch", positive=True) * rpm
+        path = Toolpath(self.operation_name, tool_type=self.tool.tool_type, tool_diameter_mm=self.tool.diameter,
+            feed_mm_min=feed, spindle_rpm=rpm, metadata={"process": "turn", "spindle_axis": self.axis,
+                "spindle_origin_mm": list(self.origin), "coordinate_system": "part_mm", "radius_mode": True,
+                "verification_status": "not_verified", "requires_owned_tool": self.requires_owned_tool,
+                "requires_feed_speed_release": feed is None or rpm is None,
+                "tool_compensation": "not_applied", "roughing_passes": "not_generated", **metadata})
+        for kind, radius, axial in points:
+            path.append(ToolpathMove(kind, turning_geometry.spindle_point_to_world(radius, axial, self.axis, self.origin),
+                feed=feed if kind == "feed" else None, spindle_rpm=rpm,
+                metadata={"spindle_radius_mm": radius, "spindle_z_mm": axial}))
+        return path
+
+
+@dataclass
+class TurnProfileOp(TurningOp):
+    operation_name: str = "turn_profile"
     stock_diameter: Optional[float] = None
 
     def apply(self, shape):
-        if self.axis.upper() != "Z" or not isinstance(self.profile, dict):
-            return shape
-        profile_type = str(self.profile.get("type") or "").lower()
-        if profile_type not in {"tapered_cylinder", "tapered_ring", "frustum"}:
-            return shape
+        local = self._prepare(shape)
+        self._contour, self._inner_contour = turning_geometry.profile_points(self.profile, local.val().BoundingBox())
+        return turning_geometry.profile_cut(shape, self.profile, axis=self.axis, origin=self.origin)
 
-        bbox = shape.val().BoundingBox()
-        current_height = bbox.zmax - bbox.zmin
-        height = float(self.profile.get("height", self.profile.get("height_mm", current_height)))
-        if height <= 0:
-            return shape
-        z_center = float(self.profile.get("z_center", (bbox.zmin + bbox.zmax) / 2.0))
-
-        bottom = self.profile.get(
-            "bottom_diameter",
-            self.profile.get("bottom_diameter_mm", self.stock_diameter),
-        )
-        top = self.profile.get("top_diameter", self.profile.get("top_diameter_mm", bottom))
-        if bottom is None or top is None:
-            return shape
-
-        inner_bottom = self.profile.get(
-            "inner_bottom_diameter",
-            self.profile.get("inner_bottom_diameter_mm", 0.0),
-        )
-        inner_top = self.profile.get(
-            "inner_top_diameter",
-            self.profile.get("inner_top_diameter_mm", inner_bottom),
-        )
-        return create_tapered_cylinder(
-            float(bottom),
-            float(top),
-            height,
-            inner_bottom_diameter=float(inner_bottom or 0.0),
-            inner_top_diameter=float(inner_top or 0.0),
-            z_center=z_center,
-        )
+    def to_toolpath(self) -> Toolpath:
+        if not hasattr(self, "_contour"):
+            raise ValueError("The Turning profile path needs the incoming material state.")
+        contour = list(self._contour)
+        if contour[-1][1] > contour[0][1]:
+            contour.reverse()
+        clearance = self._incoming_radius + 2
+        points = [("rapid", clearance, contour[0][1] + 2), ("rapid", clearance, contour[0][1]),
+            *(('feed', radius, axial) for radius, axial in contour), ("retract", clearance, contour[-1][1])]
+        return self._path(points, strategy="outside_contour", inner_profile_requires_separate_boring=bool(self._inner_contour))
 
     def to_dict(self) -> dict:
-        data = super().to_dict()
-        data.update({"axis": self.axis, "stock_diameter_mm": self.stock_diameter})
-        return data
+        return {**super().to_dict(), "stock_diameter_mm": self.stock_diameter}
 
 
 @dataclass
-class TurnFaceOp(PureToleranceOp):
+class TurnFaceOp(TurningOp):
     operation_name: str = "turn_face"
-    process: str = "turn"
     z: float = 0.0
+    side: str = "front"
+
+    def apply(self, shape):
+        self._prepare(shape)
+        return turning_geometry.face_cut(shape, self.z, axis=self.axis, origin=self.origin, side=self.side)
+
+    def to_toolpath(self) -> Toolpath:
+        clearance = self._incoming_radius + 2
+        outside = self._incoming_bounds.zmax + 2 if self.side == "front" else self._incoming_bounds.zmin - 2
+        return self._path([("rapid", clearance, outside), ("rapid", clearance, self.z),
+            ("feed", 0, self.z), ("retract", 0, outside)], strategy="facing")
 
     def to_dict(self) -> dict:
-        data = super().to_dict()
-        data.update({"z_mm": self.z})
-        return data
+        return {**super().to_dict(), "z_mm": self.z, "side": self.side}
 
 
 @dataclass
-class TurnODOp(PureToleranceOp):
+class TurnODOp(TurningOp):
     operation_name: str = "turn_od"
-    process: str = "turn"
     diameter: float = 10.0
     length: float = 10.0
 
+    def apply(self, shape):
+        self._prepare(shape)
+        return turning_geometry.diameter_cut(shape, self.diameter, self.length, axis=self.axis,
+            origin=self.origin, start_z=self.start_z)
+
+    def to_toolpath(self) -> Toolpath:
+        radius, clearance = self.diameter / 2, self._incoming_radius + 2
+        return self._path([("rapid", clearance, self._front + 2), ("rapid", radius, self._front + 2),
+            ("feed", radius, self._front - self.length), ("retract", clearance, self._front - self.length)],
+            strategy="outside_diameter")
+
     def to_dict(self) -> dict:
-        data = super().to_dict()
-        data.update({"diameter_mm": self.diameter, "length_mm": self.length})
-        return data
+        return {**super().to_dict(), "diameter_mm": self.diameter, "length_mm": self.length}
 
 
 @dataclass
 class TurnIDOp(TurnODOp):
     operation_name: str = "turn_id"
 
+    def apply(self, shape):
+        self._prepare(shape)
+        return turning_geometry.diameter_cut(shape, self.diameter, self.length, axis=self.axis,
+            origin=self.origin, start_z=self.start_z, internal=True)
+
+    def to_toolpath(self) -> Toolpath:
+        radius = self.diameter / 2
+        return self._path([("rapid", 0, self._front + 2), ("rapid", radius, self._front + 2),
+            ("feed", radius, self._front - self.length), ("retract", 0, self._front - self.length),
+            ("retract", 0, self._front + 2)], strategy="boring", requires_starting_bore_check=True)
+
 
 @dataclass
-class TurnGrooveOp(PureToleranceOp):
+class TurnGrooveOp(TurningOp):
     operation_name: str = "turn_groove"
-    process: str = "turn"
     width: float = 2.0
     z: float = 0.0
+    diameter: Optional[float] = None
+    internal: bool = False
+
+    def apply(self, shape):
+        local = self._prepare(shape)
+        self._groove_radius = self.diameter / 2 if self.diameter is not None else turning_geometry.section_radius(local, self.z)
+        return turning_geometry.groove_cut(shape, self.width, self.depth, self.z, axis=self.axis,
+            origin=self.origin, diameter=self.diameter, internal=self.internal)
+
+    def to_toolpath(self) -> Toolpath:
+        radius = self._groove_radius + self.depth if self.internal else self._groove_radius - self.depth
+        clearance = max(0, self._groove_radius - 2) if self.internal else self._incoming_radius + 2
+        return self._path([("rapid", clearance, self._front + 2), ("rapid", clearance, self.z),
+            ("feed", radius, self.z), ("retract", clearance, self.z)], strategy="grooving",
+            groove_width_mm=self.width, requires_groove_tool_width_check=True)
 
     def to_dict(self) -> dict:
-        data = super().to_dict()
-        data.update({"width_mm": self.width, "z_mm": self.z})
-        return data
+        return {**super().to_dict(), "width_mm": self.width, "z_mm": self.z, "diameter_mm": self.diameter, "internal": self.internal}
 
 
 @dataclass
-class TurnThreadOp(PureToleranceOp):
+class TurnThreadOp(TurningOp):
     operation_name: str = "turn_thread"
-    process: str = "turn"
     diameter: float = 10.0
     pitch: float = 1.5
     length: float = 10.0
     internal: bool = False
+    thread_depth: Optional[float] = None
+    angle: float = 60.0
+    left_handed: bool = False
+
+    def apply(self, shape):
+        self._prepare(shape)
+        return turning_geometry.thread_cut(shape, self.diameter, self.pitch, self.length, axis=self.axis,
+            origin=self.origin, start_z=self.start_z, internal=self.internal, depth=self.thread_depth,
+            angle=self.angle, left_handed=self.left_handed)
+
+    def to_toolpath(self) -> Toolpath:
+        depth = self.thread_depth if self.thread_depth is not None else self.pitch / 2
+        radius = self.diameter / 2 if self.internal else self.diameter / 2 - depth
+        clearance = max(0, radius - depth - 2) if self.internal else self._incoming_radius + 2
+        return self._path([("rapid", clearance, self._front + self.pitch), ("rapid", radius, self._front),
+            ("feed", radius, self._front - self.length), ("retract", clearance, self._front - self.length)],
+            strategy="synchronized_threading", pitch_mm=self.pitch, left_handed=self.left_handed, requires_spindle_phase=True)
 
     def to_dict(self) -> dict:
-        data = super().to_dict()
-        data.update({
-            "diameter_mm": self.diameter,
-            "pitch_mm": self.pitch,
-            "length_mm": self.length,
-            "internal": self.internal,
-        })
-        return data
+        return {**super().to_dict(), "diameter_mm": self.diameter, "pitch_mm": self.pitch, "length_mm": self.length,
+            "internal": self.internal, "thread_depth_mm": self.thread_depth, "angle_deg": self.angle,
+            "left_handed": self.left_handed, "geometry_fidelity": "approximate", "thread_profile": "generic_v",
+            "thread_standard_verification": "not_run"}
 
 
 @dataclass
