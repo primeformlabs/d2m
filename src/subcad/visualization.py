@@ -425,7 +425,10 @@ def _try_export_diff_mesh(
     try:
         import numpy as np
 
-        from src.simulation.mesh_compare import compute_signed_deviation
+        try:
+            from src.simulation.mesh_compare import compute_signed_deviation
+        except ImportError:
+            from simulation.mesh_compare import compute_signed_deviation
     except Exception:
         return None
 

@@ -528,7 +528,10 @@ def to_sim_tool(spec: ToolSpec):
         available.
     """
     try:
-        from src.simulation.tools import create_tool
+        try:
+            from src.simulation.tools import create_tool
+        except ImportError:
+            from simulation.tools import create_tool
     except ImportError:
         return None
 

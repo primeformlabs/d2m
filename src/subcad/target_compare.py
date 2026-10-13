@@ -17,7 +17,10 @@ def compare_to_target(candidate: Any, target: Any, tolerance_mm: float = 0.25) -
     or a path to STEP/STL/OBJ-like mesh data.  The returned dict is JSON-ready
     and summarizes overcut/undercut/deviation risk.
     """
-    from src.simulation.mesh_compare import compare_meshes
+    try:
+        from src.simulation.mesh_compare import compare_meshes
+    except ImportError:
+        from simulation.mesh_compare import compare_meshes
 
     candidate_mesh = _as_mesh(candidate)
     target_mesh = _as_mesh(target)

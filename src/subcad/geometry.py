@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 
 from .profiles import normalize_profile_points, profile_bounds_xy
+from .pocket_geometry import rectangular_pocket_cut as _native_rectangular_pocket_cut
 
 # ---------------------------------------------------------------------------
 # CadQuery import guard
@@ -493,48 +494,8 @@ def rectangular_pocket_cut(
     if not _HAS_CADQUERY:
         raise RuntimeError("cadquery is not available")
 
-    if base_height is not None:
-        bb = shape.val().BoundingBox()
-        z_min = bb.zmin + float(base_height)
-        cut_depth = min(float(depth), bb.zmax - z_min)
-        if cut_depth <= 0.0:
-            return shape
-        profile = {"type": "rect", "length": length, "width": width, "cx": cx, "cy": cy}
-        return shape.cut(_profile_prism(profile, cut_depth, z_min))
-
-    cx_rel, cy_rel = _to_face_coords(shape, face_selector, cx, cy)
-
-    try:
-        result = (
-            _selected_face_workplane(shape, face_selector)
-            .center(cx_rel, cy_rel)
-            .rect(length, width)
-            .cutBlind(-depth)
-        )
-    except Exception:
-        if face_selector in {">Y", "<Y", ">X", "<X"}:
-            return _side_pocket_fallback(
-                shape, cx, cy, depth, face_selector, width=width, length=length
-            )
-        raise
-
-    if corner_radius > 0:
-        try:
-            from cadquery import selectors as cq_selectors
-
-            half_w = width / 2.0 + 0.5
-            half_l = length / 2.0 + 0.5
-            z_range = depth + 2.0
-            result = result.edges(
-                cq_selectors.BoxSelector(
-                    (cx_rel - half_l, cy_rel - half_w, -z_range),
-                    (cx_rel + half_l, cy_rel + half_w, z_range),
-                )
-            ).fillet(corner_radius)
-        except Exception:
-            pass  # gracefully skip if fillet fails
-
-    return result
+    return _native_rectangular_pocket_cut(shape, width=width, length=length, depth=depth,
+        corner_radius=corner_radius, cx=cx, cy=cy, face_selector=face_selector, base_height=base_height)
 
 
 def sloped_rectangular_cut(

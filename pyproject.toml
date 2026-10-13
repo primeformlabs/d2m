@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "d2o-subcad"
+version = "0.1.0"
+description = "SubCAD geometry, manufacturing plans, and operation simulation runtime"
+requires-python = ">=3.11"
+dependencies = [
+  "cadquery>=2.4.0",
+  "numpy>=1.26.0",
+  "trimesh>=4.4.0",
+  "scipy>=1.13.0",
+  "rtree>=1.2.0",
+]
+
+[project.optional-dependencies]
+video = ["matplotlib>=3.9.0", "Pillow>=10.0", "imageio>=2.34", "imageio-ffmpeg>=0.4"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["subcad*", "simulation*", "knowledge_graph*"]
+
