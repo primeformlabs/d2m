@@ -45,13 +45,31 @@ def replay_milling_independently(incoming, path: Toolpath, tool, *, resolution_m
     if (path.tool_type and path.tool_type != tool.tool_type) or (path.tool_diameter_mm and path.tool_diameter_mm != tool.diameter):
         raise ValueError("The selected cutter does not match the serialized Milling path.")
     shape = getattr(incoming, "_shape", incoming)
+    # Spatial grid resolution must not coarsen a retained, finer tool path.
+    motion_resolution = resolution / 2
+    for report in path.metadata.get("material_passes") or []:
+        if isinstance(report, dict) and report.get("sample_interval_mm") is not None:
+            motion_resolution = min(motion_resolution,
+                finite(report["sample_interval_mm"], "retained motion interval", positive=True))
+    if motion_resolution <= 0:
+        raise ValueError("The independent Milling motion interval exceeds its numerical precision limit.")
+    estimated_poses, previous_position = 0, None
+    for move in path.moves:
+        if not all(math.isfinite(value) for value in move.position):
+            raise ValueError("The independent Milling path contains non-finite coordinates.")
+        if previous_position is not None and move.move_type in {"feed", "plunge"}:
+            ratio = math.dist(previous_position, move.position) / motion_resolution
+            if not math.isfinite(ratio) or estimated_poses + math.ceil(ratio) + 1 > 100000:
+                raise ValueError("The independent Milling replay exceeds its pose limit. Divide the path into smaller passes.")
+            estimated_poses += math.ceil(ratio) + 1
+        previous_position = move.position
     mesh = to_mesh(shape)
     extent = mesh.bounds[1] - mesh.bounds[0]
     counts = [max(1, math.ceil(value / resolution)) for value in extent]
     if math.prod(counts) > 100000:
         raise ValueError("The independent replay exceeds its sample limit. Divide the process into smaller regions.")
     model = TriDexelModel.from_mesh(mesh, resolution=resolution)
-    engine = MaterialRemovalEngine(model, linear_resolution=resolution / 2)
+    engine = MaterialRemovalEngine(model, linear_resolution=motion_resolution)
     selected_tool = to_sim_tool(tool)
     if selected_tool is None:
         raise ValueError("The independent Milling cutter model is unavailable.")
@@ -104,6 +122,7 @@ def replay_milling_independently(incoming, path: Toolpath, tool, *, resolution_m
         "coordinate_system": "part_mm", "tool_axis": list(axis),
         "initial_volume_mm3": initial_volume, "final_volume_mm3": model.volume(),
         "removed_volume_mm3": initial_volume - model.volume(), "resolution_mm": resolution,
+        "motion_resolution_mm": motion_resolution,
         "target_comparison": comparison, "manufacturing_ready": False,
         "reasons": ["The replay uses finite grid and motion sampling. Target tolerance requires further verification.",
             "Fixture, holder clearance, feed, and spindle qualification remain required."]}

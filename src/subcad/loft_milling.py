@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import math
 
-from .milling_replay import _boolean, finite, validate_cutter
+from .milling_replay import _boolean, finite, validate_cutter, replay_pass
 from .profile_milling import _profile_wire
 from .profile_pocket_milling import run_profile_pocket
-from .toolpath import Toolpath
+from .toolpath import Toolpath, ToolpathMove
 
 
 def loft_sections(profiles):
@@ -55,13 +55,64 @@ def _target(shape, sections):
     return _boolean(shape.val(), [keep], "common")
 
 
-def run_loft_milling(shape, profiles, *, tool, tolerance_mm, stepdown, chord_error, feed, rpm, face_selector=">Z"):
+def _wall_paths(sections, *, tool, tolerance, safe_z, feed, rpm):
+    """Compensate the flat cutter's rim along each accessible wall generator."""
+    interval = min(tool.diameter / 8, tolerance / 4)
+    spacing = min(tool.radius / 2, math.sqrt(4 * tool.radius * tolerance))
+    paths, poses = [], 0
+    for section_index, (low, high) in enumerate(reversed(list(zip(sections, sections[1:]))), 1):
+        if low["type"] == "circle":
+            count = max(12, math.ceil(math.pi * low["diameter"] / spacing))
+            if count > 200:
+                raise ValueError("The loft wall exceeds the finishing-path limit. Divide the operation into smaller regions.")
+            directions = [(math.cos(2 * math.pi * index / count), math.sin(2 * math.pi * index / count)) for index in range(count)]
+            pairs = [((high["cx"] + (high["diameter"] / 2 + tool.radius) * x,
+                       high["cy"] + (high["diameter"] / 2 + tool.radius) * y, high["z_mm"]),
+                      (low["cx"] + (low["diameter"] / 2 + tool.radius) * x,
+                       low["cy"] + (low["diameter"] / 2 + tool.radius) * y, low["z_mm"])) for x, y in directions]
+        else:
+            pairs = []
+            for axis, cross in (("length", "width"), ("width", "length")):
+                count = max(1, math.ceil(low[cross] / spacing))
+                if count > 200:
+                    raise ValueError("The loft wall exceeds the finishing-path limit. Divide the operation into smaller regions.")
+                for side in (-1, 1):
+                    for index in range(count + 1):
+                        fraction = -1 + 2 * index / count
+                        points = []
+                        for section in (high, low):
+                            along = side * (section[axis] / 2 + tool.radius)
+                            across = fraction * section[cross] / 2
+                            x, y = (along, across) if axis == "length" else (across, along)
+                            points.append((section["cx"] + x, section["cy"] + y, section["z_mm"]))
+                        pairs.append(tuple(points))
+        for start, end in pairs:
+            ratio = math.dist(start, end) / interval if interval > 0 else math.inf
+            if not math.isfinite(ratio) or poses + math.ceil(ratio) + 2 > 10000 or len(paths) >= 200:
+                raise ValueError("The loft wall exceeds the finishing-pose limit. Divide the operation into smaller regions.")
+            poses += math.ceil(ratio) + 2
+            path = Toolpath("loft_mill", safe_z=safe_z, tool_type=tool.tool_type,
+                tool_diameter_mm=tool.diameter, feed_mm_min=feed, spindle_rpm=rpm,
+                metadata={"coordinate_system":"part_mm", "tool_axis":[0,0,1], "pass_role":"finishing",
+                    "path_kind":"loft_wall_generator", "wall_section_index":section_index,
+                    "sample_interval_mm":interval, "generator_spacing_mm":spacing})
+            path.append(ToolpathMove("rapid", (start[0], start[1], safe_z)))
+            path.append(ToolpathMove("plunge", start, feed=feed, spindle_rpm=rpm))
+            path.append(ToolpathMove("feed", end, feed=feed, spindle_rpm=rpm))
+            path.append(ToolpathMove("retract", (end[0], end[1], safe_z)))
+            paths.append(path)
+    return paths
+
+
+def run_loft_milling(shape, profiles, *, tool, tolerance_mm, stepdown, chord_error, feed, rpm, face_selector=">Z", finish_walls=True):
     if face_selector != ">Z":
         raise ValueError("Loft milling requires a positive Z setup. Another cutter axis needs an explicit loft transform.")
     sections = loft_sections(profiles)
     tolerance = finite(tolerance_mm, "loft preview tolerance", positive=True)
     step = finite(stepdown, "loft stepdown", positive=True)
     chord = finite(chord_error, "loft chord error", positive=True)
+    if not isinstance(finish_walls, bool):
+        raise ValueError("The loft wall-finishing selection must be true or false.")
     if tool is None or tool.tool_type != "flat_endmill":
         raise ValueError("Loft clearing requires a flat end mill with known cutter geometry.")
     bounds = shape.val().BoundingBox()
@@ -89,6 +140,8 @@ def run_loft_milling(shape, profiles, *, tool, tolerance_mm, stepdown, chord_err
         levels.extend(low["z_mm"] if index == count else high["z_mm"] - (high["z_mm"] - low["z_mm"]) * index / count
             for index in range(1, count + 1))
     target = _target(shape, sections)
+    finishing_paths = _wall_paths(sections, tool=tool, tolerance=tolerance,
+        safe_z=bounds.zmax + max(2, tool.radius), feed=feed, rpm=rpm) if finish_walls else []
     aggregate = Toolpath("loft_mill", safe_z=bounds.zmax + max(2, tool.radius), tool_type=tool.tool_type, tool_diameter_mm=tool.diameter,
         feed_mm_min=feed, spindle_rpm=rpm,
         metadata={"coordinate_system": "part_mm", "tool_axis": [0, 0, 1], "face_selector": ">Z",
@@ -105,17 +158,33 @@ def run_loft_milling(shape, profiles, *, tool, tolerance_mm, stepdown, chord_err
         aggregate.moves.extend(path.moves)
         for state, report in zip(retained, checks):
             number = len(states) + 1
-            role = "finishing" if level_index == len(levels) else "roughing"
+            role = "finishing" if not finish_walls and level_index == len(levels) else "roughing"
             check = {**report, "pass_index": number, "pass_role": role, "depth_level_index": level_index,
                 "section_z_mm": z, "move_start_index": offset + report["move_start_index"],
                 "move_end_index": offset + report["move_end_index"], "manufacturing_ready": False}
             reports.append(check)
             states.append({**state, "pass_index": number, "pass_role": role,
                 "label": f"After loft {role} pass {number}", "geometry_replay": check})
+    clearing_remaining = _boolean(result.val(), [target], "cut").Volume()
+    for path in finishing_paths:
+        if len(states) >= 1000:
+            raise ValueError("The loft exceeds the retained pass limit. Divide the operation into smaller regions.")
+        before = result.val().Volume()
+        result, check = replay_pass(result, path, tool, sample_interval_mm=path.metadata["sample_interval_mm"])
+        number, start = len(states) + 1, len(aggregate.moves)
+        aggregate.moves.extend(path.moves)
+        check.update(pass_index=number, pass_role="finishing", machining_phase="wall_finishing",
+            removed_volume_mm3=before - result.val().Volume(), move_start_index=start,
+            move_end_index=len(aggregate.moves), wall_section_index=path.metadata["wall_section_index"],
+            generator_spacing_mm=path.metadata["generator_spacing_mm"])
+        reports.append(check)
+        states.append({"shape":result, "pass_index":number, "pass_role":"finishing",
+            "label":f"After loft wall-finishing pass {number}", "geometry_replay":check})
     missing = _boolean(target, [result.val()], "cut").Volume()
     remaining = _boolean(result.val(), [target], "cut").Volume()
     comparison = {"method": "native_brep_ruled_loft", "overcut_volume_mm3": max(0, missing),
-        "remaining_target_material_mm3": max(0, remaining), "tolerance_verified": False, "manufacturing_ready": False}
+        "remaining_target_material_mm3": max(0, remaining), "clearing_remaining_material_mm3": max(0, clearing_remaining),
+        "wall_finishing_enabled":finish_walls, "tolerance_verified": False, "manufacturing_ready": False}
     if missing > 1e-6:
         raise ValueError("The selected loft cutter removes required material. Review the cutter compensation and path.")
     if shape.val().Volume() - result.val().Volume() <= 1e-8:

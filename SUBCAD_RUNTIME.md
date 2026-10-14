@@ -13,13 +13,22 @@ python -m pip wheel --no-deps . --wheel-dir dist
 Install the wheel in the CAD environment:
 
 ```text
-python -m pip install --no-deps dist/d2o_subcad-0.2.18-py3-none-any.whl
+python -m pip install --no-deps dist/d2o_subcad-0.2.19-py3-none-any.whl
 ```
 
 Use `from subcad import Stock` from an installed package.
 Source-checkout imports with `from src.subcad import Stock` remain available.
 The package requires CadQuery, NumPy, trimesh, SciPy, and rtree.
 The optional `video` dependencies support rendered video export.
+
+Version 0.2.19 adds loft wall-finishing paths through the selected flat cutter.
+`finish_walls=True` is the default. `finish_walls=False` retains the explicit clearing mode.
+The wall paths follow the accessible ruled surfaces and preserve the material below the loft base.
+The native replay uses finite cutter poses and retains each finishing result.
+The comparison reports the remaining material before and after wall finishing.
+The independent replay preserves the finer retained motion interval when its spatial grid is coarser.
+Invalid intervals and excessive motion work produce specific reasons before replay.
+Finite cutter poses, wall scallops, fixture qualification, and manufacturing tolerances remain unverified.
 
 Version 0.2.18 adds native `loft_mill()` replay for concentric ruled circle or rectangle sections.
 Each section supplies `type`, `z_mm`, `cx`, `cy`, and either `diameter` or `length` and `width`.
@@ -30,7 +39,8 @@ The engine retains every roughing and finishing pass and its matching tool moves
 The reference loft supplies the comparison target. It does not replace the material result.
 The native comparison reports overcut and remaining terraced wall material.
 Shifted sections, mixed section types, overhangs, missing dimensions, unsupported geometry fields, and unreachable cutters produce specific reasons.
-Other cutter axes, arbitrary loft sections, continuous wall finishing, and complete tolerance qualification remain incomplete.
+Version 0.2.19 adds wall finishing to this clearing model.
+Other cutter axes, arbitrary loft sections, exact continuous cutter-sweep geometry, and complete tolerance qualification remain incomplete.
 The operation remains a preview and cannot authorize manufacturing release.
 
 Version 0.2.16 adds `replay_bending_material()` for actual incoming sheet meshes.

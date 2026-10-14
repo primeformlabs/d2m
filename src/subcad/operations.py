@@ -3881,6 +3881,7 @@ class LoftMillOp(PureToleranceOp):
     depth: float = 0.0
     stepdown: float = 1.0
     chord_error: float = 0.01
+    finish_walls: bool = True
 
     def __post_init__(self):
         from .loft_milling import loft_sections
@@ -3900,7 +3901,7 @@ class LoftMillOp(PureToleranceOp):
         result, self._loft_toolpath, self._material_pass_states, self._pass_reports, self._comparison, self.depth = run_loft_milling(
             shape, self.profiles, tool=self.tool, tolerance_mm=self.tolerance_mm, stepdown=self.stepdown,
             chord_error=self.chord_error, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds),
-            face_selector=self.face_selector)
+            face_selector=self.face_selector, finish_walls=self.finish_walls)
         return result
 
     def to_toolpath(self):
@@ -3910,15 +3911,20 @@ class LoftMillOp(PureToleranceOp):
 
     def to_dict(self) -> dict:
         data = super().to_dict()
-        reasons = ["The loft uses layered cutter clearing around concentric ruled sections. Terraced wall material remains between levels.",
+        reasons = ["Loft wall finishing uses selected cutter poses. Finite pose spacing can leave wall scallops and unverified surface material."
+            if self.finish_walls else "The loft uses layered cutter clearing around concentric ruled sections. Terraced wall material remains between levels.",
             "The loft requires independent path, fixture, feed, spindle, and manufacturing tolerance verification."]
+        comparison = getattr(self, "_comparison", None)
+        if comparison:
+            reasons.append(f"The nominal loft comparison finds {comparison['remaining_target_material_mm3']:.3f} mm³ of remaining wall stock. This does not verify manufacturing tolerances.")
         if not (self.tool.physical_assembly or {}).get("owned"):
             reasons.append("The loft requires an owned physical cutter assembly.")
         data.update(profiles=_profile_payload(self.profiles or []), material_passes=getattr(self, "_pass_reports", []),
-            operation_target_comparison=getattr(self, "_comparison", None), geometry_status="requires_review",
-            geometry_fidelity="layered_selected_cutter_replay", manufacturing_completeness="requires_validation",
+            operation_target_comparison=comparison, geometry_status="requires_review",
+            geometry_fidelity="sampled_cutter" if self.finish_walls else "layered_selected_cutter_replay", manufacturing_completeness="requires_validation",
             verification_status="not_verified", toolpath_status="unverified", cutter_compensation="geometry_applied",
-            face_selector=self.face_selector, stepdown_mm=self.stepdown, chord_error_mm=self.chord_error,
+            face_selector=self.face_selector, stepdown_mm=self.stepdown, chord_error_mm=self.chord_error, wall_finishing_enabled=self.finish_walls,
+            wall_sample_interval_mm=min(self.tool.diameter / 8, self.tolerance_mm / 4) if self.finish_walls else None,
             review_reasons=reasons)
         data["tool_selection"] = _tool_selection_dict(getattr(self, "tool_selection", None))
         return data

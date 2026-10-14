@@ -24,10 +24,13 @@ def test_loft_cuts_actual_material_and_retains_compensated_roughing_and_finishin
     assert record["operation"]=="loft_mill"
     assert record["operation_target_comparison"]["overcut_volume_mm3"]<1e-6
     assert record["operation_target_comparison"]["remaining_target_material_mm3"]>0
+    assert record["operation_target_comparison"]["remaining_target_material_mm3"] < record["operation_target_comparison"]["clearing_remaining_material_mm3"] / 2
+    assert record["operation_target_comparison"]["wall_finishing_enabled"]
     assert record["verification_status"]=="not_verified"
     assert record["achieved_tolerance_estimate_mm"] is None
     assert record["cutter_compensation"]=="geometry_applied"
     assert {state["pass_role"] for state in record["material_passes"]}=={"roughing","finishing"}
+    assert any(state.get("machining_phase")=="wall_finishing" for state in record["material_passes"])
     assert len(result._state_history)==len(record["material_passes"])+1
     assert all(state["shape"].val().isValid() for state in result._state_history)
     assert all(first["shape"].val().Volume()>=last["shape"].val().Volume()-1e-7
@@ -103,7 +106,8 @@ def test_loft_path_replays_independently_against_incoming_material():
     model,report=replay_milling_independently(incoming,path,tool,resolution_mm=0.5,target=result)
     assert model.get_material_at(np.array([0.25,0.25,1.25]))
     assert not model.get_material_at(np.array([2.75,0.25,1.25]))
-    assert report["target_comparison"]["status"]=="sampled_match"
+    assert report["target_comparison"]["status"]=="sampled_match",report["target_comparison"]
+    assert report["motion_resolution_mm"]<=0.125
     assert not report["manufacturing_ready"] and not report["target_comparison"]["tolerance_verified"]
     assert incoming._shape.val().isInside(cq.Vector(2.75,0.25,1.25))
 
@@ -111,3 +115,11 @@ def test_loft_path_replays_independently_against_incoming_material():
 def test_loft_rejects_an_unbounded_preview_interval_before_native_replay():
     with pytest.raises(ValueError,match="depth-pass limit"):
         Stock.rectangular(8,8,4).loft_mill(sections(),tool=ToolSpec("flat_endmill",4),tolerance_mm=1e-320)
+
+
+def test_wall_finishing_flag_and_path_budget_have_specific_reasons():
+    from src.subcad.loft_milling import _wall_paths
+    with pytest.raises(ValueError,match="true or false"):
+        Stock.rectangular(8,8,4).loft_mill(sections(),tool=ToolSpec("flat_endmill",4),finish_walls="yes")
+    with pytest.raises(ValueError,match="finishing.*limit"):
+        _wall_paths(sections(),tool=ToolSpec("flat_endmill",4),tolerance=1e-8,safe_z=4,feed=100,rpm=1000)
