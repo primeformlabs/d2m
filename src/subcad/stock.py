@@ -2101,11 +2101,13 @@ class Stock:
         ))
 
     def loft_mill(self, profiles, *, tolerance_mm: float = 0.10,
-                  tool: Optional[ToolSpec] = None) -> "Stock":
+                  tool: Optional[ToolSpec] = None, stepdown: float = 1.0,
+                  chord_error: float = 0.01, face_selector: str = ">Z") -> "Stock":
         from .operations import LoftMillOp
         return self._apply_op(LoftMillOp(
             profiles=profiles, tolerance_mm=tolerance_mm,
-            tool=tool, material=self._material,
+            tool=tool, material=self._material, stepdown=stepdown,
+            chord_error=chord_error, face_selector=face_selector,
         ))
 
     def dome_mill(self, radius: float, height: float, *, cx: float = 0.0,

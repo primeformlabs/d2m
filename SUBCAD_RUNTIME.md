@@ -13,13 +13,25 @@ python -m pip wheel --no-deps . --wheel-dir dist
 Install the wheel in the CAD environment:
 
 ```text
-python -m pip install --no-deps dist/d2o_subcad-0.2.17-py3-none-any.whl
+python -m pip install --no-deps dist/d2o_subcad-0.2.18-py3-none-any.whl
 ```
 
 Use `from subcad import Stock` from an installed package.
 Source-checkout imports with `from src.subcad import Stock` remain available.
 The package requires CadQuery, NumPy, trimesh, SciPy, and rtree.
 The optional `video` dependencies support rendered video export.
+
+Version 0.2.18 adds native `loft_mill()` replay for concentric ruled circle or rectangle sections.
+Each section supplies `type`, `z_mm`, `cx`, `cy`, and either `diameter` or `length` and `width`.
+Section Z positions increase from the base to the top. The section dimensions cannot increase toward the top.
+The top must match the incoming stock datum. The base leaves existing material below it.
+The selected flat end mill clears each level through actual compensated cutter paths.
+The engine retains every roughing and finishing pass and its matching tool moves.
+The reference loft supplies the comparison target. It does not replace the material result.
+The native comparison reports overcut and remaining terraced wall material.
+Shifted sections, mixed section types, overhangs, missing dimensions, unsupported geometry fields, and unreachable cutters produce specific reasons.
+Other cutter axes, arbitrary loft sections, continuous wall finishing, and complete tolerance qualification remain incomplete.
+The operation remains a preview and cannot authorize manufacturing release.
 
 Version 0.2.16 adds `replay_bending_material()` for actual incoming sheet meshes.
 It retains each ordered bend result and preserves closed surface topology and cut holes.

@@ -59,7 +59,7 @@ def test_native_replay_does_not_cut_during_a_rapid_move():
 @pytest.mark.parametrize("operation,reason", [
     (lambda stock: stock.surface_mill({"id": "missing_patch"}), "explicit geometry"),
     (lambda stock: stock.sweep_mill({"width": 4, "length": 8}, {"points": [(0, 0), (5, 0)]}), "no native material-removal"),
-    (lambda stock: stock.loft_mill([{"diameter": 8}, {"diameter": 4}]), "no native material-removal"),
+    (lambda stock: stock.loft_mill([{"diameter": 8}, {"diameter": 4}]), "section"),
 ])
 def test_missing_surface_geometry_never_returns_unchanged_machined_material(operation, reason):
     with pytest.raises(ValueError, match=reason):

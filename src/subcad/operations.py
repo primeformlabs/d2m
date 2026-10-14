@@ -3876,12 +3876,51 @@ class SweepMillOp(PureToleranceOp):
 @dataclass
 class LoftMillOp(PureToleranceOp):
     operation_name: str = "loft_mill"
-    process: str = "5axis"
+    process: str = "mill"
     profiles: Optional[list[Any]] = None
+    depth: float = 0.0
+    stepdown: float = 1.0
+    chord_error: float = 0.01
+
+    def __post_init__(self):
+        from .loft_milling import loft_sections
+        from .milling_replay import finite
+        sections = loft_sections(self.profiles)
+        self.depth = sections[-1]["z_mm"] - sections[0]["z_mm"]
+        finite(self.tolerance_mm, "loft preview tolerance", positive=True)
+        if self.tool is None:
+            self.tool, self.tool_selection = _select_inventory_tool(
+                ToolRequirement("flat_endmill", min_flute_length_mm=self.depth, feature="loft_mill",
+                    reason="selected cutter for native ruled loft clearing", prefer_largest=True),
+                ToolSpec("flat_endmill", 6, inventory_count=0))
+        self.feeds_speeds = get_feeds_speeds(_resolve_fs_tool_type(self.tool.tool_type), self.tool.diameter, self.material)
+
+    def apply(self, shape):
+        from .loft_milling import run_loft_milling
+        result, self._loft_toolpath, self._material_pass_states, self._pass_reports, self._comparison, self.depth = run_loft_milling(
+            shape, self.profiles, tool=self.tool, tolerance_mm=self.tolerance_mm, stepdown=self.stepdown,
+            chord_error=self.chord_error, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds),
+            face_selector=self.face_selector)
+        return result
+
+    def to_toolpath(self):
+        if not hasattr(self, "_loft_toolpath"):
+            raise ValueError("The loft path requires the actual incoming material state.")
+        return self._loft_toolpath
 
     def to_dict(self) -> dict:
         data = super().to_dict()
-        data.update({"profiles": _profile_payload(self.profiles or [])})
+        reasons = ["The loft uses layered cutter clearing around concentric ruled sections. Terraced wall material remains between levels.",
+            "The loft requires independent path, fixture, feed, spindle, and manufacturing tolerance verification."]
+        if not (self.tool.physical_assembly or {}).get("owned"):
+            reasons.append("The loft requires an owned physical cutter assembly.")
+        data.update(profiles=_profile_payload(self.profiles or []), material_passes=getattr(self, "_pass_reports", []),
+            operation_target_comparison=getattr(self, "_comparison", None), geometry_status="requires_review",
+            geometry_fidelity="layered_selected_cutter_replay", manufacturing_completeness="requires_validation",
+            verification_status="not_verified", toolpath_status="unverified", cutter_compensation="geometry_applied",
+            face_selector=self.face_selector, stepdown_mm=self.stepdown, chord_error_mm=self.chord_error,
+            review_reasons=reasons)
+        data["tool_selection"] = _tool_selection_dict(getattr(self, "tool_selection", None))
         return data
 
 
