@@ -2935,6 +2935,7 @@ class ProfileContourOp(ContourOp):
             chord_error=self.chord_error, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds))
         self._contour_toolpath.metadata["tool"] = _tool_dict(self.tool)
         self._contour_toolpath.metadata["tool_selection"] = _tool_selection_dict(self.tool_selection)
+        FaceMotionFrame(compute_bounding_box(shape), self.face_selector).bind_absolute(self._contour_toolpath)
         return result
 
     def to_toolpath(self):
@@ -3763,6 +3764,7 @@ class NativeSurfaceOp(PureToleranceOp):
         if shape.val().Volume() - result.val().Volume() <= 1e-8:
             raise ValueError("The surface path does not remove material from the incoming stock.")
         self._surface_toolpath.metadata["material_passes"] = self._pass_reports
+        FaceMotionFrame(compute_bounding_box(shape), self.face_selector).bind_absolute(self._surface_toolpath)
         return result
 
     def _raster_passes(self, bounds, tip_height):

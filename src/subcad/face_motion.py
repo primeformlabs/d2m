@@ -75,6 +75,18 @@ class FaceMotionFrame:
         })
         return path
 
+    def bind_absolute(self, path: Toolpath) -> Toolpath:
+        """Describe an existing part-coordinate path without transforming its positions."""
+        if path.metadata.get("coordinate_system") != "part_mm" or path.metadata.get("tool_axis") != self.tool_axes["z_axis"]:
+            raise ValueError("Absolute face motion requires matching part coordinates and a cardinal cutter axis.")
+        for move in path.moves:
+            if move.arc_center is not None or len(move.position) != 3 or not all(math.isfinite(value) for value in move.position):
+                raise ValueError("Absolute face motion requires finite linear cutter-tip positions.")
+        path.metadata.update({"tool_origin": "cutting_tip", "tool_frame": self.tool_axes,
+            "face_selector": self.face, "incoming_bounds_mm": dict(self.bounds),
+            "verification_status": "not_verified", "source": "cam_intent"})
+        return path
+
 
 def rounded_contour(half_x: float, half_y: float, radius: float,
                     chord_error: float) -> list[tuple[float, float]]:

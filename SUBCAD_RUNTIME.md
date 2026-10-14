@@ -13,7 +13,7 @@ python -m pip wheel --no-deps . --wheel-dir dist
 Install the wheel in the CAD environment:
 
 ```text
-python -m pip install --no-deps dist/d2o_subcad-0.2.5-py3-none-any.whl
+python -m pip install --no-deps dist/d2o_subcad-0.2.6-py3-none-any.whl
 ```
 
 Use `from subcad import Stock` from an installed package.
@@ -123,3 +123,8 @@ Version 0.2.5 combines these contour paths with browser stock frames and the con
 It preserves supplied spindle phase across consecutive operations with the same recorded insert and spindle conditions.
 It records non-cutting transport without changing the original operation-level plan.
 Tool, setup, speed, and direction changes still need recorded transition data.
+
+Version 0.2.6 exports fixed stock frames for native contour and surface paths.
+These paths retain their existing absolute part coordinates and their independent replay contract.
+The export includes the actual incoming bounds and a cutting-tip origin.
+The browser can replay every retained pass with its selected flat or ball cutter.
