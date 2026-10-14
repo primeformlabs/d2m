@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from subcad import Stock, replay_laser_material, release_laser_part, laser_selection_region
 from subcad.geometry import export_stl
+from subcad.milling_replay import _boolean
 
 
 def test_mesh_export_preserves_live_material_through_eight_circular_holes(tmp_path):
@@ -28,6 +29,38 @@ def test_mesh_export_preserves_live_material_through_eight_circular_holes(tmp_pa
 
 def replay(source, path, kerf=0.4):
     return replay_laser_material(source, path, kerf_width_mm=kerf, units="mm", coordinate_system="stock_local_mm")
+
+
+@pytest.mark.parametrize("path", [
+    [(-5,-5),(5,-5),(5,5),(-5,5),(-5,-5)],
+    [(-5,-5),(-5,5),(5,5),(5,-5),(-5,-5)],
+    [(-4,-4),(-5,-5),(5,-5),(5,5),(-5,5),(-5,-5)],
+    [(-5,-5),(5,-5),(5,0),(0,0),(0,5),(-5,5),(-5,-5)],
+    [(-5,-5),(5,5),(-5,5),(5,-5),(-5,-5)],
+    [(-6,-4),(-1,4),(5,-2)],
+])
+def test_contour_resolution_preserves_the_exact_segment_footprint(path):
+    source = Stock.sheet(20,20,2)
+    reference = replay(source,path)
+    result = replay_laser_material(source,path,kerf_width_mm=0.4,units="mm",
+        coordinate_system="stock_local_mm",retain_segments=False)
+    assert len(result.passes) == 2
+    assert result.passes[1].points_mm == [tuple(point) for point in path]
+    assert result.passes[0].after.Volume() == pytest.approx(reference.passes[0].after.Volume(),abs=1e-7)
+    assert result.report["removed_volume_mm3"] == pytest.approx(reference.report["removed_volume_mm3"],abs=1e-6)
+    assert _boolean(reference.material,[result.material],"cut").Volume() == pytest.approx(0,abs=1e-6)
+    assert _boolean(result.material,[reference.material],"cut").Volume() == pytest.approx(0,abs=1e-6)
+    assert source.volume == pytest.approx(800)
+    assert result.report["retained_phase_resolution"] == "contour"
+    assert result.report["manufacturing_ready"] is False
+
+
+def test_contour_acceleration_rejects_a_self_crossing_star_as_a_convex_offset():
+    vertices = [(5*math.cos(i*2*math.pi/5),5*math.sin(i*2*math.pi/5)) for i in range(5)]
+    path = [vertices[i] for i in [0,2,4,1,3,0]]
+    result = replay_laser_material(Stock.sheet(20,20,2),path,kerf_width_mm=0.4,units="mm",
+        coordinate_system="stock_local_mm",retain_segments=False)
+    assert result.report["footprint_method"] == "exact_segment_capsules"
 
 
 def test_native_beam_removes_a_capsule_without_filling_the_contour():
