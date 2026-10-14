@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "d2o-subcad"
-version = "0.2.10"
+version = "0.2.11"
 description = "SubCAD geometry, manufacturing plans, and operation simulation runtime"
 requires-python = ">=3.11"
 dependencies = [

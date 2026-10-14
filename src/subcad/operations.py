@@ -50,7 +50,7 @@ from .geometry import (
 )
 from .profiles import normalize_profile_points, profile_span_yx
 from .tool_library import ToolSpec, ToolCatalog
-from .tool_selection import ToolRequirement, ToolSelectionResult, select_or_fallback, select_tool
+from .tool_selection import ToolRequirement, ToolSelectionResult, ToolUnavailableError, select_or_fallback, select_tool
 from .material import get_feeds_speeds
 from .toolpath import Toolpath, ToolpathMove
 from .drilling_replay import apply_drilling, drilling_record
@@ -433,29 +433,6 @@ def _pick_slot_tool(slot_width: float) -> ToolSpec:
             return ToolCatalog.select("flat_endmill")
         except ValueError:
             return ToolSpec("flat_endmill", max(slot_width * 0.8, 1.0))
-
-
-def _pick_reamer(hole_diameter: float) -> ToolSpec:
-    """Pick the closest reamer tool for a given hole diameter.
-
-    Searches the catalog for tools whose name starts with ``REAM_`` and
-    returns the smallest reamer whose diameter >= *hole_diameter*.  If no
-    reamer is large enough, the largest available reamer is returned.
-    Falls back to a generic drill-type tool with a 45-degree tip angle
-    when the catalog contains no reamers at all.
-    """
-    ToolCatalog._ensure_initialised()
-    reamers = sorted(
-        (t for name, t in ToolCatalog._tools.items() if name.startswith("REAM_")),
-        key=lambda t: t.diameter,
-    )
-    if reamers:
-        for r in reamers:
-            if r.diameter >= hole_diameter:
-                return r
-        return reamers[-1]
-    # Fallback: no reamers in catalog
-    return ToolSpec("drill", hole_diameter, tip_angle=45.0)
 
 
 def _laser_tool(kerf_width: float) -> ToolSpec:
@@ -1898,7 +1875,13 @@ class ReamOp(MachiningOperation):
 
     def __post_init__(self):
         if self.tool is None:
-            self.tool = _pick_reamer(self.diameter)
+            self.tool_selection = select_tool(ToolRequirement("reamer",
+                min_diameter_mm=self.diameter, max_diameter_mm=self.diameter,
+                min_flute_length_mm=self.depth, require_point_geometry=True, include_point_length_in_reach=True,
+                feature="ream", reason="reamer diameter must match the finished hole; its recorded lead must fit an existing pilot"))
+            if not self.tool_selection.ok:
+                raise ToolUnavailableError(self.tool_selection)
+            self.tool = self.tool_selection.selected_tool
 
         tool_type_fs = _resolve_fs_tool_type(self.tool.tool_type)
         self.feeds_speeds = get_feeds_speeds(
@@ -1909,10 +1892,11 @@ class ReamOp(MachiningOperation):
     # ------------------------------------------------------------------
 
     def apply(self, shape):
-        return drill_hole(shape, self.cx, self.cy, self.diameter, self.depth,
-                          self.through, face_selector=self.face_selector)
+        from .hole_finishing import apply_reaming
+        return apply_reaming(self, shape)
 
     def to_dict(self) -> dict:
+        from .hole_finishing import hole_finishing_record
         return {
             "operation": "ream",
             "tool_type": self.tool.tool_type,
@@ -1927,18 +1911,13 @@ class ReamOp(MachiningOperation):
             if "error" not in self.feeds_speeds
             else None,
             "notes": "",
+            **hole_finishing_record(self, ream=True),
         }
 
     def to_toolpath(self) -> Toolpath:
-        return _drill_toolpath(
-            "ream",
-            self.tool,
-            self.feeds_speeds,
-            self.cx,
-            self.cy,
-            self.depth,
-            dwell_seconds=0.2,
-        )
+        if not hasattr(self, "_ream_toolpath"):
+            raise ValueError("Reaming has no retained selected-cutter path. Apply the operation to its incoming material first.")
+        return self._ream_toolpath
 
 
 # ---------------------------------------------------------------------------
@@ -1947,27 +1926,28 @@ class ReamOp(MachiningOperation):
 
 @dataclass
 class BoreOp(MachiningOperation):
-    """Boring operation for hole trueness and finish.
-
-    Auto-selects a flat endmill approximately 90 % of the bore diameter.
-    """
+    """Circular hole milling with a selected flat end mill and retained passes."""
 
     cx: float = 0.0
     cy: float = 0.0
     diameter: float = 20.0
     depth: float = 10.0
     through: bool = False
+    stepdown: float = 1.0
+    finish_allowance: float = 0.0
+    chord_error: float = 0.01
 
     tool: Optional[ToolSpec] = None
     material: str = "aluminum_6061"
 
     def __post_init__(self):
         if self.tool is None:
-            tool_dia = self.diameter * 0.9
-            try:
-                self.tool = ToolCatalog.get_best_for("flat_endmill", tool_dia)
-            except ValueError:
-                self.tool = ToolSpec("flat_endmill", tool_dia)
+            self.tool_selection = select_tool(ToolRequirement("flat_endmill", max_diameter_mm=self.diameter,
+                min_flute_length_mm=self.depth, prefer_largest=True, feature="bore",
+                reason="circular milling requires an available end mill that fits the hole and reaches its complete depth"))
+            if not self.tool_selection.ok:
+                raise ToolUnavailableError(self.tool_selection)
+            self.tool = self.tool_selection.selected_tool
 
         tool_type_fs = _resolve_fs_tool_type(self.tool.tool_type)
         self.feeds_speeds = get_feeds_speeds(
@@ -1978,12 +1958,14 @@ class BoreOp(MachiningOperation):
     # ------------------------------------------------------------------
 
     def apply(self, shape):
-        return drill_hole(shape, self.cx, self.cy, self.diameter, self.depth,
-                          self.through, face_selector=self.face_selector)
+        from .hole_finishing import apply_circular_milling
+        return apply_circular_milling(self, shape)
 
     def to_dict(self) -> dict:
+        from .hole_finishing import hole_finishing_record
         return {
             "operation": "bore",
+            "strategy": "circular_milling",
             "tool_type": self.tool.tool_type,
             "tool_diameter_mm": self.tool.diameter,
             "tool": _tool_dict(self.tool),
@@ -1996,34 +1978,13 @@ class BoreOp(MachiningOperation):
             if "error" not in self.feeds_speeds
             else None,
             "notes": "",
+            **hole_finishing_record(self),
         }
 
     def to_toolpath(self) -> Toolpath:
-        stepdown = max(self.tool.diameter * 0.25, 0.5)
-        radius = max(self.diameter / 2.0 - self.tool.radius, 0.0)
-        tp = _new_toolpath(
-            "bore",
-            self.tool,
-            self.feeds_speeds,
-            metadata={"hole_diameter_mm": self.diameter},
-        )
-        feed = _feed_rate(self.feeds_speeds)
-        _move(tp, "rapid", self.cx, self.cy, tp.safe_z)
-        for z in _depth_levels(self.depth, stepdown):
-            _move(tp, "plunge", self.cx, self.cy, z, feed=feed)
-            if radius > 0:
-                _move(tp, "feed", self.cx + radius, self.cy, z, feed=feed)
-                center = (self.cx, self.cy, z)
-                for x, y in (
-                    (self.cx, self.cy + radius),
-                    (self.cx - radius, self.cy),
-                    (self.cx, self.cy - radius),
-                    (self.cx + radius, self.cy),
-                ):
-                    _move(tp, "arc", x, y, z, feed=feed, arc_center=center, arc_direction="ccw")
-                _move(tp, "feed", self.cx, self.cy, z, feed=feed)
-        _move(tp, "retract", self.cx, self.cy, tp.safe_z)
-        return tp
+        if not hasattr(self, "_bore_toolpath"):
+            raise ValueError("Circular milling has no retained cutter path. Apply the operation to its incoming material first.")
+        return self._bore_toolpath
 
 
 # ---------------------------------------------------------------------------

@@ -10,13 +10,15 @@ from .toolpath import Toolpath, ToolpathMove
 
 
 def point_geometry(tool):
-    if tool is None or tool.tool_type != "drill":
-        raise ValueError("Native drilling requires a selected drill with recorded point geometry.")
+    if tool is None or tool.tool_type not in {"drill", "reamer"}:
+        raise ValueError("Axial cutter replay requires a selected drill or reamer with recorded point geometry.")
     diameter = finite(tool.diameter, "drill diameter", positive=True)
     angle = finite(tool.tip_angle, "drill point angle", positive=True)
     tip = finite(tool.tip_diameter, "drill tip diameter")
     if angle > 180 or tip < 0 or tip > diameter:
         raise ValueError("The drill point angle must not exceed 180 degrees. Its tip diameter must fit the cutter diameter.")
+    if tool.tool_type == "reamer" and not 0 < tip < diameter:
+        raise ValueError("Reaming requires a recorded lead tip diameter smaller than the finished hole and greater than zero.")
     height = 0 if angle == 180 else (diameter - tip) / (2 * math.tan(math.radians(angle / 2)))
     if finite(tool.flute_length, "drill flute length", positive=True) <= height:
         raise ValueError("The drill flute length does not contain its recorded point geometry.")
@@ -41,7 +43,7 @@ def axial_sweep(tool, start, end):
 
 
 def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z",
-                 through=False, spot=False, peck_step=None, feed=100, rpm=None):
+                 through=False, spot=False, peck_step=None, feed=100, rpm=None, ream=False):
     """Blind depth is the full-diameter depth; spot depth is the tip depth."""
     import cadquery as cq
     requested = finite(diameter, "hole diameter", positive=True)
@@ -52,6 +54,8 @@ def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z"
     if depth < 0 or (not through and depth <= 0):
         raise ValueError("The drilling depth must be positive for a blind hole or a spot.")
     radius, tip, point_height = point_geometry(tool)
+    if tool.tool_type != ("reamer" if ream else "drill"):
+        raise ValueError("The selected axial cutter type does not match the drilling or reaming operation.")
     if not spot and abs(tool.diameter - requested) > 1e-8:
         raise ValueError("The selected drill diameter does not match the requested hole diameter.")
     plane, mirror = _setup_plane(face_selector)
@@ -63,6 +67,13 @@ def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z"
     travel = full_depth if spot else full_depth + point_height
     if not through and not spot and travel > bounds.zlen + 1e-8:
         raise ValueError("The drill point passes through the incoming material. Use through drilling or change the blind depth.")
+    if ream:
+        # The complete lead must enter an existing hole. Test the actual
+        # incoming material, including preceding cuts and the blind floor.
+        pilot = cq.Solid.makeCylinder(tip, travel, cq.Vector(cx, cy * mirror, bounds.zmax - travel))
+        contact = _boolean(local.val(), [pilot], "common")
+        if not contact.isValid() or (contact.Solids() and contact.Volume() > 1e-8):
+            raise ValueError("The reamer lead has no clear pilot hole through its complete travel. Drill a suitable pilot hole first.")
     limit = min(finite(tool.flute_length, "drill flute length", positive=True),
         finite(tool.stickout_mm, "drill projection", positive=True),
         finite(tool.reach_mm or tool.flute_length, "drill reach", positive=True))
@@ -72,9 +83,9 @@ def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z"
     count = max(1, math.ceil(travel / step))
     if count > 100:
         raise ValueError("The drill exceeds the retained peck limit. Divide the operation into smaller depth ranges.")
-    operation = "spot_drill" if spot else "peck_drill" if peck_step is not None else "drill"
+    operation = "ream" if ream else "spot_drill" if spot else "peck_drill" if peck_step is not None else "drill"
     safe = bounds.zmax + max(2, radius)
-    path = Toolpath(operation, safe_z=safe, tool_type="drill", tool_diameter_mm=tool.diameter,
+    path = Toolpath(operation, safe_z=safe, tool_type=tool.tool_type, tool_diameter_mm=tool.diameter,
         feed_mm_min=feed, spindle_rpm=rpm, metadata={"coordinate_system": "part_mm",
             "tool_axis": list(plane.zDir.toTuple()), "face_selector": face_selector,
             "point_angle_deg": tool.tip_angle, "tip_diameter_mm": tool.tip_diameter,
@@ -100,9 +111,10 @@ def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z"
         moves = [ToolpathMove("rapid", start), ToolpathMove("plunge", end, feed=feed, spindle_rpm=rpm),
             ToolpathMove("retract", start)]
         path.moves.extend(replace(move, position=plane.toWorldCoords(move.position).toTuple()) for move in moves)
-        report = {"pass_index": index, "pass_role": "spotting" if spot else "drilling", "path_kind": "axial_plunge",
+        report = {"pass_index": index, "pass_role": "reaming" if ream else "spotting" if spot else "drilling", "path_kind": "axial_plunge",
             "move_start_index": first, "move_end_index": len(path.moves), "removed_volume_mm3": before - result.val().Volume(),
-            "method": "selected_drill_axial_sweep", "geometry_fidelity": "rotational_drill_envelope",
+            "method": "selected_reamer_axial_sweep" if ream else "selected_drill_axial_sweep",
+            "geometry_fidelity": "rotational_reamer_envelope" if ream else "rotational_drill_envelope",
             "coordinate_system": "part_mm", "tool_axis": list(plane.zDir.toTuple()),
             "tip_depth_mm": bounds.zmax - end[2], "manufacturing_ready": False, "verification_status": "not_verified"}
         reports.append(report)

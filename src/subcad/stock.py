@@ -1437,12 +1437,16 @@ class Stock:
         """Finish a pre-drilled hole with a reamer."""
         from .operations import ReamOp
 
+        if through:
+            setup = self._setups.get(self._active_setup) if self._active_setup else None
+            depth = _profile_through_depth(self, setup.face_selector if setup else face_selector)
         op = ReamOp(
             cx=cx,
             cy=cy,
             diameter=diameter,
             depth=depth,
             through=through,
+            face_selector=face_selector,
             tool=tool,
             material=self._material,
         )
@@ -1458,16 +1462,26 @@ class Stock:
         through: bool = False,
         face_selector: str = ">Z",
         tool: Optional[ToolSpec] = None,
+        stepdown: float = 1.0,
+        finish_allowance: float = 0.0,
+        chord_error: float = 0.01,
     ) -> "Stock":
-        """Bore a hole for trueness and finish."""
+        """Circular-mill a hole with the selected cutter and retained material passes."""
         from .operations import BoreOp
 
+        if through:
+            setup = self._setups.get(self._active_setup) if self._active_setup else None
+            depth = _profile_through_depth(self, setup.face_selector if setup else face_selector)
         op = BoreOp(
             cx=cx,
             cy=cy,
             diameter=diameter,
             depth=depth,
             through=through,
+            face_selector=face_selector,
+            stepdown=stepdown,
+            finish_allowance=finish_allowance,
+            chord_error=chord_error,
             tool=tool,
             material=self._material,
         )

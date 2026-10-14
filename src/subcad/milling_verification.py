@@ -61,7 +61,7 @@ def replay_milling_independently(incoming, path: Toolpath, tool, *, resolution_m
     if not cutting_positions:
         raise ValueError("The independent Milling path has no cutting moves.")
     cutting_depth = max(0, max(mesh.vertices @ direction) - min(cutting_positions))
-    if tool.tool_type == "drill":
+    if tool.tool_type in {"drill", "reamer"}:
         from .drilling_replay import point_geometry
         point_geometry(tool)
         if cutting_depth > min(tool.flute_length, tool.stickout_mm, tool.reach_mm or tool.flute_length):

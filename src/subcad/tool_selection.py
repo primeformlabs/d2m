@@ -190,7 +190,8 @@ def select_tool(requirement: ToolRequirement) -> ToolSelectionResult:
         message += f" and flute length {requirement.min_flute_length_mm:g} mm"
     result.errors.append(message)
     if requirement.require_point_geometry:
-        result.errors.append("Drilling requires a valid recorded point angle and enough reach for the complete drill point.")
+        result.errors.append("Reaming requires a recorded lead angle, a positive lead tip diameter, and complete lead reach." if requirement.tool_type == "reamer"
+            else "Drilling requires a valid recorded point angle and enough reach for the complete drill point.")
     return result
 
 
