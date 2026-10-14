@@ -36,6 +36,26 @@ The engine cannot substitute a drill or a different reamer diameter.
 
 ## Evidence
 
+## Pilot preparation in 0.2.12
+
+`Stock.ream_hole()` selects the required reamer before it selects the pilot drill.
+The pilot drill must clear the recorded lead tip and leave material for the final diameter.
+The selected drill requires sufficient reach for its complete point.
+The method retains both cutter records and both material states.
+An existing clear pilot hole needs no new drill.
+Missing pilot tools cannot cause a full-size drill fallback.
+
+Blind holes can supply an entry plane in the selected setup frame.
+The method includes the incoming stock allowance above that plane in its cutting depth.
+The method rejects entry planes outside the incoming material bounds.
+The card must report a pilot point that extends below the finished reamer lead.
+Finishing allowance and the required blind floor remain unqualified.
+
+Fourteen preparation checks pass.
+They cover all six setup faces, selected tools, existing pilots, missing tools, reach, and recorded blind entry planes.
+
+## Earlier hole-finishing evidence
+
 `test_subcad_hole_finishing.py` passes 25 checks.
 The checks cover all six setup faces, actual pilot material, retained passes, reach, and specific failures.
 They also cover owned-tool selection, preceding holes, and independent reamer replay.

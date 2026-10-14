@@ -2,6 +2,60 @@
 from .milling_replay import finite
 
 
+def prepare_reaming(stock, diameter, depth, *, cx, cy, through, face_selector, entry_plane_mm=None):
+    """Select the actual reamer first, then preserve or drill its pilot hole."""
+    import cadquery as cq
+    from .drilling_replay import point_geometry
+    from .milling_replay import _boolean
+    from .operations import ReamOp
+    from .profile_milling import _setup_plane
+    from .tool_selection import ToolRequirement, ToolUnavailableError, select_tool
+    if not isinstance(through, bool):
+        raise ValueError("Reaming requires an explicit through setting.")
+    setup = stock._setups.get(stock._active_setup) if stock._active_setup else None
+    face = setup.face_selector if setup else face_selector
+    plane, mirror = _setup_plane(face)
+    local = plane.toLocalCoords(stock._shape.val())
+    bounds = local.BoundingBox()
+    depth = bounds.zlen if through else finite(depth, "reaming depth", positive=True)
+    if not through and entry_plane_mm is not None:
+        entry = finite(entry_plane_mm, "reaming entry plane")
+        if not bounds.zmin <= entry <= bounds.zmax:
+            raise ValueError("The recorded reaming entry plane lies outside the incoming material bounds.")
+        depth += bounds.zmax - entry
+    cx, cy = finite(cx, "reaming X position"), finite(cy, "reaming Y position")
+    diameter = finite(diameter, "finished hole diameter", positive=True)
+    operation = ReamOp(diameter=diameter, depth=depth, cx=cx, cy=cy, through=through, face_selector=face,
+        material=stock._material)
+    _, tip, lead = point_geometry(operation.tool)
+    travel = depth + lead
+    if not through and travel > bounds.zlen + 1e-8:
+        raise ValueError("The reamer lead passes through the incoming material. Use through reaming or change the blind depth.")
+    corridor = cq.Solid.makeCylinder(tip, travel, cq.Vector(cx, cy * mirror, bounds.zmax - travel))
+    contact = _boolean(local, [corridor], "common")
+    if not contact.isValid():
+        raise ValueError("The reamer pilot clearance check produced invalid geometry.")
+    prepared = stock
+    if contact.Solids() and contact.Volume() > 1e-8:
+        pilot_depth = depth if through else travel
+        selection = select_tool(ToolRequirement("drill", min_diameter_mm=tip * 2 + 1e-6,
+            max_diameter_mm=diameter - 1e-6, min_flute_length_mm=pilot_depth, require_point_geometry=True,
+            include_point_length_in_reach=True, prefer_largest=True, feature="reaming_pilot",
+            reason="the pilot drill must clear the recorded reamer lead and leave material for the finished diameter"))
+        if not selection.ok:
+            selection.errors.append("Reaming requires an available pilot drill larger than the lead tip and smaller than the finished hole.")
+            raise ToolUnavailableError(selection)
+        drill = selection.selected_tool
+        prepared = stock.drill(drill.diameter, pilot_depth, cx=cx, cy=cy, through=through,
+            face_selector=face, spot_drill=False, tool=drill)
+        operation._pilot_preparation = {"method": "selected_pilot_drill", "diameter_mm": drill.diameter,
+            "tool_id": drill.catalog_id, "tool_selection": selection.to_dict(), "allowance_qualified": False,
+            "point_extension_mm": point_geometry(drill)[2]}
+    else:
+        operation._pilot_preparation = {"method": "existing_material_hole", "allowance_qualified": False}
+    return prepared._apply_op(operation)
+
+
 def apply_reaming(operation, shape):
     from .drilling_replay import run_drilling
     from .operations import _feed_rate, _spindle_rpm, _tool_dict, _tool_selection_dict
@@ -50,6 +104,8 @@ def hole_finishing_record(operation, *, ream=False):
         fidelity = "rotational_reamer_envelope"
         if not operation.through:
             reasons.append("The blind hole retains the reamer lead below the full-diameter depth. Its floor requires review.")
+            if (getattr(operation, "_pilot_preparation", None) or {}).get("point_extension_mm", 0) > 0:
+                reasons.append("The pilot drill point extends below the reamer lead. Review the required blind-hole floor.")
     else:
         reasons = ["The hole uses circular milling with the selected end mill.",
             "Circular milling requires qualified entry, fixture, feed, spindle, roundness, and complete target verification."]
@@ -65,6 +121,7 @@ def hole_finishing_record(operation, *, ream=False):
     if not (operation.tool.physical_assembly or {}).get("owned"):
         reasons.append("The hole requires an owned physical cutter assembly.")
     return {"material_passes": passes, "operation_target_comparison": comparison,
+        "pilot_preparation": getattr(operation, "_pilot_preparation", None),
         "geometry_fidelity": fidelity if passes else "unavailable", "geometry_status": "requires_review",
         "toolpath_status": "unverified" if passes else "unavailable", "manufacturing_ready": False,
         "verification_status": "not_verified", "achieved_tolerance_estimate_mm": None, "review_reasons": reasons}

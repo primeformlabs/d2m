@@ -1452,6 +1452,15 @@ class Stock:
         )
         return self._apply_op(op)
 
+    def ream_hole(
+        self, diameter: float, depth: float = 10.0, *, cx: float = 0.0, cy: float = 0.0,
+        through: bool = False, face_selector: str = ">Z", entry_plane_mm: Optional[float] = None,
+    ) -> "Stock":
+        """Select a reamer and retain an existing pilot or prepare it with an available drill."""
+        from .hole_finishing import prepare_reaming
+        return prepare_reaming(self, diameter, depth, cx=cx, cy=cy,
+            through=through, face_selector=face_selector, entry_plane_mm=entry_plane_mm)
+
     def bore(
         self,
         diameter: float,
