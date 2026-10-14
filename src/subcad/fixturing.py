@@ -166,6 +166,7 @@ class Setup:
             "name": self.name,
             "fixture": self.fixture.name,
             "fixture_type": self.fixture.fixture_type.value,
+            "fixture_spec": self.fixture.to_dict(),
             "face_selector": self.face_selector,
             "work_offset": self.work_offset,
             "work_offset_values": list(self.work_offset_values),
@@ -382,40 +383,16 @@ def check_operation_against_fixture(
     setup: Setup,
     stock_dims: dict,
 ) -> list[str]:
-    """Validate an operation against the active fixture's clamping zones.
-
-    Returns a list of warning strings.  Empty list = no warnings.
-    """
-    warnings: list[str] = []
-
+    """Check one operation against its specified setup and complete linear travel."""
+    from .validation import _check_fixture_clearance
     if setup is None:
-        return warnings
-
-    zones = setup.fixture.clamping_zones
-    if not zones:
-        return warnings
-
-    op_type = op_dict.get("operation", "")
-    pos = op_dict.get("position")
-
-    if pos is not None:
-        px, py = pos
-        for zone in zones:
-            if zone.contains_point(px, py):
-                warnings.append(
-                    f"Operation '{op_type}' at ({px:.1f}, {py:.1f}) "
-                    f"intersects clamping zone '{zone.label}'. "
-                    f"Consider repositioning or adding a new setup."
-                )
-
-    # Whole-face ops: general advisory if clamps exist
-    if op_type in ("face_mill", "contour") and zones:
-        warnings.append(
-            f"Operation '{op_type}' covers the full face. "
-            f"Verify clamping zones do not interfere with toolpath."
-        )
-
-    return warnings
+        return ["The fixture setup is missing. Fixture clearance is unverified."]
+    operation = {**op_dict, "setup": setup.name,
+                 "face_selector": op_dict.get("face_selector", setup.face_selector)}
+    return [issue.message for issue in _check_fixture_clearance({
+        "operations": [operation], "fixture": setup.fixture.to_dict(),
+        "setups": {setup.name: setup.to_dict()}, "stock_dimensions": stock_dims,
+    })]
 
 
 def fixture_visualization_payload(fixture: FixtureSpec, stock_dims: Optional[dict] = None) -> dict:

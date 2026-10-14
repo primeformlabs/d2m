@@ -2106,10 +2106,13 @@ class Stock:
                   rotation_deg: float = 0.0) -> "Stock":
         """Define a new machining setup. Requires .with_fixture() to have been called first."""
         from .fixturing import Setup
+        from copy import deepcopy
 
         if self._fixture is None:
             raise ValueError("No fixture assigned. Call .with_fixture() first.")
-        setup = Setup(name=name, fixture=self._fixture, face_selector=face_selector,
+        if name in self._setups:
+            raise ValueError(f"Setup {name!r} already exists. Use a new name for a revised fixture setup.")
+        setup = Setup(name=name, fixture=deepcopy(self._fixture), face_selector=face_selector,
                       work_offset=work_offset, work_offset_values=work_offset_values,
                       rotation_deg=rotation_deg, description=description)
         new_setups = dict(self._setups)
@@ -2143,19 +2146,16 @@ class Stock:
         )
 
     def validate_fixture_clearance(self) -> list[str]:
-        """Check all operations against the active fixture's clamping zones."""
-        from .fixturing import check_operation_against_fixture
+        """Check each operation against its recorded fixture and cardinal tool axis."""
+        from .validation import _check_fixture_clearance
 
-        warnings = []
-        active_name = self._active_setup
-        if active_name is None or active_name not in self._setups:
-            return warnings
-        active_setup = self._setups[active_name]
-        for op_dict in self._plan.operations:
-            warnings.extend(
-                check_operation_against_fixture(op_dict, active_setup, self._stock_dims)
-            )
-        return warnings
+        setups = ({name: setup.to_dict() for name, setup in self._setups.items()}
+                  if self._setups else self._plan.setups)
+        fixture = self._fixture.to_dict() if self._fixture else self._plan.fixture
+        return [issue.message for issue in _check_fixture_clearance({
+            "operations": self._plan.operations, "fixture": fixture,
+            "setups": setups, "stock_dimensions": self._stock_dims,
+        })]
 
     # -------------------------------------------------------------------
     #  Simulation bridge
