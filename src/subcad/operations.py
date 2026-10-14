@@ -3765,16 +3765,14 @@ class NativeSurfaceOp(PureToleranceOp):
         self.depth = max(0, shape.val().BoundingBox().zmax - min(move.position[2]
             for path in paths for move in path.moves if move.move_type in {"feed", "plunge"}))
         self._surface_toolpath = _new_toolpath(self.operation_name, self.tool, self.feeds_speeds,
-            metadata={"coordinate_system": "part_mm", "tool_axis": [0, 0, 1], "cutter_compensation": "geometry_applied"})
+            metadata={"coordinate_system": "part_mm", "tool_axis": [0, 0, 1], "face_selector": ">Z", "cutter_compensation": "geometry_applied"})
         self._material_pass_states, self._pass_reports = [], []
-        result, cumulative_sweep = shape, None
+        result = shape
         for index, path in enumerate(paths, 1):
             start = len(self._surface_toolpath.moves)
             before = result.val().Volume()
-            source = result if self.tool.tool_type == "flat_endmill" else shape
-            previous = None if self.tool.tool_type == "flat_endmill" else cumulative_sweep
-            result, report, cumulative_sweep = replay_pass(source, path, self.tool,
-                sample_interval_mm=path.metadata["sample_interval_mm"], previous_sweep=previous, return_sweep=True)
+            result, report = replay_pass(result, path, self.tool,
+                sample_interval_mm=path.metadata["sample_interval_mm"])
             self._surface_toolpath.moves.extend(path.moves)
             report.update(pass_index=index, pass_role=path.metadata["pass_role"], move_start_index=start,
                 move_end_index=len(self._surface_toolpath.moves), removed_volume_mm3=before - result.val().Volume())
