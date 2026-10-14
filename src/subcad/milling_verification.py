@@ -60,7 +60,14 @@ def replay_milling_independently(incoming, path: Toolpath, tool, *, resolution_m
         raise ValueError("The independent replay exceeds its move limit. Divide the process into smaller paths.")
     if not cutting_positions:
         raise ValueError("The independent Milling path has no cutting moves.")
-    validate_cutter(tool, cutting_depth=max(0, max(mesh.vertices @ direction) - min(cutting_positions)))
+    cutting_depth = max(0, max(mesh.vertices @ direction) - min(cutting_positions))
+    if tool.tool_type == "drill":
+        from .drilling_replay import point_geometry
+        point_geometry(tool)
+        if cutting_depth > min(tool.flute_length, tool.stickout_mm, tool.reach_mm or tool.flute_length):
+            raise ValueError("The independent drill replay exceeds the selected tool reach.")
+    else:
+        validate_cutter(tool, cutting_depth=cutting_depth)
     initial_volume, previous, cutting_moves = model.volume(), None, 0
     for move in path.moves:
         if not all(math.isfinite(value) for value in move.position):

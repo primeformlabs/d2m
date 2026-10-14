@@ -167,6 +167,11 @@ class Stock:
 
     def _apply_op(self, op) -> "Stock":
         """Apply a machining operation: modify shape, record in plan, return new Stock."""
+        if getattr(op, "spot_op", None) is not None:
+            prepared = self._apply_op(op.spot_op)
+            op.spot_op = None
+            op.sequence_number = prepared._next_op_number
+            return prepared._apply_op(op)
         validate_inventory_tool(getattr(op, "tool", None), depth=getattr(op, "depth", 0.0))
         if getattr(op, "sequence_number", 0) == 0:
             op.sequence_number = self._next_op_number
@@ -942,6 +947,9 @@ class Stock:
         from .operations import DrillOp, SpotDrillOp
 
         result = self
+        if through:
+            setup = self._setups.get(self._active_setup) if self._active_setup else None
+            depth = _profile_through_depth(self, setup.face_selector if setup else face_selector)
 
         # Apply spot-drill first so it's recorded in the plan
         if spot_drill:
@@ -969,6 +977,13 @@ class Stock:
         )
         op.sequence_number = result._next_op_number
         return result._apply_op(op)
+
+    def spot_drill(self, hole_diameter: float, depth: float = 1.0, *, cx: float = 0.0,
+                   cy: float = 0.0, face_selector: str = ">Z", tool: Optional[ToolSpec] = None) -> "Stock":
+        """Cut a drill-point start with explicit tip depth and selected geometry."""
+        from .operations import SpotDrillOp
+        return self._apply_op(SpotDrillOp(hole_diameter=hole_diameter, depth=depth, cx=cx, cy=cy,
+            face_selector=face_selector, tool=tool, material=self._material))
 
     def drill_at(
         self,
@@ -1392,6 +1407,9 @@ class Stock:
         """Peck-drill a deep hole."""
         from .operations import PeckDrillOp
 
+        if through:
+            setup = self._setups.get(self._active_setup) if self._active_setup else None
+            depth = _profile_through_depth(self, setup.face_selector if setup else face_selector)
         op = PeckDrillOp(
             cx=cx,
             cy=cy,

@@ -557,7 +557,10 @@ def to_sim_tool(spec: ToolSpec):
         kwargs["corner_radius"] = spec.corner_radius
 
     elif tt == "drill":
-        kwargs["tip_angle"] = spec.tip_angle if spec.tip_angle else 118.0
+        from .drilling_replay import point_geometry
+        point_geometry(spec)
+        kwargs["tip_angle"] = spec.tip_angle
+        kwargs["tip_diameter"] = spec.tip_diameter
 
     elif tt == "chamfer":
         if spec.tip_diameter:

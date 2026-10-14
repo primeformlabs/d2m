@@ -53,6 +53,7 @@ from .tool_library import ToolSpec, ToolCatalog
 from .tool_selection import ToolRequirement, ToolSelectionResult, select_or_fallback, select_tool
 from .material import get_feeds_speeds
 from .toolpath import Toolpath, ToolpathMove
+from .drilling_replay import apply_drilling, drilling_record
 from . import turning_geometry
 
 # ---------------------------------------------------------------------------
@@ -1145,16 +1146,12 @@ class CircularPocketOp(MachiningOperation):
 
 @dataclass
 class SpotDrillOp(MachiningOperation):
-    """Spot-drilling operation -- creates a shallow conical start for a drill.
-
-    This is normally created internally by ``DrillOp`` when
-    ``spot_drill=True`` (the default).  Geometry is unchanged -- a spot
-    drill is primarily a process-planning step.
-    """
+    """Shallow recorded drill-point cut with retained material and moves."""
 
     cx: float = 0.0
     cy: float = 0.0
     hole_diameter: float = 6.0
+    depth: float = 1.0
     """Target hole diameter (the spot drill is sized slightly larger)."""
 
     material: str = "aluminum_6061"
@@ -1170,6 +1167,8 @@ class SpotDrillOp(MachiningOperation):
                 ToolRequirement(
                     "drill",
                     min_diameter_mm=spot_dia,
+                    min_flute_length_mm=self.depth,
+                    require_point_geometry=True,
                     feature="spot_drill",
                     reason="spot drill diameter should cover the target hole",
                 ),
@@ -1185,9 +1184,7 @@ class SpotDrillOp(MachiningOperation):
     # ------------------------------------------------------------------
 
     def apply(self, shape):
-        # Spot-drill does not change the final hole geometry -- it is a
-        # planning step that precedes the actual drill.
-        return shape
+        return apply_drilling(self, shape, spot=True)
 
     def to_dict(self) -> dict:
         return {
@@ -1195,23 +1192,26 @@ class SpotDrillOp(MachiningOperation):
             "tool_type": self.tool.tool_type,
             "tool_diameter_mm": self.tool.diameter,
             "tool": _tool_dict(self.tool),
-            "depth_mm": 1.0,  # spot-drill is shallow
+            "depth_mm": self.depth,
             "position": list(self.position) if self.position else None,
             "face_selector": self.face_selector,
             "feeds_speeds": self.feeds_speeds
             if "error" not in self.feeds_speeds
             else None,
             "notes": "Spot drill for hole alignment",
+            **drilling_record(self),
         }
 
     def to_toolpath(self) -> Toolpath:
+        if hasattr(self, "_drill_toolpath"):
+            return self._drill_toolpath
         return _drill_toolpath(
             "spot_drill",
             self.tool,
             self.feeds_speeds,
             self.cx,
             self.cy,
-            1.0,
+            self.depth,
             dwell_seconds=0.2,
         )
 
@@ -1225,8 +1225,7 @@ class DrillOp(MachiningOperation):
     """Drilling operation -- creates a hole at a given position.
 
     When ``spot_drill=True`` (default) an internal ``SpotDrillOp`` is
-    created and applied first (process-planning only -- the spot drill
-    does not modify the B-Rep).
+    created and applied as a separate retained operation first.
 
     When ``peck=True`` the feeds/speeds are adjusted for peck-drilling
     (reduced feed rate).
@@ -1257,6 +1256,8 @@ class DrillOp(MachiningOperation):
                     min_diameter_mm=self.diameter,
                     max_diameter_mm=self.diameter,
                     min_flute_length_mm=self.depth,
+                    require_point_geometry=True,
+                    include_point_length_in_reach=True,
                     feature="drill",
                     reason="drill diameter must match requested hole diameter",
                 ),
@@ -1292,8 +1293,7 @@ class DrillOp(MachiningOperation):
         if self.spot_op is not None:
             self.spot_op.face_selector = self.face_selector
             shape = self.spot_op.apply(shape)
-        return drill_hole(shape, self.cx, self.cy, self.diameter, self.depth, self.through,
-                          face_selector=self.face_selector)
+        return apply_drilling(self, shape, peck_step=max(self.diameter, 1.0) if self.peck else None)
 
     def to_dict(self) -> dict:
         return {
@@ -1312,9 +1312,12 @@ class DrillOp(MachiningOperation):
             else None,
             "has_spot_drill": self.spot_op is not None,
             "notes": "Peck drilling" if self.peck else "",
+            **drilling_record(self),
         }
 
     def to_toolpath(self) -> Toolpath:
+        if hasattr(self, "_drill_toolpath"):
+            return self._drill_toolpath
         tp = _drill_toolpath(
             "drill",
             self.tool,
@@ -1820,10 +1823,11 @@ class PeckDrillOp(MachiningOperation):
 
     def __post_init__(self):
         if self.tool is None:
-            try:
-                self.tool = ToolCatalog.get_best_for("drill", self.diameter)
-            except ValueError:
-                self.tool = ToolSpec("drill", self.diameter, tip_angle=118.0)
+            self.tool, self.tool_selection = _select_inventory_tool(
+                ToolRequirement("drill", min_diameter_mm=self.diameter, max_diameter_mm=self.diameter,
+                    min_flute_length_mm=self.depth, require_point_geometry=True, include_point_length_in_reach=True,
+                    feature="peck_drill", reason="matching drill with recorded point geometry and complete tip reach"),
+                ToolSpec("drill", self.diameter, tip_angle=118.0))
 
         tool_type_fs = _resolve_fs_tool_type(self.tool.tool_type)
         self.feeds_speeds = get_feeds_speeds(
@@ -1840,8 +1844,7 @@ class PeckDrillOp(MachiningOperation):
     # ------------------------------------------------------------------
 
     def apply(self, shape):
-        return drill_hole(shape, self.cx, self.cy, self.diameter, self.depth,
-                          self.through, face_selector=self.face_selector)
+        return apply_drilling(self, shape, peck_step=self.peck_step)
 
     def to_dict(self) -> dict:
         return {
@@ -1859,9 +1862,12 @@ class PeckDrillOp(MachiningOperation):
             if "error" not in self.feeds_speeds
             else None,
             "notes": f"Peck drilling (step={self.peck_step}mm)",
+            **drilling_record(self),
         }
 
     def to_toolpath(self) -> Toolpath:
+        if hasattr(self, "_drill_toolpath"):
+            return self._drill_toolpath
         return _drill_toolpath(
             "peck_drill",
             self.tool,
