@@ -20,3 +20,8 @@ Invalid coordinates, zero kerf, unsupported units, and missing native material p
 The model assumes a constant circular kerf. It does not verify heat, pierce quality, head clearance, or manufacturing tolerances.
 The existing fluent profile operations remain separate from this path replay API.
 Production callers must use the replay API with their checked paths and saved settings.
+
+SubCAD 0.2.15 exports a disposable copy of the material to STL.
+OCCT tessellation can change shared triangulations and invalidate a later live material state.
+The eight-hole regression preserves valid material and detached slugs through every pierce and cut export.
+Fourteen focused native checks pass. The model remains unqualified for physical manufacturing.

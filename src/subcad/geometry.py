@@ -1432,7 +1432,13 @@ def export_stl(shape: "cq.Workplane", path: str) -> None:
     """Export shape to STL file."""
     if not _HAS_CADQUERY:
         raise RuntimeError("cadquery is not available")
-    cq.exporters.export(shape, path)
+    # OCCT meshing updates triangulations on shared topology. A later Boolean
+    # state can share those faces and edges, so never mesh the process material.
+    if isinstance(shape, cq.Workplane):
+        exported = shape.newObject([value.copy() for value in shape.vals()])
+    else:
+        exported = shape.copy()
+    cq.exporters.export(exported, path)
 
 
 def to_mesh(shape: "cq.Workplane"):

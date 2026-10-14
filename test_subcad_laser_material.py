@@ -1,7 +1,29 @@
 import math
 import cadquery as cq
 import pytest
+import json
+from pathlib import Path
 from subcad import Stock, replay_laser_material, release_laser_part, laser_selection_region
+from subcad.geometry import export_stl
+
+
+def test_mesh_export_preserves_live_material_through_eight_circular_holes(tmp_path):
+    fixture = json.loads((Path(__file__).parent / "test_fixtures/laser_u_channel_paths.json").read_text())
+    stock = Stock.sheet(*fixture["sheet_mm"])
+    material = stock._shape.translate((100, 100, 0))
+    for index, operation in enumerate(fixture["paths"]):
+        result = replay(material, operation["path_mm"], fixture["kerf_mm"])
+        before = result.material.Volume()
+        export_stl(cq.Workplane("XY").newObject([result.passes[0].after]), str(tmp_path / f"pierce_{index}.stl"))
+        export_stl(cq.Workplane("XY").newObject([result.material]), str(tmp_path / f"cut_{index}.stl"))
+        assert result.material.isValid()
+        assert result.material.Volume() == pytest.approx(before, abs=1e-7)
+        region = laser_selection_region(operation["hole_mm"], [], thickness_mm=2, bottom_z_mm=-1)
+        released = release_laser_part(result.material, region, envelope_tolerance_mm=0.05)
+        assert released.part.Volume() > 0
+        assert released.remainder.isValid()
+        material = released.remainder
+    assert len(material.Solids()) == 1
 
 
 def replay(source, path, kerf=0.4):
