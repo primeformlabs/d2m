@@ -11,6 +11,7 @@ It also avoids a collision from radial and axial overlaps at different travel ti
 Clearance margins expand the radial envelope and axial limits.
 
 Each setup retains its complete fixture specification.
+Each native operation retains its fixture setup for material-pass review.
 The last fixture cannot replace an earlier setup's fixture.
 An empty setup zone list overrides the global zone list.
 Duplicate setup names require a new name for the revised setup.

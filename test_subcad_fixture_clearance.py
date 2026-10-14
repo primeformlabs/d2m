@@ -195,6 +195,16 @@ class FixtureClearanceTests(TestCase):
         issues = _check_fixture_clearance(value)
         self.assertTrue(any("holder_diameter_mm" in hit.context.get("missing_dimensions", []) for hit in issues))
 
+    def test_native_operation_retains_fixture_setup(self):
+        fixture = FixtureSpec("owned_fixture", clamping_zones=[ClampingZone("jaw", 15, 16, -1, 1, 0, 1)])
+        stock = Stock.rectangular(20, 20, 10).with_fixture(fixture).new_setup("first")
+        stock = stock.drill(diameter=2, cx=0, cy=0, depth=1)
+        native = stock._plan.operations[-1]
+        self.assertEqual(native["fixture_setup"]["fixture_spec"]["name"], "owned_fixture")
+        self.assertEqual(native["fixture_setup"]["name"], native["setup"])
+        fixture.clamping_zones[0].x_max = 500
+        self.assertEqual(native["fixture_setup"]["fixture_spec"]["clamping_zones"][0]["x_max"], 16)
+
 
 if __name__ == "__main__":
     main()

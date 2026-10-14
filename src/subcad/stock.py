@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from copy import deepcopy
 from typing import Optional, Tuple
 
 from .geometry import (
@@ -267,6 +268,7 @@ class Stock:
         if active_setup is not None and active_setup in self._setups:
             op_dict["setup"] = active_setup
             op_dict["face_selector"] = self._setups[active_setup].face_selector
+            op_dict["fixture_setup"] = deepcopy(setups_dict[active_setup])
         elif self._plan.setup_intent and len(setups_dict) == 1:
             setup_name, setup = next(iter(setups_dict.items()))
             op_dict.setdefault("setup", setup_name)
@@ -2106,7 +2108,6 @@ class Stock:
                   rotation_deg: float = 0.0) -> "Stock":
         """Define a new machining setup. Requires .with_fixture() to have been called first."""
         from .fixturing import Setup
-        from copy import deepcopy
 
         if self._fixture is None:
             raise ValueError("No fixture assigned. Call .with_fixture() first.")
