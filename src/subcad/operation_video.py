@@ -673,7 +673,7 @@ def _operation_moves(op: dict, mesh_bbox: dict) -> list[dict]:
     for record in records:
         normalized = _normalize_move(record, top_z)
         if normalized is not None:
-            if coordinate_system == "stock_mm":
+            if coordinate_system == "stock_mm" or coordinate_system == "part_mm" and tool_frame:
                 normalized["coordinate_system"] = coordinate_system
             if orientation is not None:
                 normalized["pose"]["orientation"] = orientation[:]
@@ -918,7 +918,7 @@ def _is_cutting_move(move: dict, end_position: list[float]) -> bool:
     move_type = _move_type(move)
     if move_type not in _CUTTING_MOVES:
         return False
-    if move.get("coordinate_system") == "stock_mm":
+    if move.get("coordinate_system") in {"stock_mm", "part_mm"}:
         return bool(end_position)
     program = move.get("program_position") or []
     if len(program) >= 3:

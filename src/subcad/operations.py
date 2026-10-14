@@ -51,9 +51,10 @@ from .geometry import (
 )
 from .profiles import normalize_profile_points, profile_span_yx
 from .tool_library import ToolSpec, ToolCatalog
-from .tool_selection import ToolRequirement, ToolSelectionResult, select_or_fallback, select_tool
+from .tool_selection import ToolRequirement, ToolSelectionResult, ToolUnavailableError, select_or_fallback, select_tool
 from .material import get_feeds_speeds
 from .toolpath import Toolpath, ToolpathMove
+from .drilling_replay import apply_drilling, drilling_record
 from .face_motion import FaceMotionFrame, rounded_contour
 from . import turning_geometry
 
@@ -286,16 +287,6 @@ def _drill_toolpath(
     ))
 
 
-def _drill_tip_height(tool: ToolSpec) -> float:
-    if (any(isinstance(value, bool) or not isinstance(value, (int, float))
-            for value in (tool.diameter, tool.tip_angle, tool.tip_diameter, tool.corner_radius))
-            or tool.tool_type != "drill" or not math.isfinite(tool.diameter) or tool.diameter <= 0
-            or not math.isfinite(tool.tip_angle) or not 0 < tool.tip_angle < 180
-            or tool.tip_diameter != 0 or tool.corner_radius != 0):
-        raise ValueError("The drill needs a recorded pointed cone cutting geometry.")
-    return tool.diameter / (2 * math.tan(math.radians(tool.tip_angle / 2)))
-
-
 def _slot_endpoints(cx: float, cy: float, length: float, angle_deg: float) -> tuple[tuple[float, float], tuple[float, float]]:
     theta = math.radians(angle_deg)
     half = length / 2.0
@@ -444,29 +435,6 @@ def _pick_slot_tool(slot_width: float) -> ToolSpec:
             return ToolCatalog.select("flat_endmill")
         except ValueError:
             return ToolSpec("flat_endmill", max(slot_width * 0.8, 1.0))
-
-
-def _pick_reamer(hole_diameter: float) -> ToolSpec:
-    """Pick the closest reamer tool for a given hole diameter.
-
-    Searches the catalog for tools whose name starts with ``REAM_`` and
-    returns the smallest reamer whose diameter >= *hole_diameter*.  If no
-    reamer is large enough, the largest available reamer is returned.
-    Falls back to a generic drill-type tool with a 45-degree tip angle
-    when the catalog contains no reamers at all.
-    """
-    ToolCatalog._ensure_initialised()
-    reamers = sorted(
-        (t for name, t in ToolCatalog._tools.items() if name.startswith("REAM_")),
-        key=lambda t: t.diameter,
-    )
-    if reamers:
-        for r in reamers:
-            if r.diameter >= hole_diameter:
-                return r
-        return reamers[-1]
-    # Fallback: no reamers in catalog
-    return ToolSpec("drill", hole_diameter, tip_angle=45.0)
 
 
 def _laser_tool(kerf_width: float) -> ToolSpec:
@@ -626,8 +594,33 @@ class FaceMillOp(MachiningOperation):
     # ------------------------------------------------------------------
 
     def apply(self, shape):
-        self._motion_frame = FaceMotionFrame(compute_bounding_box(shape), self.face_selector)
-        return face_mill_cut(shape, self.depth, face_selector=self.face_selector)
+        from dataclasses import replace
+        from .profile_milling import _setup_plane
+        from .profile_pocket_milling import run_profile_pocket
+        from .milling_replay import finite
+        finite(self.depth, "facing depth", positive=True)
+        plane, mirror = _setup_plane(self.face_selector)
+        bounds = plane.toLocalCoords(shape.val()).BoundingBox()
+        profile = {"type": "rectangle", "length": bounds.xlen, "width": bounds.ylen,
+            "cx": (bounds.xmin + bounds.xmax) / 2, "cy": (bounds.ymin + bounds.ymax) / 2 * mirror}
+        if self.tool.tool_type not in {"flat_endmill", "face_mill"}:
+            raise ValueError("Native facing requires a flat end mill or a face mill cutting envelope.")
+        cutter = replace(self.tool, tool_type="flat_endmill", corner_radius=0) if self.tool.tool_type == "face_mill" else self.tool
+        if self.stepover is not None:
+            stepover = finite(self.stepover, "facing stepover", positive=True)
+            saved_maximum = (cutter.safe_limits or {}).get("max_stepover_mm")
+            if saved_maximum is not None:
+                stepover = min(stepover, finite(saved_maximum, "maximum facing stepover", positive=True))
+            cutter = replace(cutter, safe_limits={**(cutter.safe_limits or {}),
+                "max_stepover_mm": stepover})
+        result, self._face_toolpath, self._material_pass_states, self._pass_reports, self._target_comparison = run_profile_pocket(
+            shape, profile, tool=cutter, depth=self.depth, face_selector=self.face_selector,
+            stepdown=min(self.tool.diameter / 2, 2), finish_allowance=0,
+            feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds))
+        self._face_toolpath.operation = "face_mill"
+        self._face_toolpath.tool_type = self.tool.tool_type
+        self._face_toolpath.metadata.update(tool=_tool_dict(self.tool), tool_selection=_tool_selection_dict(self.tool_selection))
+        return result
 
     def to_dict(self) -> dict:
         return {
@@ -646,55 +639,54 @@ class FaceMillOp(MachiningOperation):
             "finish_pass": self.finish_pass,
             "face_selector": self.face_selector,
             "notes": "Finishing pass included" if self.finish_pass else "",
+            "material_passes": getattr(self, "_pass_reports", []),
+            "operation_target_comparison": getattr(self, "_target_comparison", {}),
+            "geometry_status": "requires_review",
+            "geometry_fidelity": "nominal_face_mill_envelope" if self.tool.tool_type == "face_mill" else "exact_cutter_sweep",
+            "achieved_tolerance_estimate_mm": None,
+            "toolpath_status": "unverified",
+            "review_reasons": ["The facing plan requires fixture, feed, spindle, and complete target verification."] +
+                (["The face mill uses its nominal cutting envelope. Insert geometry and runout require verification."] if self.tool.tool_type == "face_mill" else []),
         }
 
     def to_toolpath(self) -> Toolpath:
+        if hasattr(self, "_face_toolpath"):
+            return self._face_toolpath
         stepover = self.stepover if self.stepover is not None else _tool_stepover(self.tool, 0.7, 0.1)
-        frame = getattr(self, "_motion_frame", None)
-        if frame is None:
-            raise ValueError("Apply face milling to the incoming stock before creating its toolpath.")
-        if not math.isfinite(self.depth) or self.depth <= 0.001:
-            raise ValueError("The facing depth does not produce a material-removal path.")
-        if self.tool.diameter <= 0 or not math.isfinite(stepover) or not 0 < stepover <= self.tool.diameter:
-            raise ValueError("The facing stepover must be positive and no greater than the cutter diameter.")
-        umin, umax, vmin, vmax = frame.footprint
-        radius = self.tool.radius
-        x0, x1 = umin - radius, umax + radius
-        span_x, span_y = umax - umin, vmax - vmin
+        span_x = max(self.tool.diameter * 4.0, stepover * 4.0)
+        span_y = max(self.tool.diameter * 2.0, stepover * 2.0)
         tp = _new_toolpath(
             "face_mill",
             self.tool,
             self.feeds_speeds,
             metadata={
-                "stock_span_x_mm": span_x,
-                "stock_span_y_mm": span_y,
+                "nominal_span_x_mm": span_x,
+                "nominal_span_y_mm": span_y,
                 "tool_selection": _tool_selection_dict(self.tool_selection),
             },
         )
         feed = _feed_rate(self.feeds_speeds)
-        # Include both edges. Never leave an uncovered final lane.
-        lanes = max(1, math.ceil(span_y / stepover))
-        lane_y = [vmin + span_y * index / lanes for index in range(lanes + 1)]
-        y = lane_y[0]
+        y = -span_y / 2.0
         direction = 1
         lane_count = 0
-        _move(tp, "rapid", x0, y, tp.safe_z)
-        _move(tp, "plunge", x0, y, -abs(self.depth), feed=feed)
-        for index, y in enumerate(lane_y):
+        _move(tp, "rapid", -span_x / 2.0, y, tp.safe_z)
+        _move(tp, "plunge", -span_x / 2.0, y, -abs(self.depth), feed=feed)
+        while y <= span_y / 2.0 + 1e-9:
             lane_count += 1
-            x = x1 if direction > 0 else x0
+            x = span_x / 2.0 if direction > 0 else -span_x / 2.0
             _move(tp, "feed", x, y, -abs(self.depth), feed=feed)
-            if index < lanes:
-                _move(tp, "feed", x, lane_y[index + 1], -abs(self.depth), feed=feed)
+            y += stepover
+            if y <= span_y / 2.0 + 1e-9:
+                _move(tp, "feed", x, y, -abs(self.depth), feed=feed)
             direction *= -1
         _move(tp, "retract", tp.moves[-1].position[0], tp.moves[-1].position[1], tp.safe_z)
-        return frame.bind(_attach_pass_plan(tp, _pass_plan(
+        return _attach_pass_plan(tp, _pass_plan(
             strategy="face_mill",
             tool=self.tool,
             depth_levels=[-abs(self.depth)],
             lane_count=lane_count,
             pass_type="facing",
-        )))
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -1151,16 +1143,12 @@ class CircularPocketOp(MachiningOperation):
 
 @dataclass
 class SpotDrillOp(MachiningOperation):
-    """Spot-drilling operation -- creates a shallow conical start for a drill.
-
-    This is normally created internally by ``DrillOp`` when
-    ``spot_drill=True`` (the default).  Geometry is unchanged -- a spot
-    drill is primarily a process-planning step.
-    """
+    """Shallow recorded drill-point cut with retained material and moves."""
 
     cx: float = 0.0
     cy: float = 0.0
     hole_diameter: float = 6.0
+    depth: float = 1.0
     """Target hole diameter (the spot drill is sized slightly larger)."""
 
     material: str = "aluminum_6061"
@@ -1176,6 +1164,8 @@ class SpotDrillOp(MachiningOperation):
                 ToolRequirement(
                     "drill",
                     min_diameter_mm=spot_dia,
+                    min_flute_length_mm=self.depth,
+                    require_point_geometry=True,
                     feature="spot_drill",
                     reason="spot drill diameter should cover the target hole",
                 ),
@@ -1191,10 +1181,7 @@ class SpotDrillOp(MachiningOperation):
     # ------------------------------------------------------------------
 
     def apply(self, shape):
-        # Spot-drill does not change the final hole geometry -- it is a
-        # planning step that precedes the actual drill.
-        self._motion_frame = FaceMotionFrame(compute_bounding_box(shape), self.face_selector)
-        return shape
+        return apply_drilling(self, shape, spot=True)
 
     def to_dict(self) -> dict:
         return {
@@ -1202,33 +1189,28 @@ class SpotDrillOp(MachiningOperation):
             "tool_type": self.tool.tool_type,
             "tool_diameter_mm": self.tool.diameter,
             "tool": _tool_dict(self.tool),
-            "depth_mm": 1.0,  # spot-drill is shallow
+            "depth_mm": self.depth,
             "position": list(self.position) if self.position else None,
             "face_selector": self.face_selector,
             "feeds_speeds": self.feeds_speeds
             if "error" not in self.feeds_speeds
             else None,
             "notes": "Spot drill for hole alignment",
+            **drilling_record(self),
         }
 
     def to_toolpath(self) -> Toolpath:
-        frame = getattr(self, "_motion_frame", None)
-        if frame is None:
-            raise ValueError("Apply spot drilling to the incoming stock before creating its toolpath.")
-        height = _drill_tip_height(self.tool)
-        if not math.isfinite(self.tool.flute_length) or self.tool.flute_length < max(height, 1):
-            raise ValueError("The spot drill needs sufficient recorded cutting length.")
-        return frame.bind(_drill_toolpath(
+        if hasattr(self, "_drill_toolpath"):
+            return self._drill_toolpath
+        return _drill_toolpath(
             "spot_drill",
             self.tool,
             self.feeds_speeds,
             self.cx,
             self.cy,
-            1.0,
+            self.depth,
             dwell_seconds=0.2,
-            metadata={"drill_tip_height_mm": height, "depth_reference": "cutting_tip",
-                      "cad_drill_bottom": "planning_only"},
-        ))
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1240,8 +1222,7 @@ class DrillOp(MachiningOperation):
     """Drilling operation -- creates a hole at a given position.
 
     When ``spot_drill=True`` (default) an internal ``SpotDrillOp`` is
-    created and applied first (process-planning only -- the spot drill
-    does not modify the B-Rep).
+    created and applied as a separate retained operation first.
 
     When ``peck=True`` the feeds/speeds are adjusted for peck-drilling
     (reduced feed rate).
@@ -1272,6 +1253,8 @@ class DrillOp(MachiningOperation):
                     min_diameter_mm=self.diameter,
                     max_diameter_mm=self.diameter,
                     min_flute_length_mm=self.depth,
+                    require_point_geometry=True,
+                    include_point_length_in_reach=True,
                     feature="drill",
                     reason="drill diameter must match requested hole diameter",
                 ),
@@ -1307,9 +1290,7 @@ class DrillOp(MachiningOperation):
         if self.spot_op is not None:
             self.spot_op.face_selector = self.face_selector
             shape = self.spot_op.apply(shape)
-        self._motion_frame = FaceMotionFrame(compute_bounding_box(shape), self.face_selector)
-        return drill_hole(shape, self.cx, self.cy, self.diameter, self.depth, self.through,
-                          face_selector=self.face_selector)
+        return apply_drilling(self, shape, peck_step=max(self.diameter, 1.0) if self.peck else None)
 
     def to_dict(self) -> dict:
         return {
@@ -1328,40 +1309,25 @@ class DrillOp(MachiningOperation):
             else None,
             "has_spot_drill": self.spot_op is not None,
             "notes": "Peck drilling" if self.peck else "",
+            **drilling_record(self),
         }
 
     def to_toolpath(self) -> Toolpath:
-        frame = getattr(self, "_motion_frame", None)
-        if frame is None:
-            raise ValueError("Apply drilling to the incoming stock before creating its toolpath.")
-        height = _drill_tip_height(self.tool)
-        axis = "xyz"[frame.axes[2]]
-        if abs(self.tool.diameter - self.diameter) > 1e-6:
-            raise ValueError("The selected drill diameter does not match the hole.")
-        thickness = frame.bounds[f"{axis}_max"] - frame.bounds[f"{axis}_min"]
-        # The full-diameter portion must pass the far stock face. Keep the
-        # physical cutting-tip origin instead of treating the cone as a cylinder.
-        penetration = thickness + height + 1.0 if self.through else self.depth
-        if not math.isfinite(penetration) or penetration <= 0:
-            raise ValueError("The drill needs a positive cutting-tip depth.")
-        if not math.isfinite(self.tool.flute_length) or self.tool.flute_length < max(height, penetration):
-            raise ValueError("The drill needs sufficient recorded cutting length for this stock.")
+        if hasattr(self, "_drill_toolpath"):
+            return self._drill_toolpath
         tp = _drill_toolpath(
             "drill",
             self.tool,
             self.feeds_speeds,
             self.cx,
             self.cy,
-            penetration,
+            self.depth,
             peck_step=(max(self.diameter, 1.0) if self.peck else None),
-            metadata={"tool_selection": _tool_selection_dict(self.tool_selection),
-                      "drill_tip_height_mm": height, "depth_reference": "cutting_tip",
-                      "through": self.through, "breakthrough_mm": 1.0 if self.through else 0.0,
-                      "cad_drill_bottom": "through" if self.through else "flat_intent"},
+            metadata={"tool_selection": _tool_selection_dict(self.tool_selection)},
         )
         if self.spot_op is not None:
             tp.metadata["spot_toolpath"] = self.spot_op.to_toolpath().to_dict()
-        return frame.bind(tp)
+        return tp
 
 
 # ---------------------------------------------------------------------------
@@ -1675,11 +1641,7 @@ class ContourOp(MachiningOperation):
 
 @dataclass
 class SlotOp(MachiningOperation):
-    """Slot milling -- cuts an obround slot at a given position and angle.
-
-    Validates that the selected tool diameter is not larger than the slot
-    width.
-    """
+    """Obround slot replay from the selected cutter and retained passes."""
 
     cx: float = 0.0
     cy: float = 0.0
@@ -1697,9 +1659,22 @@ class SlotOp(MachiningOperation):
 
     material: str = "aluminum_6061"
 
+    stepdown: float = 1.0
+    finish_allowance: float = 0.0
+    chord_error: float = 0.01
+
     _validation_note: str = field(default="", repr=False)
 
     def __post_init__(self):
+        from .milling_replay import finite
+        for name in ("length", "width", "depth", "stepdown", "chord_error"):
+            finite(getattr(self, name), f"slot {name}", positive=True)
+        for name in ("cx", "cy", "angle", "finish_allowance"):
+            finite(getattr(self, name), f"slot {name}")
+        if self.length < self.width:
+            raise ValueError("The slot length must be at least equal to its width.")
+        if self.finish_allowance < 0:
+            raise ValueError("The slot finish allowance must be non-negative.")
         if self.tool is None:
             fallback = _pick_slot_tool(self.width)
             self.tool, self.tool_selection = _select_inventory_tool(
@@ -1730,17 +1705,43 @@ class SlotOp(MachiningOperation):
     # ------------------------------------------------------------------
 
     def apply(self, shape):
-        return slot_cut(
-            shape,
-            self.cx, self.cy,
-            self.length, self.width,
-            self.depth,
-            self.angle,
-            self.through,
-            face_selector=self.face_selector,
-        )
+        from .profile_pocket_milling import run_profile_pocket
+        if self.through:
+            from .profile_milling import _setup_plane
+            plane, _ = _setup_plane(self.face_selector)
+            self.depth = plane.toLocalCoords(shape.val()).BoundingBox().zlen
+        if self.tool.diameter > self.width:
+            raise ValueError("The selected milling cutter exceeds the slot width.")
+        profile = {"type": "slot", "length": self.length, "width": self.width,
+            "cx": self.cx, "cy": self.cy, "angle": self.angle}
+        result, self._slot_toolpath, self._material_pass_states, self._pass_reports, self._target_comparison = run_profile_pocket(
+            shape, profile, tool=self.tool, depth=self.depth, through=self.through,
+            face_selector=self.face_selector, stepdown=self.stepdown, finish_allowance=self.finish_allowance,
+            chord_error=self.chord_error, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds))
+        self._slot_toolpath.operation = "slot"
+        self._slot_toolpath.metadata.update(tool=_tool_dict(self.tool), tool_selection=_tool_selection_dict(self.tool_selection),
+            slot_length_mm=self.length, slot_width_mm=self.width, angle_deg=self.angle,
+            pass_plan={"strategy": "selected_cutter_slot", "total_passes": len(self._pass_reports),
+                "roughing_passes": sum(row["pass_role"] == "roughing" for row in self._pass_reports),
+                "finishing_passes": sum(row["pass_role"] == "finishing" for row in self._pass_reports)})
+        for state in self._material_pass_states:
+            state["label"] = f"After slot {state['pass_role']} pass {state['pass_index']}"
+        return result
 
     def to_dict(self) -> dict:
+        passes = getattr(self, "_pass_reports", [])
+        comparison = getattr(self, "_target_comparison", {})
+        reasons = ["The slot requires qualified entry, fixture, feed, spindle, and complete target verification."]
+        if not passes:
+            reasons.append("The slot has no retained selected-cutter replay. The operation does not prove a machining result.")
+        if any(row["profile_fidelity"] == "linearized_curve" for row in passes):
+            reasons.append("The slot end paths use linear segments. The requested part tolerance is not verified.")
+        if comparison.get("remaining_target_material_mm3", 0) > 1e-6:
+            reasons.append(f"After the slot passes, {comparison['remaining_target_material_mm3']:.6g} mm³ of target cavity material remains.")
+        if comparison.get("overcut_volume_mm3", 0) > 1e-6:
+            reasons.append(f"The slot replay removes {comparison['overcut_volume_mm3']:.6g} mm³ outside the requested slot. Engineering review is required.")
+        if not (self.tool.physical_assembly or {}).get("owned"):
+            reasons.append("The slot requires an owned physical cutter assembly.")
         return {
             "operation": "slot",
             "tool_type": self.tool.tool_type,
@@ -1757,9 +1758,24 @@ class SlotOp(MachiningOperation):
             if "error" not in self.feeds_speeds
             else None,
             "notes": self._validation_note,
+            "material_passes": passes,
+            "operation_target_comparison": comparison,
+            "geometry_status": "requires_review",
+            "geometry_fidelity": "linearized_profile_cutter_replay" if any(
+                row["profile_fidelity"] == "linearized_curve" for row in passes) else "exact_cutter_sweep" if passes else "unavailable",
+            "toolpath_status": "unverified" if passes else "unavailable",
+            "verification_status": "not_verified",
+            "manufacturing_ready": False,
+            "achieved_tolerance_estimate_mm": None,
+            "review_reasons": reasons,
+            "cutter_compensation": "geometry_applied" if passes else "not_verified",
         }
 
     def to_toolpath(self) -> Toolpath:
+        if hasattr(self, "_slot_toolpath"):
+            return self._slot_toolpath
+        # A planning path is available before stock exists. Only apply() can
+        # produce the retained material and its bound native cutting path.
         return _linear_slot_toolpath(
             "slot",
             self.tool,
@@ -1770,7 +1786,8 @@ class SlotOp(MachiningOperation):
             self.width,
             self.depth,
             self.angle,
-            metadata={"tool_selection": _tool_selection_dict(self.tool_selection)},
+            metadata={"tool_selection": _tool_selection_dict(self.tool_selection),
+                "material_replay": "unavailable", "verification_status": "not_verified"},
         )
 
 
@@ -1803,10 +1820,11 @@ class PeckDrillOp(MachiningOperation):
 
     def __post_init__(self):
         if self.tool is None:
-            try:
-                self.tool = ToolCatalog.get_best_for("drill", self.diameter)
-            except ValueError:
-                self.tool = ToolSpec("drill", self.diameter, tip_angle=118.0)
+            self.tool, self.tool_selection = _select_inventory_tool(
+                ToolRequirement("drill", min_diameter_mm=self.diameter, max_diameter_mm=self.diameter,
+                    min_flute_length_mm=self.depth, require_point_geometry=True, include_point_length_in_reach=True,
+                    feature="peck_drill", reason="matching drill with recorded point geometry and complete tip reach"),
+                ToolSpec("drill", self.diameter, tip_angle=118.0))
 
         tool_type_fs = _resolve_fs_tool_type(self.tool.tool_type)
         self.feeds_speeds = get_feeds_speeds(
@@ -1823,8 +1841,7 @@ class PeckDrillOp(MachiningOperation):
     # ------------------------------------------------------------------
 
     def apply(self, shape):
-        return drill_hole(shape, self.cx, self.cy, self.diameter, self.depth,
-                          self.through, face_selector=self.face_selector)
+        return apply_drilling(self, shape, peck_step=self.peck_step)
 
     def to_dict(self) -> dict:
         return {
@@ -1842,9 +1859,12 @@ class PeckDrillOp(MachiningOperation):
             if "error" not in self.feeds_speeds
             else None,
             "notes": f"Peck drilling (step={self.peck_step}mm)",
+            **drilling_record(self),
         }
 
     def to_toolpath(self) -> Toolpath:
+        if hasattr(self, "_drill_toolpath"):
+            return self._drill_toolpath
         return _drill_toolpath(
             "peck_drill",
             self.tool,
@@ -1875,7 +1895,13 @@ class ReamOp(MachiningOperation):
 
     def __post_init__(self):
         if self.tool is None:
-            self.tool = _pick_reamer(self.diameter)
+            self.tool_selection = select_tool(ToolRequirement("reamer",
+                min_diameter_mm=self.diameter, max_diameter_mm=self.diameter,
+                min_flute_length_mm=self.depth, require_point_geometry=True, include_point_length_in_reach=True,
+                feature="ream", reason="reamer diameter must match the finished hole; its recorded lead must fit an existing pilot"))
+            if not self.tool_selection.ok:
+                raise ToolUnavailableError(self.tool_selection)
+            self.tool = self.tool_selection.selected_tool
 
         tool_type_fs = _resolve_fs_tool_type(self.tool.tool_type)
         self.feeds_speeds = get_feeds_speeds(
@@ -1886,10 +1912,11 @@ class ReamOp(MachiningOperation):
     # ------------------------------------------------------------------
 
     def apply(self, shape):
-        return drill_hole(shape, self.cx, self.cy, self.diameter, self.depth,
-                          self.through, face_selector=self.face_selector)
+        from .hole_finishing import apply_reaming
+        return apply_reaming(self, shape)
 
     def to_dict(self) -> dict:
+        from .hole_finishing import hole_finishing_record
         return {
             "operation": "ream",
             "tool_type": self.tool.tool_type,
@@ -1904,18 +1931,13 @@ class ReamOp(MachiningOperation):
             if "error" not in self.feeds_speeds
             else None,
             "notes": "",
+            **hole_finishing_record(self, ream=True),
         }
 
     def to_toolpath(self) -> Toolpath:
-        return _drill_toolpath(
-            "ream",
-            self.tool,
-            self.feeds_speeds,
-            self.cx,
-            self.cy,
-            self.depth,
-            dwell_seconds=0.2,
-        )
+        if not hasattr(self, "_ream_toolpath"):
+            raise ValueError("Reaming has no retained selected-cutter path. Apply the operation to its incoming material first.")
+        return self._ream_toolpath
 
 
 # ---------------------------------------------------------------------------
@@ -1924,27 +1946,28 @@ class ReamOp(MachiningOperation):
 
 @dataclass
 class BoreOp(MachiningOperation):
-    """Boring operation for hole trueness and finish.
-
-    Auto-selects a flat endmill approximately 90 % of the bore diameter.
-    """
+    """Circular hole milling with a selected flat end mill and retained passes."""
 
     cx: float = 0.0
     cy: float = 0.0
     diameter: float = 20.0
     depth: float = 10.0
     through: bool = False
+    stepdown: float = 1.0
+    finish_allowance: float = 0.0
+    chord_error: float = 0.01
 
     tool: Optional[ToolSpec] = None
     material: str = "aluminum_6061"
 
     def __post_init__(self):
         if self.tool is None:
-            tool_dia = self.diameter * 0.9
-            try:
-                self.tool = ToolCatalog.get_best_for("flat_endmill", tool_dia)
-            except ValueError:
-                self.tool = ToolSpec("flat_endmill", tool_dia)
+            self.tool_selection = select_tool(ToolRequirement("flat_endmill", max_diameter_mm=self.diameter,
+                min_flute_length_mm=self.depth, prefer_largest=True, feature="bore",
+                reason="circular milling requires an available end mill that fits the hole and reaches its complete depth"))
+            if not self.tool_selection.ok:
+                raise ToolUnavailableError(self.tool_selection)
+            self.tool = self.tool_selection.selected_tool
 
         tool_type_fs = _resolve_fs_tool_type(self.tool.tool_type)
         self.feeds_speeds = get_feeds_speeds(
@@ -1955,12 +1978,14 @@ class BoreOp(MachiningOperation):
     # ------------------------------------------------------------------
 
     def apply(self, shape):
-        return drill_hole(shape, self.cx, self.cy, self.diameter, self.depth,
-                          self.through, face_selector=self.face_selector)
+        from .hole_finishing import apply_circular_milling
+        return apply_circular_milling(self, shape)
 
     def to_dict(self) -> dict:
+        from .hole_finishing import hole_finishing_record
         return {
             "operation": "bore",
+            "strategy": "circular_milling",
             "tool_type": self.tool.tool_type,
             "tool_diameter_mm": self.tool.diameter,
             "tool": _tool_dict(self.tool),
@@ -1973,34 +1998,13 @@ class BoreOp(MachiningOperation):
             if "error" not in self.feeds_speeds
             else None,
             "notes": "",
+            **hole_finishing_record(self),
         }
 
     def to_toolpath(self) -> Toolpath:
-        stepdown = max(self.tool.diameter * 0.25, 0.5)
-        radius = max(self.diameter / 2.0 - self.tool.radius, 0.0)
-        tp = _new_toolpath(
-            "bore",
-            self.tool,
-            self.feeds_speeds,
-            metadata={"hole_diameter_mm": self.diameter},
-        )
-        feed = _feed_rate(self.feeds_speeds)
-        _move(tp, "rapid", self.cx, self.cy, tp.safe_z)
-        for z in _depth_levels(self.depth, stepdown):
-            _move(tp, "plunge", self.cx, self.cy, z, feed=feed)
-            if radius > 0:
-                _move(tp, "feed", self.cx + radius, self.cy, z, feed=feed)
-                center = (self.cx, self.cy, z)
-                for x, y in (
-                    (self.cx, self.cy + radius),
-                    (self.cx - radius, self.cy),
-                    (self.cx, self.cy - radius),
-                    (self.cx + radius, self.cy),
-                ):
-                    _move(tp, "arc", x, y, z, feed=feed, arc_center=center, arc_direction="ccw")
-                _move(tp, "feed", self.cx, self.cy, z, feed=feed)
-        _move(tp, "retract", self.cx, self.cy, tp.safe_z)
-        return tp
+        if not hasattr(self, "_bore_toolpath"):
+            raise ValueError("Circular milling has no retained cutter path. Apply the operation to its incoming material first.")
+        return self._bore_toolpath
 
 
 # ---------------------------------------------------------------------------
@@ -2877,31 +2881,69 @@ class EdgeFilletOp(MachiningOperation):
 
 @dataclass
 class ProfilePocketOp(PocketOp):
-    """Arbitrary profile pocket using profile bounds for current B-Rep cut."""
+    """Profile cavity replay from the selected cutter and clipped tool paths."""
 
     profile: Any = field(default_factory=dict)
     islands: Optional[list[Any]] = None
     through: bool = False
+    stepdown: float = 1.0
+    finish_allowance: float = 0.1
+    chord_error: float = 0.01
 
     def __post_init__(self):
-        if self.profile:
-            width, length = _profile_bounds(self.profile)
-            self.width = self.width or width
-            self.length = self.length or length
-        super().__post_init__()
+        from .milling_replay import finite
+        from .profile_pocket_milling import pocket_tool_limit
+        finite(self.depth, "profile pocket depth", positive=True)
+        self.width, self.length = _profile_bounds(self.profile)
+        if self.tool is None:
+            maximum = pocket_tool_limit(self.profile, self.islands, finish_allowance=self.finish_allowance)
+            self.tool, self.tool_selection = _select_inventory_tool(
+                ToolRequirement("flat_endmill", max_diameter_mm=maximum, min_flute_length_mm=self.depth,
+                    feature="profile_pocket", reason="selected cutter for the profile opening and island clearances", prefer_largest=True),
+                ToolSpec("flat_endmill", maximum))
+        self.feeds_speeds = get_feeds_speeds(_resolve_fs_tool_type(self.tool.tool_type), self.tool.diameter, self.material)
+        self.position = None
+        self.finish_op = None
 
     def apply(self, shape):
-        return profile_pocket_cut(
-            shape,
-            self.profile or {"width": self.width, "length": self.length},
-            self.depth,
-            face_selector=self.face_selector,
-            through=self.through,
-            islands=self.islands,
-        )
+        return self._apply_native_profile(shape)
+
+    def _apply_native_profile(self, shape, *, outside=False):
+        from .profile_pocket_milling import run_profile_pocket
+        result, self._pocket_toolpath, self._material_pass_states, self._pass_reports, self._target_comparison = run_profile_pocket(
+            shape, self.profile, tool=self.tool, depth=self.depth, islands=self.islands, through=self.through,
+            face_selector=self.face_selector, stepdown=self.stepdown, finish_allowance=self.finish_allowance,
+            chord_error=self.chord_error, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds), outside=outside)
+        self._pocket_toolpath.metadata.update(tool=_tool_dict(self.tool), tool_selection=_tool_selection_dict(self.tool_selection),
+            width_mm=self.width, length_mm=self.length)
+        return result
+
+    def to_toolpath(self):
+        if not hasattr(self, "_pocket_toolpath"):
+            raise ValueError("The profile operation has no retained selected-cutter path. Its material-removal simulation needs verification.")
+        return self._pocket_toolpath
 
     def to_dict(self) -> dict:
         data = super().to_dict()
+        for key in ("geometry_review_reasons", "corner_radius_mm", "modeled_corner_radius_mm", "has_finish_pass", "notes"):
+            data.pop(key, None)
+        passes = getattr(self, "_pass_reports", [])
+        comparison = getattr(self, "_target_comparison", {})
+        reasons = ["The profile operation requires qualified entry, fixture, feed, spindle, and complete target verification."]
+        if not passes:
+            reasons.append("This profile operation has no retained selected-cutter replay. The displayed geometry is not machining proof.")
+        elif not isinstance(self, ProfileCutoutOp):
+            kind = str(self.profile.get("type", self.profile.get("shape", ""))).lower() if isinstance(self.profile, dict) else "polygon"
+            if kind in {"rect", "rectangle", "rib", "pad", "polygon"} and not (self.profile.get("corner_radius") if isinstance(self.profile, dict) else None):
+                reasons.append("The requested sharp inside corners require another process or a design change.")
+        if any(row["profile_fidelity"] == "linearized_curve" or row["source_profile_sampled"] for row in passes):
+            reasons.append("Curved profile paths use linear segments. The requested part tolerance is not verified.")
+        if comparison.get("remaining_target_material_mm3", 0) > 1e-6:
+            reasons.append(f"After all planned passes, {comparison['remaining_target_material_mm3']:.6g} mm³ of target cavity material remains. Review the cutter size and remaining features.")
+        if comparison.get("overcut_volume_mm3", 0) > 1e-6:
+            reasons.append(f"The native profile replay removes {comparison['overcut_volume_mm3']:.6g} mm³ outside the requested operation region. Engineering review is required.")
+        if not (self.tool.physical_assembly or {}).get("owned"):
+            reasons.append("The profile operation requires an owned physical cutter assembly.")
         data.update({
             "operation": "profile_pocket",
             "profile": _profile_payload(self.profile),
@@ -2909,7 +2951,16 @@ class ProfilePocketOp(PocketOp):
             "through": self.through,
             "process": "mill",
             "coverage_family": "arbitrary_profile_2_5d",
-            "manufacturing_completeness": "pure_operation",
+            "manufacturing_completeness": "requires_validation",
+            "geometry_status": "requires_review",
+            "geometry_fidelity": "linearized_profile_cutter_replay" if any(
+                row["profile_fidelity"] == "linearized_curve" or row["source_profile_sampled"] for row in passes) else "exact_cutter_sweep" if passes else "ideal_profile_cut",
+            "achieved_tolerance_estimate_mm": None,
+            "toolpath_status": "unverified" if passes else "unavailable",
+            "material_passes": passes,
+            "operation_target_comparison": comparison,
+            "review_reasons": reasons,
+            "cutter_compensation": "geometry_applied" if passes else "not_verified",
         })
         return data
 
@@ -2921,13 +2972,7 @@ class ProfileCutoutOp(ProfilePocketOp):
     through: bool = False
 
     def apply(self, shape):
-        return profile_cutout_cut(
-            shape,
-            self.profile or {"width": self.width, "length": self.length},
-            self.depth,
-            face_selector=self.face_selector,
-            through=self.through,
-        )
+        return self._apply_native_profile(shape, outside=True)
 
     def to_dict(self) -> dict:
         data = super().to_dict()
@@ -2973,7 +3018,6 @@ class ProfileContourOp(ContourOp):
             chord_error=self.chord_error, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds))
         self._contour_toolpath.metadata["tool"] = _tool_dict(self.tool)
         self._contour_toolpath.metadata["tool_selection"] = _tool_selection_dict(self.tool_selection)
-        FaceMotionFrame(compute_bounding_box(shape), self.face_selector).bind_absolute(self._contour_toolpath)
         return result
 
     def to_toolpath(self):
@@ -3783,16 +3827,14 @@ class NativeSurfaceOp(PureToleranceOp):
         self.depth = max(0, shape.val().BoundingBox().zmax - min(move.position[2]
             for path in paths for move in path.moves if move.move_type in {"feed", "plunge"}))
         self._surface_toolpath = _new_toolpath(self.operation_name, self.tool, self.feeds_speeds,
-            metadata={"coordinate_system": "part_mm", "tool_axis": [0, 0, 1], "cutter_compensation": "geometry_applied"})
+            metadata={"coordinate_system": "part_mm", "tool_axis": [0, 0, 1], "face_selector": ">Z", "cutter_compensation": "geometry_applied"})
         self._material_pass_states, self._pass_reports = [], []
-        result, cumulative_sweep = shape, None
+        result = shape
         for index, path in enumerate(paths, 1):
             start = len(self._surface_toolpath.moves)
             before = result.val().Volume()
-            source = result if self.tool.tool_type == "flat_endmill" else shape
-            previous = None if self.tool.tool_type == "flat_endmill" else cumulative_sweep
-            result, report, cumulative_sweep = replay_pass(source, path, self.tool,
-                sample_interval_mm=path.metadata["sample_interval_mm"], previous_sweep=previous, return_sweep=True)
+            result, report = replay_pass(result, path, self.tool,
+                sample_interval_mm=path.metadata["sample_interval_mm"])
             self._surface_toolpath.moves.extend(path.moves)
             report.update(pass_index=index, pass_role=path.metadata["pass_role"], move_start_index=start,
                 move_end_index=len(self._surface_toolpath.moves), removed_volume_mm3=before - result.val().Volume())
@@ -3802,7 +3844,6 @@ class NativeSurfaceOp(PureToleranceOp):
         if shape.val().Volume() - result.val().Volume() <= 1e-8:
             raise ValueError("The surface path does not remove material from the incoming stock.")
         self._surface_toolpath.metadata["material_passes"] = self._pass_reports
-        FaceMotionFrame(compute_bounding_box(shape), self.face_selector).bind_absolute(self._surface_toolpath)
         return result
 
     def _raster_passes(self, bounds, tip_height):

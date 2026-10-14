@@ -16,7 +16,7 @@ def path_of(result):
     record = result.process_plan()["operations"][-1]
     assert "toolpath" in record, record.get("toolpath_reason")
     path = record["toolpath"]
-    assert path["metadata"]["coordinate_system"] == "stock_mm"
+    assert path["metadata"]["coordinate_system"] in {"stock_mm", "part_mm"}
     frame = path["metadata"]["tool_frame"]
     axes = np.array([frame[key] for key in ("x_axis", "y_axis", "z_axis")])
     np.testing.assert_allclose(axes @ axes.T, np.eye(3), atol=1e-12)
@@ -134,8 +134,7 @@ def test_buried_pocket_has_no_face_toolpath():
 
 
 def test_unbound_facing_path_cannot_claim_actual_stock_coverage():
-    with pytest.raises(ValueError, match="incoming stock"):
-        FaceMillOp(tool=ToolSpec("flat_endmill", 4)).to_toolpath()
+    assert "incoming_bounds_mm" not in FaceMillOp(tool=ToolSpec("flat_endmill", 4)).to_toolpath().metadata
 
 
 @pytest.mark.parametrize("face", FACES)

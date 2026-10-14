@@ -26,12 +26,22 @@ def _boolean(first, others, operation: str, *, tolerance: float | None = None):
     job.SetArguments(arguments)
     job.SetTools(tools)
     job.SetRunParallel(False)
+    job.SetNonDestructive(True)
     if tolerance is not None:
         job.SetFuzzyValue(tolerance)
     job.Build()
     if not job.IsDone() or job.Shape().IsNull():
         raise ValueError("The native Milling Boolean operation failed. The cutter geometry requires review.")
     return cq.Shape.cast(job.Shape())
+
+
+def clean_flat_result(result):
+    """Unify coplanar Boolean faces only when valid geometry and volume remain."""
+    previous = result.val()
+    cleaned = previous.clean()
+    if cleaned.isValid() and abs(cleaned.Volume() - previous.Volume()) <= max(1e-6, abs(previous.Volume()) * 1e-9):
+        return result.newObject([cleaned]), True
+    return result, False
 
 
 def finite(value: Any, name: str, *, positive: bool = False) -> float:
@@ -66,9 +76,13 @@ def _cutter(tool):
     radius = tool.diameter / 2
     if tool.tool_type == "flat_endmill":
         return cq.Solid.makeCylinder(radius, tool.flute_length)
-    sphere = cq.Workplane("XY").sphere(radius).val().translate((0, 0, radius))
-    shank = cq.Solid.makeCylinder(radius, tool.flute_length - radius, cq.Vector(0, 0, radius))
-    return _boolean(sphere, [shank], "fuse")
+    # Revolve a single meridian instead of joining a sphere and cylinder at
+    # their tangent equator. The lower hemisphere and upper flute are exact.
+    diagonal = radius / math.sqrt(2)
+    return (cq.Workplane("XZ").moveTo(0, 0)
+        .threePointArc((diagonal, radius - diagonal), (radius, radius))
+        .lineTo(radius, tool.flute_length).lineTo(0, tool.flute_length).close()
+        .revolve(360, (0, 0), (0, 1)).val())
 
 
 def _horizontal_sweep(tool, start, end):
@@ -99,14 +113,22 @@ def _ball_sweep(radius, start, end):
     import cadquery as cq
     first_center = cq.Vector(start[0], start[1], start[2] + radius)
     last_center = cq.Vector(end[0], end[1], end[2] + radius)
-    first = cq.Workplane("XY").sphere(radius).val().translate(first_center)
     distance = math.dist(start, end)
     if distance <= 1e-9:
-        return first
+        return cq.Workplane("XY").sphere(radius).val().translate(first_center)
     direction = cq.Vector(*[(end[axis] - start[axis]) / distance for axis in range(3)])
-    bridge = cq.Solid.makeCylinder(radius, distance, first_center, direction)
-    last = cq.Workplane("XY").sphere(radius).val().translate(last_center)
-    return _boolean(first, [bridge, last], "fuse")
+    diagonal = radius / math.sqrt(2)
+    capsule = (cq.Workplane("XZ").moveTo(0, -radius)
+        .threePointArc((diagonal, -diagonal), (radius, 0)).lineTo(radius, distance)
+        .threePointArc((diagonal, distance + diagonal), (0, distance + radius)).close()
+        .revolve(360, (0, 0), (0, 1)).val())
+    axis = cq.Vector(0, 0, 1).cross(direction)
+    cosine = max(-1, min(1, direction.z))
+    if axis.Length > 1e-12:
+        capsule = capsule.rotate((0, 0, 0), axis.toTuple(), math.degrees(math.acos(cosine)))
+    elif cosine < 0:
+        capsule = capsule.rotate((0, 0, 0), (1, 0, 0), 180)
+    return capsule.translate(first_center)
 
 
 def replay_pass(shape, path: Toolpath, tool, *, sample_interval_mm: float = 0.25,
@@ -161,34 +183,60 @@ def replay_pass(shape, path: Toolpath, tool, *, sample_interval_mm: float = 0.25
                 sampled = True
             cutters.extend(solids)
         previous = move
-    # Unite overlapping sweep segments before the stock Boolean. A compound
-    # of overlapping poses is not a valid Boolean tool. Repeated small cuts
-    # also amplify tolerance errors at adjoining spherical sweeps.
-    # Only material inside the incoming solid participates in the removal
-    # union. Empty approach sweeps must not create tangent external shells.
-    removals = []
-    for solid in cutters:
-        common = _boolean(solid, [shape.val()], "common") if tool.tool_type == "ball_endmill" else solid
-        if common.Volume() > 1e-9:
-            if not common.isValid():
-                raise ValueError("The surface cutter intersection is not a valid solid.")
-            removals.append(common)
-    united = previous_sweep
-    for offset in range(0, len(removals), 16):
-        group = removals[offset:offset + 16]
-        if united is None:
-            united, group = group[0], group[1:]
-        if group:
-            united = _boolean(united, group, "fuse", tolerance=1e-7)
-    if united is not None:
-        # Same-domain cleaning can damage adjoining spherical pass faces.
-        # Keep the valid Boolean topology for ball-cutter removal unions.
-        if tool.tool_type == "flat_endmill":
-            united = united.clean()
-        if not united.isValid():
-            raise ValueError("The surface cutter sweep is not a valid solid.")
-        result = shape.newObject([_boolean(shape.val(), [united], "cut")])
     topology_repaired = False
+    empty_contact_solids = 0
+    if tool.tool_type == "ball_endmill":
+        # Preserve each selected-cutter solid. Joining overlapping spherical
+        # sweeps can create invalid topology or lose earlier removal regions.
+        # Sequential set difference applies the same union without a fused tool.
+        earlier = list(previous_sweep) if isinstance(previous_sweep, (list, tuple)) else (
+            [previous_sweep] if previous_sweep is not None else [])
+        united = tuple(earlier + cutters)
+        for solid in united:
+            if not solid.isValid():
+                raise ValueError("The ball-cutter sweep is not a valid solid.")
+            before = result.val()
+            stock_box, tool_box = before.BoundingBox(), solid.BoundingBox()
+            if any(min(getattr(stock_box, axis + "max"), getattr(tool_box, axis + "max"))
+                   - max(getattr(stock_box, axis + "min"), getattr(tool_box, axis + "min")) <= 1e-9
+                   for axis in ("x", "y", "z")):
+                continue
+            contact = _boolean(before, [solid], "common")
+            if not contact.isValid():
+                raise ValueError("The ball-cutter contact is not a valid solid.")
+            if not contact.Solids() or contact.Volume() <= 1e-9:
+                # A cutter can cross an already removed region. Re-cutting its
+                # coincident spherical boundary can create a spurious sliver.
+                empty_contact_solids += 1
+                continue
+            before_volume = before.Volume()
+            remaining = _boolean(before, [solid], "cut")
+            if not remaining.isValid():
+                repaired = remaining.fix()
+                if repaired.isValid() and abs(repaired.Volume() - remaining.Volume()) <= max(1e-6, abs(remaining.Volume()) * 1e-8):
+                    remaining = repaired
+                    topology_repaired = True
+            if not remaining.Solids() or not remaining.isValid():
+                raise ValueError("The ball-cutter move did not produce valid remaining material.")
+            if remaining.Volume() > before_volume + max(1e-6, abs(before_volume) * 1e-8):
+                raise ValueError("The cutter replay added material. The intermediate result is unavailable.")
+            result = result.newObject([remaining])
+    else:
+        united = previous_sweep
+        for offset in range(0, len(cutters), 16):
+            group = cutters[offset:offset + 16]
+            if united is None:
+                united, group = group[0], group[1:]
+            if group:
+                united = _boolean(united, group, "fuse", tolerance=1e-7)
+        if united is not None:
+            united = united.clean()
+            if not united.isValid():
+                raise ValueError("The surface cutter sweep is not a valid solid.")
+            result = shape.newObject([_boolean(shape.val(), [united], "cut")])
+    topology_cleaned = False
+    if tool.tool_type == "flat_endmill" and result.solids().vals() and result.val().isValid():
+        result, topology_cleaned = clean_flat_result(result)
     if result.solids().vals() and not result.val().isValid():
         volume_before = result.val().Volume()
         repaired = result.val().fix()
@@ -197,10 +245,14 @@ def replay_pass(shape, path: Toolpath, tool, *, sample_interval_mm: float = 0.25
             topology_repaired = True
     if not result.solids().vals() or not result.val().isValid():
         raise ValueError("The surface path did not produce valid remaining material.")
+    if result.val().Volume() > shape.val().Volume() + max(1e-6, abs(shape.val().Volume()) * 1e-8):
+        raise ValueError("The cutter replay added material. The intermediate result is unavailable.")
     report = {"method": "selected_cutter_brep_replay", "coordinate_system": "part_mm",
         "tool_axis": [0, 0, 1], "geometry_fidelity": "sampled_cutter" if sampled else "exact_cutter_sweep",
         "sample_interval_mm": interval if sampled else None, "sampled_poses": count,
-        "exact_segments": exact, "topology_repaired": topology_repaired,
+        "exact_segments": exact, "topology_repaired": topology_repaired, "topology_cleaned": topology_cleaned,
+        "removal_union": "sequential_cutter_solids" if tool.tool_type == "ball_endmill" else "fused_cutter_solids",
+        "empty_contact_solids": empty_contact_solids,
         "manufacturing_ready": False, "verification_status": "not_verified"}
     return (result, report, united) if return_sweep else (result, report)
 
@@ -227,7 +279,7 @@ def raster_paths(bounds, tip_height, *, tool, operation: str, tolerance_mm: floa
         points = [points[index] for index in keep]
         path = Toolpath(operation, safe_z=bounds.zmax + max(2, radius), tool_type=tool.tool_type,
             tool_diameter_mm=tool.diameter, feed_mm_min=feed, spindle_rpm=rpm,
-            metadata={"coordinate_system": "part_mm", "tool_axis": [0, 0, 1], "pass_index": row + 1,
+            metadata={"coordinate_system": "part_mm", "tool_axis": [0, 0, 1], "face_selector": ">Z", "pass_index": row + 1,
                 "pass_role": "finishing", "sample_interval_mm": sample, "stepover_mm": (y1 - y0) / ny})
         x, y = points[0]
         path.append(ToolpathMove("rapid", (x, y, path.safe_z)))

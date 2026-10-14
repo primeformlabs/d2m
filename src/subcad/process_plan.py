@@ -447,10 +447,7 @@ class ProcessPlan:
         try:
             from .validation import validate_all
 
-            _append_bucket(
-                buckets,
-                "warnings",
-                validate_all({
+            report = validate_all({
                     "schema_version": self.schema_version,
                     "material": self.material,
                     "stock_dimensions": self.stock_dimensions,
@@ -464,10 +461,11 @@ class ProcessPlan:
                     "tooling": self.tooling,
                     "quality": self.quality,
                     "collision_policy": self.collision_policy,
-                }, self.stock_dimensions),
-            )
-        except Exception:
-            pass
+                }, self.stock_dimensions, structured=True)
+            _append_bucket(buckets, "warnings", report.warnings)
+            _append_bucket(buckets, "errors", report.errors)
+        except Exception as error:
+            _append_bucket(buckets, "errors", [f"Process validation failed: {error}"])
 
         for op in self.operations:
             _merge_validation_buckets(buckets, op.get("validation_buckets"))

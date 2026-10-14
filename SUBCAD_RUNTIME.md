@@ -13,7 +13,7 @@ python -m pip wheel --no-deps . --wheel-dir dist
 Install the wheel in the CAD environment:
 
 ```text
-python -m pip install --no-deps dist/d2o_subcad-0.2.6-py3-none-any.whl
+python -m pip install --no-deps dist/d2o_subcad-0.2.14+browser.1-py3-none-any.whl
 ```
 
 Use `from subcad import Stock` from an installed package.
@@ -119,26 +119,47 @@ Contour entry, waste removal, fixture clearance, feeds, spindle speed, and targe
 The independent tri-dexel engine now supports all six cardinal cutter axes in part coordinates.
 It retains its finite sampling limits and cannot authorize manufacturing release.
 
-Version 0.2.5 combines these contour paths with browser stock frames and the continuous Turning clock.
-It preserves supplied spindle phase across consecutive operations with the same recorded insert and spindle conditions.
-It records non-cutting transport without changing the original operation-level plan.
-Tool, setup, speed, and direction changes still need recorded transition data.
+Version 0.2.5 replaces ideal profile-pocket cuts with selected-cutter replay.
+Rasters and boundary passes respect the actual profile and retained islands.
+Each roughing and finishing pass retains its actual material and matching cutter moves.
+The selected cutter leaves the inside corner material that it cannot reach.
+A native operation-region comparison reports remaining target material and overcut volume.
+That comparison does not verify the complete part tolerance or manufacturing release.
 
-Version 0.2.6 exports fixed stock frames for native contour and surface paths.
-These paths retain their existing absolute part coordinates and their independent replay contract.
-The export includes the actual incoming bounds and a cutting-tip origin.
-The browser can replay every retained pass with its selected flat or ball cutter.
+Tool selection checks the accessible cutter-center region, including triangular openings and island gaps.
+Matching circular cutters can use a point or line center path for circles and slots.
+Through depth uses the actual selected stock axis.
+Whole-stock openings permit cutter travel across open stock edges.
+Outside profile clearing removes waste through actual cutter passes instead of intersecting the ideal target.
+Flat cutter results unify coplanar Boolean faces only when validity and volume remain unchanged.
+Qualified entry, fixtures, feeds, spindle speed, complete target comparison, and other operation families remain incomplete.
 
-Version 0.2.7 binds native drilling and spot drilling to all six cardinal stock faces.
-The path records a cutting-tip origin, the actual incoming bounds, and the selected drill point height.
-Through drilling includes the stock thickness, the cone height, and a recorded 1 mm breakthrough distance.
-This distance remains unverified against fixtures and machine travel.
-The path retains each peck plunge and retract.
-Missing point geometry, insufficient cutting length, and a mismatched drill diameter prevent motion export.
+Version 0.2.6 cuts facing operations through retained cutter passes on six cardinal setup faces.
+`face_mill(depth, face_selector="<Z")` supports the bottom datum without moving the profile origin after previous cuts.
+Flat end mills use their cutter geometry. Face mills use a declared nominal cutting envelope.
+Face-mill insert geometry and runout remain unverified.
+The recorded tool identity remains the actual selected assembly.
+Each facing pass preserves its native material state, matching tool moves, and target-region comparison.
+An explicit facing stepover cannot exceed the selected cutter's saved maximum stepover.
+Qualified fixtures, feeds, spindle speed, insert geometry, and complete part tolerances remain required.
 
-Blind drilling records the commanded cutting-tip depth.
-The current blind-hole BRep still uses a flat cylindrical cavity.
-Its `cad_drill_bottom: flat_intent` metadata records this difference from the physical conical drill point.
-Spot drilling records `cad_drill_bottom: planning_only` because its retained CAD state has no material removal.
-The browser keeps these limitations visible.
-Neither case supplies independent manufacturing proof.
+## Browser runtime reconciliation
+
+The `0.2.14+browser.1` candidate combines native replay through commit `34504a2` with the existing browser frame and Turning clock records.
+Native drilling, spot drilling, hole finishing, measured fixture reports, nominal comparison, and Laser replay keep their material implementations.
+Browser binding adds a fixed cutter frame and actual incoming bounds to retained part-coordinate paths.
+It does not change native move positions, depth references, or material states.
+Blind drilling keeps its full-diameter depth and actual point cavity.
+Spot drilling keeps its tip depth and actual removed material.
+Unapplied planning paths have no browser stock binding.
+
+The rectangular `PocketOp` frame fixes remain because the native branch did not change that legacy operation class.
+The native `ProfilePocketOp` retains its selected-cutter material passes.
+Turning retains the supplied spindle phase, signed spindle transform, and continuous program clock.
+The separate native nominal comparison remains available.
+These records do not establish manufacturing tolerance or machine release.
+
+The combined source checks pass 277 tests and 28 subtests on Python 3.11 and CadQuery 2.4.0.
+Installed runtime, contour, facing, and profile-pocket checks pass from the candidate wheel.
+The operation-video contract passes all 46 checks.
+D2O integration and browser checks remain separate requirements before changing the application runtime pin.

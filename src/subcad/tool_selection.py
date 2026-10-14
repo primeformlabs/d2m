@@ -72,6 +72,8 @@ class ToolRequirement:
     reason: str = ""
     prefer_largest: bool = False
     alternative_tool_types: tuple[str, ...] = ()
+    require_point_geometry: bool = False
+    include_point_length_in_reach: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -83,6 +85,8 @@ class ToolRequirement:
             "reason": self.reason,
             "prefer_largest": self.prefer_largest,
             "alternative_tool_types": list(self.alternative_tool_types),
+            "require_point_geometry": self.require_point_geometry,
+            "include_point_length_in_reach": self.include_point_length_in_reach,
         }
 
 
@@ -148,6 +152,15 @@ def select_tool(requirement: ToolRequirement) -> ToolSelectionResult:
                 reasons.append("flute_length_too_short")
             if scope and scope.strict and min(tool.reach_mm or tool.flute_length, tool.stickout_mm) < requirement.min_flute_length_mm:
                 reasons.append("reach_too_short")
+        if requirement.require_point_geometry and tool.tool_type in allowed_types:
+            try:
+                from .drilling_replay import point_geometry
+                _, _, point = point_geometry(tool)
+                required_depth = requirement.min_flute_length_mm + (point if requirement.include_point_length_in_reach else 0)
+                if required_depth > min(tool.flute_length, tool.reach_mm or tool.flute_length, tool.stickout_mm):
+                    reasons.append("point_depth_exceeds_reach")
+            except (ValueError, TypeError):
+                reasons.append("missing_or_invalid_point_geometry")
 
         if reasons:
             if tool.tool_type in allowed_types:
@@ -176,6 +189,9 @@ def select_tool(requirement: ToolRequirement) -> ToolSelectionResult:
     if requirement.min_flute_length_mm:
         message += f" and flute length {requirement.min_flute_length_mm:g} mm"
     result.errors.append(message)
+    if requirement.require_point_geometry:
+        result.errors.append("Reaming requires a recorded lead angle, a positive lead tip diameter, and complete lead reach." if requirement.tool_type == "reamer"
+            else "Drilling requires a valid recorded point angle and enough reach for the complete drill point.")
     return result
 
 

@@ -18,9 +18,9 @@ drill = ToolSpec("drill", 4, tip_angle=118, flute_length=20, catalog_id="ENGINEE
     physical_assembly={"owned": True, "assembly_id": "ENGINEERING-INSTALLED-DRILL"})
 drilled = Stock.rectangular(8, 8, 6).drill(4, through=True, spot_drill=False, face_selector="<X", tool=drill)
 drill_path = drilled.process_plan()["operations"][-1]["toolpath"]
-assert drill_path["metadata"]["coordinate_system"] == "stock_mm"
+assert drill_path["metadata"]["coordinate_system"] == "part_mm"
 assert drill_path["metadata"]["tool_frame"]["z_axis"] == [-1, 0, 0]
-assert drill_path["metadata"]["cad_drill_bottom"] == "through"
+assert drill_path["metadata"]["depth_reference"] == "full_diameter"
 assert to_sim_tool(ToolSpec("flat_endmill", 8, flute_length=20)) is not None
 comparison_stock = Stock.rectangular(12, 12, 8)
 faced = comparison_stock.face_mill(1)

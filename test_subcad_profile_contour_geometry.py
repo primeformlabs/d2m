@@ -121,7 +121,7 @@ def test_profiles_use_their_own_boundary_instead_of_a_square_substitute(profile)
     ({"points": [(0, 0), (4, 4), (0, 4), (4, 0)]}, {}, "without intersections"),
     ({"points": [(0, 0), (4, 0), (4, 0), (0, 4)]}, {}, "repeated"),
     ({"points": [(0, 0), (math.nan, 4), (4, 0)]}, {}, "finite closed"),
-    ({"type": "circle"}, {}, "profile radius"),
+    ({"type": "circle"}, {}, "profile diameter"),
     ({"type": "unknown", "length": 10, "width": 8}, {}, "unsupported"),
     ({"type": "slot", "length": 4, "width": 6}, {}, "at least equal"),
     ({"length": 4, "width": 4}, {"side": "inside", "tool": ToolSpec("flat_endmill", 6)}, "does not fit"),

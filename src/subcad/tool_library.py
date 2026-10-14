@@ -297,12 +297,13 @@ class ToolCatalog:
             "TAP_M12": _e("thread_mill", 12.0),
 
             # --- Reamers (shallow tip angle) ---
-            "REAM_3mm":  _e("drill", 3.0,  tip_angle=45.0),
-            "REAM_4mm":  _e("drill", 4.0,  tip_angle=45.0),
-            "REAM_5mm":  _e("drill", 5.0,  tip_angle=45.0),
-            "REAM_6mm":  _e("drill", 6.0,  tip_angle=45.0),
-            "REAM_8mm":  _e("drill", 8.0,  tip_angle=45.0),
-            "REAM_10mm": _e("drill", 10.0, tip_angle=45.0),
+            # Lead geometry requires a recorded cutter specification.
+            "REAM_3mm":  _e("reamer", 3.0),
+            "REAM_4mm":  _e("reamer", 4.0),
+            "REAM_5mm":  _e("reamer", 5.0),
+            "REAM_6mm":  _e("reamer", 6.0),
+            "REAM_8mm":  _e("reamer", 8.0),
+            "REAM_10mm": _e("reamer", 10.0),
 
             # --- Spot Drills (wider tip than standard drills) ---
             "SPOT_6mm":  _e("drill", 6.0,  tip_angle=120.0),
@@ -556,8 +557,12 @@ def to_sim_tool(spec: ToolSpec):
     elif tt == "bull_nose":
         kwargs["corner_radius"] = spec.corner_radius
 
-    elif tt == "drill":
-        kwargs["tip_angle"] = spec.tip_angle if spec.tip_angle else 118.0
+    elif tt in {"drill", "reamer"}:
+        from .drilling_replay import point_geometry
+        point_geometry(spec)
+        kwargs["tip_angle"] = spec.tip_angle
+        tt = "drill"
+        kwargs["tip_diameter"] = spec.tip_diameter
 
     elif tt == "chamfer":
         if spec.tip_diameter:

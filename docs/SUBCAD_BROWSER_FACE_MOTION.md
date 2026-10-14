@@ -12,23 +12,23 @@ The cutter-centre contour follows the modeled corner radius minus the cutter rad
 The contour uses linear chords with a maximum error of 0.002 mm.
 The final inner contour prevents a remaining material island.
 
-Face milling covers the full incoming stock footprint.
-The lanes include both footprint edges.
-The path starts outside the stock before the cutter descends.
-An unbound face operation has no toolpath.
+Face milling uses the retained native cutter passes through the full incoming stock footprint.
+The native path preserves its entry and cutter positions.
+An unbound face plan has no browser stock binding.
 A buried pocket has no toolpath through the access face.
 
 Bound paths provide:
 
-- `coordinate_system: stock_mm`.
+- `coordinate_system: part_mm` for retained native paths, or `stock_mm` for the legacy rectangular pocket.
 - `tool_origin: cutting_tip`.
 - A fixed, right-handed `tool_frame` with three unit axes.
 - The incoming material bounds in millimetres.
 - The stock face and the clearance distance.
 - `source: cam_intent` and `verification_status: not_verified`.
 
-The legacy `safe_z` field gives the clearance distance.
-It does not give the world Z coordinate.
+Legacy rectangular pocket paths use `safe_z` as a clearance distance.
+Native retained paths keep the native meaning of `safe_z`.
+The browser uses the recorded absolute move positions.
 The operation-video adapter uses the stock positions and the fixed tool frame.
 It does not add the stock top height again.
 

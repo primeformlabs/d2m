@@ -637,29 +637,11 @@ def _zone_contains(zone: dict, x: float, y: float) -> bool:
 def _zone_bounds(zone: dict) -> Optional[dict[str, float]]:
     keys = ("x_min", "x_max", "y_min", "y_max", "z_min", "z_max")
     values = {key: _as_float(zone.get(key)) for key in keys}
-    if any(value is None for value in values.values()):
+    if any(value is None or not math.isfinite(value) for value in values.values()):
         return None
-    x_min, x_max = sorted((values["x_min"], values["x_max"]))
-    y_min, y_max = sorted((values["y_min"], values["y_max"]))
-    z_min, z_max = sorted((values["z_min"], values["z_max"]))
-    return {
-        "x_min": x_min,
-        "x_max": x_max,
-        "y_min": y_min,
-        "y_max": y_max,
-        "z_min": z_min,
-        "z_max": z_max,
-    }
-
-
-def _distance_to_rect_xy(bounds: dict[str, float], x: float, y: float) -> float:
-    dx = max(bounds["x_min"] - x, 0.0, x - bounds["x_max"])
-    dy = max(bounds["y_min"] - y, 0.0, y - bounds["y_max"])
-    return (dx * dx + dy * dy) ** 0.5
-
-
-def _intervals_overlap(a_min: float, a_max: float, b_min: float, b_max: float) -> bool:
-    return max(a_min, b_min) <= min(a_max, b_max)
+    if any(values[axis + "_min"] > values[axis + "_max"] for axis in ("x", "y", "z")):
+        return None
+    return values
 
 
 def _tool_id(op: dict) -> str:
@@ -711,6 +693,9 @@ def _tool_assembly(op: dict) -> dict:
 
 def _tool_envelopes(op: dict, *, include_cutter: bool = True) -> list[dict[str, Any]]:
     assembly = _tool_assembly(op)
+    for key, value in assembly.items():
+        if key.endswith("_mm") and (not math.isfinite(value) or value < 0):
+            assembly[key] = 0.0
     cutter_dia = assembly["cutter_diameter_mm"]
     flute = assembly["flute_length_mm"]
     shank_dia = assembly["shank_diameter_mm"] or cutter_dia
@@ -750,28 +735,6 @@ def _tool_envelopes(op: dict, *, include_cutter: bool = True) -> list[dict[str, 
     return envelopes
 
 
-def _sample_toolpath_points(points: list[tuple[float, float, float]],
-                            max_step_mm: float = 2.0) -> list[tuple[float, float, float]]:
-    if len(points) < 2:
-        return points
-
-    samples: list[tuple[float, float, float]] = []
-    for start, end in zip(points, points[1:]):
-        sx, sy, sz = start
-        ex, ey, ez = end
-        length = ((ex - sx) ** 2 + (ey - sy) ** 2 + (ez - sz) ** 2) ** 0.5
-        steps = max(1, math.ceil(length / max(max_step_mm, 0.1)))
-        for step in range(steps):
-            t = step / steps
-            samples.append((
-                sx + (ex - sx) * t,
-                sy + (ey - sy) * t,
-                sz + (ez - sz) * t,
-            ))
-    samples.append(points[-1])
-    return samples
-
-
 def _check_tool_envelope_against_zones(
     op: dict,
     op_index: int,
@@ -782,55 +745,84 @@ def _check_tool_envelope_against_zones(
     fixture_id: str,
     include_cutter: bool,
 ) -> list[ValidationIssue]:
-    records = _toolpath_records(op.get("toolpath"))
-    points = [p for p in (_toolpath_xyz(record) for record in records or []) if p is not None]
-    if not points:
+    from .fixture_sweep import cardinal_tool_axis, segment_envelope_hit
+
+    if not zones:
         return []
+    def unavailable(message, **context):
+        return _issue("warning", "fixture_clearance_unverified", message, op_index, op,
+                      fixture_id=fixture_id, verification_status="unavailable",
+                      manufacturing_ready=False, **context)
+
+    records = _toolpath_records(op.get("toolpath"))
+    if not records:
+        return [unavailable("Fixture clearance is unverified because the operation has no toolpath.")]
+    try:
+        axis = cardinal_tool_axis(op)
+    except ValueError as error:
+        return [unavailable(str(error))]
 
     tool_id = _tool_id(op)
-    samples = _sample_toolpath_points(points)
     envelopes = _tool_envelopes(op, include_cutter=include_cutter)
-    if not envelopes:
-        return []
-
     issues: list[ValidationIssue] = []
+    segments = []
+    previous = None
+    path = op.get("toolpath")
+    metadata = path.get("metadata", {}) if isinstance(path, dict) else {}
+    entry = metadata.get("pass_entry_position")
+    if entry is not None:
+        previous = _toolpath_xyz(entry)
+        if previous is None or not all(math.isfinite(value) for value in previous):
+            issues.append(unavailable("The toolpath entry position is invalid."))
+            previous = None
+    for move_index, record in enumerate(records):
+        point = _toolpath_xyz(record)
+        kind = str(record.get("type", record.get("kind", "feed"))).lower() if isinstance(record, dict) else "feed"
+        if point is None or not all(math.isfinite(value) for value in point):
+            if kind == "dwell" and previous is not None:
+                continue
+            issues.append(unavailable("A toolpath position is invalid. Fixture clearance is unverified.", move_index=move_index))
+            previous = None
+            continue
+        if kind not in {"rapid", "feed", "plunge", "retract", "dwell", "linear"}:
+            issues.append(unavailable("Fixture clearance is unverified for this toolpath move type.",
+                                      move_index=move_index, move_type=kind))
+            # Inspect the endpoint, but never replace an unsupported arc with a chord.
+            segments.append((point, point, move_index))
+        else:
+            segments.append((previous or point, point, move_index))
+        previous = point
+
     emitted: set[tuple[str, str]] = set()
     for zone in zones:
         if not isinstance(zone, dict):
+            issues.append(unavailable("A fixture zone is invalid."))
             continue
         bounds = _zone_bounds(zone)
-        if bounds is None:
-            continue
         label = str(zone.get("label") or zone_type)
-        margin = _as_float(zone.get("margin_mm"), 0.0) or 0.0
+        margin = _as_float(zone.get("margin_mm"), 0.0)
+        if bounds is None:
+            issues.append(unavailable("A fixture zone has invalid bounds.", zone=label))
+            continue
+        if margin is None or not math.isfinite(margin) or margin < 0:
+            issues.append(unavailable("A fixture zone has an invalid clearance margin.", zone=label))
+            continue
         severity = str(zone.get("severity", "warning")).lower()
         if severity not in ("warning", "error"):
             severity = "warning"
 
         best_by_component: dict[str, dict[str, Any]] = {}
-        for x, y, tip_z in samples:
+        for start, end, move_index in segments:
             for envelope in envelopes:
                 component = envelope["component"]
-                component_z_min = tip_z + envelope["z_start_mm"]
-                component_z_max = tip_z + envelope["z_end_mm"]
-                if not _intervals_overlap(
-                    component_z_min, component_z_max, bounds["z_min"], bounds["z_max"]
-                ):
-                    continue
-                radius = envelope["radius_mm"]
-                clearance = _distance_to_rect_xy(bounds, x, y) - radius - margin
-                if clearance > 0.0:
+                hit = segment_envelope_hit(start, end, axis, envelope, bounds, margin)
+                if hit is None:
                     continue
                 previous = best_by_component.get(component)
-                if previous is None or clearance < previous["clearance_mm"]:
+                if previous is None or hit["clearance_mm"] < previous["clearance_mm"]:
                     best_by_component[component] = {
-                        "x": x,
-                        "y": y,
-                        "z": tip_z,
-                        "clearance_mm": clearance,
-                        "radius_mm": radius,
-                        "component_z_min": component_z_min,
-                        "component_z_max": component_z_max,
+                        **hit, "move_index": move_index,
+                        "radius_mm": envelope["radius_mm"],
                     }
 
         for component, hit in best_by_component.items():
@@ -841,9 +833,8 @@ def _check_tool_envelope_against_zones(
             issues.append(_issue(
                 severity,
                 code,
-                f"{_op_name(op) or 'operation'} at position {op_index} has "
-                f"{component} envelope within {abs(hit['clearance_mm']):g}mm of "
-                f"{zone_type} '{label}' using tool '{tool_id or 'unknown'}'.",
+                f"The {component} envelope can intersect {zone_type} '{label}' "
+                f"during {_op_name(op) or 'operation'} with tool '{tool_id or 'unknown'}'.",
                 op_index,
                 op,
                 fixture_id=fixture_id,
@@ -851,13 +842,16 @@ def _check_tool_envelope_against_zones(
                 zone=label,
                 zone_type=zone_type,
                 component=component,
-                clearance_mm=round(hit["clearance_mm"], 6),
+                clearance_mm=hit["clearance_mm"],
                 envelope_radius_mm=hit["radius_mm"],
-                point=[round(hit["x"], 6), round(hit["y"], 6), round(hit["z"], 6)],
-                component_z_range_mm=[
-                    round(hit["component_z_min"], 6),
-                    round(hit["component_z_max"], 6),
-                ],
+                point=hit["point"],
+                tool_axis=list(axis),
+                move_index=hit["move_index"],
+                segment_fraction=hit["segment_fraction"],
+                component_axis_range_mm=hit["component_axis_range_mm"],
+                method="continuous_cardinal_envelope",
+                verification_status="possible_collision",
+                manufacturing_ready=False,
                 zone_bounds=bounds,
             ))
 
@@ -871,44 +865,89 @@ def _check_fixture_clearance(process_plan_dict: dict) -> list[ValidationIssue]:
         return []
 
     issues: list[ValidationIssue] = []
-    fixture_zones = fixture.get("clamping_zones", []) if isinstance(fixture, dict) else []
-    fixture_clearance_zones = fixture.get("clearance_zones", []) if isinstance(fixture, dict) else []
-    fixture_id = str(fixture.get("name") or fixture.get("id") or "") if isinstance(fixture, dict) else ""
     stock_dims = process_plan_dict.get("stock_dimensions") or {}
     stock_length = _as_float(stock_dims.get("length"))
     stock_width = _as_float(stock_dims.get("width"))
-    if isinstance(fixture, dict):
-        max_opening = _as_float(fixture.get("max_opening_mm"))
-        jaw_width = _as_float(fixture.get("jaw_width_mm"))
-        if max_opening is not None and stock_length is not None and stock_length > max_opening:
-            issues.append(_issue(
-                "warning", "fixture_stock_fit",
-                f"Stock length ({stock_length:g}mm) exceeds fixture max opening "
-                f"({max_opening:g}mm).",
-                stock_length_mm=stock_length, max_opening_mm=max_opening,
-            ))
-        if jaw_width is not None and stock_width is not None and stock_width > jaw_width:
-            issues.append(_issue(
-                "warning", "fixture_jaw_width",
-                f"Stock width ({stock_width:g}mm) exceeds fixture jaw width "
-                f"({jaw_width:g}mm).",
-                stock_width_mm=stock_width, jaw_width_mm=jaw_width,
-            ))
+    checked_setups = set()
     for i, op in enumerate(process_plan_dict.get("operations", [])):
         setup_name = op.get("setup")
         setup = setups.get(setup_name, {}) if setup_name else {}
-        zones = fixture_zones
-        if isinstance(setup, dict) and setup.get("clamping_zones"):
-            zones = setup.get("clamping_zones", zones)
-        clearance_zones = fixture_clearance_zones
-        if isinstance(setup, dict) and setup.get("clearance_zones"):
-            clearance_zones = setup.get("clearance_zones", clearance_zones)
-        if not zones:
-            zones = []
+        setup = setup if isinstance(setup, dict) else {}
+        actual_fixture = setup.get("fixture_spec")
+        if not isinstance(actual_fixture, dict):
+            actual_fixture = setup.get("fixture") if isinstance(setup.get("fixture"), dict) else fixture
+        actual_fixture = actual_fixture if isinstance(actual_fixture, dict) else {}
+        fixture_id = str(actual_fixture.get("name") or actual_fixture.get("id") or "")
+        referenced_fixture = setup.get("fixture")
+        if isinstance(referenced_fixture, str) and referenced_fixture != fixture_id:
+            issues.append(_issue(
+                "warning", "fixture_clearance_unverified",
+                "The setup fixture geometry is missing. The latest fixture cannot replace it.",
+                i, op, setup=setup_name, fixture_id=referenced_fixture,
+                verification_status="unavailable", manufacturing_ready=False,
+            ))
+            continue
+        if setup_name and setup_name not in setups:
+            issues.append(_issue(
+                "warning", "fixture_clearance_unverified",
+                "The operation setup is missing. Fixture clearance is unverified.",
+                i, op, setup=setup_name, verification_status="unavailable", manufacturing_ready=False,
+            ))
+            continue
+        setup_key = (setup_name, fixture_id)
+        if setup_key not in checked_setups:
+            checked_setups.add(setup_key)
+            max_opening = _as_float(actual_fixture.get("max_opening_mm"))
+            jaw_width = _as_float(actual_fixture.get("jaw_width_mm"))
+            if max_opening and stock_length is not None and stock_length > max_opening:
+                issues.append(_issue("warning", "fixture_stock_fit",
+                    f"Stock length ({stock_length:g} mm) exceeds fixture opening ({max_opening:g} mm).",
+                    i, op, setup=setup_name, fixture_id=fixture_id,
+                    stock_length_mm=stock_length, max_opening_mm=max_opening))
+            if jaw_width and stock_width is not None and stock_width > jaw_width:
+                issues.append(_issue("warning", "fixture_jaw_width",
+                    f"Stock width ({stock_width:g} mm) exceeds fixture jaw width ({jaw_width:g} mm).",
+                    i, op, setup=setup_name, fixture_id=fixture_id,
+                    stock_width_mm=stock_width, jaw_width_mm=jaw_width))
+        frame = actual_fixture.get("coordinate_frame")
+        if frame and frame not in ("part_mm", {"name": "part_mm"}, {"origin": "part_mm"}):
+            issues.append(_issue("warning", "fixture_clearance_unverified",
+                "Fixture zones require part_mm coordinates. The fixture coordinate transform is unverified.",
+                i, op, setup=setup_name, fixture_id=fixture_id,
+                verification_status="unavailable", manufacturing_ready=False))
+            continue
+        zones = setup.get("clamping_zones", actual_fixture.get("clamping_zones", []))
+        clearance_zones = setup.get("clearance_zones", actual_fixture.get("clearance_zones", []))
+        if not isinstance(zones, list) or not isinstance(clearance_zones, list):
+            issues.append(_issue(
+                "warning", "fixture_clearance_unverified", "The fixture zones are invalid.",
+                i, op, fixture_id=fixture_id, verification_status="unavailable", manufacturing_ready=False,
+            ))
+            continue
+        if not zones and not clearance_zones:
+            issues.append(_issue(
+                "warning", "fixture_clearance_unverified", "The fixture has no collision zones. Fixture clearance is unverified.",
+                i, op, fixture_id=fixture_id, verification_status="unavailable", manufacturing_ready=False,
+            ))
+
+        assembly = _tool_assembly(op)
+        required = ("cutter_diameter_mm", "flute_length_mm", "shank_diameter_mm",
+                    "stickout_mm", "holder_diameter_mm", "holder_length_mm")
+        missing = [key for key in required if not math.isfinite(assembly[key]) or assembly[key] <= 0]
+        if assembly["stickout_mm"] < assembly["flute_length_mm"]:
+            missing.append("stickout_at_least_flute_length")
+        if missing:
+            issues.append(_issue(
+                "warning", "fixture_clearance_unverified",
+                "The cutter assembly dimensions are incomplete or invalid. Complete fixture clearance is unverified.",
+                i, op, fixture_id=fixture_id, tool_id=_tool_id(op), missing_dimensions=missing,
+                verification_status="unavailable", manufacturing_ready=False,
+            ))
 
         op_type = _op_name(op)
         pos = op.get("position")
-        if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+        # A 2D feature position cannot override a valid 3D travel check.
+        if not op.get("toolpath") and isinstance(pos, (list, tuple)) and len(pos) >= 2:
             x = _as_float(pos[0])
             y = _as_float(pos[1])
             if x is not None and y is not None:
@@ -923,7 +962,7 @@ def _check_fixture_clearance(process_plan_dict: dict) -> list[ValidationIssue]:
                         ))
 
         issues.extend(_check_tool_envelope_against_zones(
-            op,
+            {**op, "face_selector": op.get("face_selector", setup.get("face_selector", ">Z"))},
             i,
             zones,
             zone_type="clamping zone",
@@ -932,7 +971,7 @@ def _check_fixture_clearance(process_plan_dict: dict) -> list[ValidationIssue]:
             include_cutter=True,
         ))
         issues.extend(_check_tool_envelope_against_zones(
-            op,
+            {**op, "face_selector": op.get("face_selector", setup.get("face_selector", ">Z"))},
             i,
             clearance_zones,
             zone_type="clearance zone",
