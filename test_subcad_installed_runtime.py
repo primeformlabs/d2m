@@ -14,6 +14,13 @@ assert "site-packages" in str(Path(subcad.__file__).resolve())
 assert MaterialRemovalEngine and TriDexelModel
 assert "aluminum_6061" in list_materials()
 assert "error" not in get_feeds_speeds("end_mill", 8, "aluminum_6061")
+drill = ToolSpec("drill", 4, tip_angle=118, flute_length=20, catalog_id="ENGINEERING-INSTALLED-DRILL",
+    physical_assembly={"owned": True, "assembly_id": "ENGINEERING-INSTALLED-DRILL"})
+drilled = Stock.rectangular(8, 8, 6).drill(4, through=True, spot_drill=False, face_selector="<X", tool=drill)
+drill_path = drilled.process_plan()["operations"][-1]["toolpath"]
+assert drill_path["metadata"]["coordinate_system"] == "stock_mm"
+assert drill_path["metadata"]["tool_frame"]["z_axis"] == [-1, 0, 0]
+assert drill_path["metadata"]["cad_drill_bottom"] == "through"
 assert to_sim_tool(ToolSpec("flat_endmill", 8, flute_length=20)) is not None
 comparison_stock = Stock.rectangular(12, 12, 8)
 faced = comparison_stock.face_mill(1)

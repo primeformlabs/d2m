@@ -286,6 +286,16 @@ def _drill_toolpath(
     ))
 
 
+def _drill_tip_height(tool: ToolSpec) -> float:
+    if (any(isinstance(value, bool) or not isinstance(value, (int, float))
+            for value in (tool.diameter, tool.tip_angle, tool.tip_diameter, tool.corner_radius))
+            or tool.tool_type != "drill" or not math.isfinite(tool.diameter) or tool.diameter <= 0
+            or not math.isfinite(tool.tip_angle) or not 0 < tool.tip_angle < 180
+            or tool.tip_diameter != 0 or tool.corner_radius != 0):
+        raise ValueError("The drill needs a recorded pointed cone cutting geometry.")
+    return tool.diameter / (2 * math.tan(math.radians(tool.tip_angle / 2)))
+
+
 def _slot_endpoints(cx: float, cy: float, length: float, angle_deg: float) -> tuple[tuple[float, float], tuple[float, float]]:
     theta = math.radians(angle_deg)
     half = length / 2.0
@@ -1183,6 +1193,7 @@ class SpotDrillOp(MachiningOperation):
     def apply(self, shape):
         # Spot-drill does not change the final hole geometry -- it is a
         # planning step that precedes the actual drill.
+        self._motion_frame = FaceMotionFrame(compute_bounding_box(shape), self.face_selector)
         return shape
 
     def to_dict(self) -> dict:
@@ -1201,7 +1212,13 @@ class SpotDrillOp(MachiningOperation):
         }
 
     def to_toolpath(self) -> Toolpath:
-        return _drill_toolpath(
+        frame = getattr(self, "_motion_frame", None)
+        if frame is None:
+            raise ValueError("Apply spot drilling to the incoming stock before creating its toolpath.")
+        height = _drill_tip_height(self.tool)
+        if not math.isfinite(self.tool.flute_length) or self.tool.flute_length < max(height, 1):
+            raise ValueError("The spot drill needs sufficient recorded cutting length.")
+        return frame.bind(_drill_toolpath(
             "spot_drill",
             self.tool,
             self.feeds_speeds,
@@ -1209,7 +1226,9 @@ class SpotDrillOp(MachiningOperation):
             self.cy,
             1.0,
             dwell_seconds=0.2,
-        )
+            metadata={"drill_tip_height_mm": height, "depth_reference": "cutting_tip",
+                      "cad_drill_bottom": "planning_only"},
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -1288,6 +1307,7 @@ class DrillOp(MachiningOperation):
         if self.spot_op is not None:
             self.spot_op.face_selector = self.face_selector
             shape = self.spot_op.apply(shape)
+        self._motion_frame = FaceMotionFrame(compute_bounding_box(shape), self.face_selector)
         return drill_hole(shape, self.cx, self.cy, self.diameter, self.depth, self.through,
                           face_selector=self.face_selector)
 
@@ -1311,19 +1331,37 @@ class DrillOp(MachiningOperation):
         }
 
     def to_toolpath(self) -> Toolpath:
+        frame = getattr(self, "_motion_frame", None)
+        if frame is None:
+            raise ValueError("Apply drilling to the incoming stock before creating its toolpath.")
+        height = _drill_tip_height(self.tool)
+        axis = "xyz"[frame.axes[2]]
+        if abs(self.tool.diameter - self.diameter) > 1e-6:
+            raise ValueError("The selected drill diameter does not match the hole.")
+        thickness = frame.bounds[f"{axis}_max"] - frame.bounds[f"{axis}_min"]
+        # The full-diameter portion must pass the far stock face. Keep the
+        # physical cutting-tip origin instead of treating the cone as a cylinder.
+        penetration = thickness + height + 1.0 if self.through else self.depth
+        if not math.isfinite(penetration) or penetration <= 0:
+            raise ValueError("The drill needs a positive cutting-tip depth.")
+        if not math.isfinite(self.tool.flute_length) or self.tool.flute_length < max(height, penetration):
+            raise ValueError("The drill needs sufficient recorded cutting length for this stock.")
         tp = _drill_toolpath(
             "drill",
             self.tool,
             self.feeds_speeds,
             self.cx,
             self.cy,
-            self.depth,
+            penetration,
             peck_step=(max(self.diameter, 1.0) if self.peck else None),
-            metadata={"tool_selection": _tool_selection_dict(self.tool_selection)},
+            metadata={"tool_selection": _tool_selection_dict(self.tool_selection),
+                      "drill_tip_height_mm": height, "depth_reference": "cutting_tip",
+                      "through": self.through, "breakthrough_mm": 1.0 if self.through else 0.0,
+                      "cad_drill_bottom": "through" if self.through else "flat_intent"},
         )
         if self.spot_op is not None:
             tp.metadata["spot_toolpath"] = self.spot_op.to_toolpath().to_dict()
-        return tp
+        return frame.bind(tp)
 
 
 # ---------------------------------------------------------------------------

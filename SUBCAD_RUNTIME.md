@@ -128,3 +128,17 @@ Version 0.2.6 exports fixed stock frames for native contour and surface paths.
 These paths retain their existing absolute part coordinates and their independent replay contract.
 The export includes the actual incoming bounds and a cutting-tip origin.
 The browser can replay every retained pass with its selected flat or ball cutter.
+
+Version 0.2.7 binds native drilling and spot drilling to all six cardinal stock faces.
+The path records a cutting-tip origin, the actual incoming bounds, and the selected drill point height.
+Through drilling includes the stock thickness, the cone height, and a recorded 1 mm breakthrough distance.
+This distance remains unverified against fixtures and machine travel.
+The path retains each peck plunge and retract.
+Missing point geometry, insufficient cutting length, and a mismatched drill diameter prevent motion export.
+
+Blind drilling records the commanded cutting-tip depth.
+The current blind-hole BRep still uses a flat cylindrical cavity.
+Its `cad_drill_bottom: flat_intent` metadata records this difference from the physical conical drill point.
+Spot drilling records `cad_drill_bottom: planning_only` because its retained CAD state has no material removal.
+The browser keeps these limitations visible.
+Neither case supplies independent manufacturing proof.
