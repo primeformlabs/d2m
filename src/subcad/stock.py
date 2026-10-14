@@ -1271,6 +1271,9 @@ class Stock:
         through: bool = False,
         face_selector: str = ">Z",
         tool: Optional[ToolSpec] = None,
+        stepdown: float = 1.0,
+        finish_allowance: float = 0.0,
+        chord_error: float = 0.01,
     ) -> "Stock":
         """Cut a straight slot (obround).
 
@@ -1285,6 +1288,9 @@ class Stock:
         """
         from .operations import SlotOp
 
+        if through:
+            setup = self._setups.get(self._active_setup) if self._active_setup else None
+            depth = _profile_through_depth(self, setup.face_selector if setup else face_selector)
         op = SlotOp(
             cx=cx,
             cy=cy,
@@ -1296,6 +1302,9 @@ class Stock:
             face_selector=face_selector,
             tool=tool,
             material=self._material,
+            stepdown=stepdown,
+            finish_allowance=finish_allowance,
+            chord_error=chord_error,
         )
         op.sequence_number = self._next_op_number
         return self._apply_op(op)

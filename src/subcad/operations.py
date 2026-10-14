@@ -1641,11 +1641,7 @@ class ContourOp(MachiningOperation):
 
 @dataclass
 class SlotOp(MachiningOperation):
-    """Slot milling -- cuts an obround slot at a given position and angle.
-
-    Validates that the selected tool diameter is not larger than the slot
-    width.
-    """
+    """Obround slot replay from the selected cutter and retained passes."""
 
     cx: float = 0.0
     cy: float = 0.0
@@ -1663,9 +1659,22 @@ class SlotOp(MachiningOperation):
 
     material: str = "aluminum_6061"
 
+    stepdown: float = 1.0
+    finish_allowance: float = 0.0
+    chord_error: float = 0.01
+
     _validation_note: str = field(default="", repr=False)
 
     def __post_init__(self):
+        from .milling_replay import finite
+        for name in ("length", "width", "depth", "stepdown", "chord_error"):
+            finite(getattr(self, name), f"slot {name}", positive=True)
+        for name in ("cx", "cy", "angle", "finish_allowance"):
+            finite(getattr(self, name), f"slot {name}")
+        if self.length < self.width:
+            raise ValueError("The slot length must be at least equal to its width.")
+        if self.finish_allowance < 0:
+            raise ValueError("The slot finish allowance must be non-negative.")
         if self.tool is None:
             fallback = _pick_slot_tool(self.width)
             self.tool, self.tool_selection = _select_inventory_tool(
@@ -1696,17 +1705,43 @@ class SlotOp(MachiningOperation):
     # ------------------------------------------------------------------
 
     def apply(self, shape):
-        return slot_cut(
-            shape,
-            self.cx, self.cy,
-            self.length, self.width,
-            self.depth,
-            self.angle,
-            self.through,
-            face_selector=self.face_selector,
-        )
+        from .profile_pocket_milling import run_profile_pocket
+        if self.through:
+            from .profile_milling import _setup_plane
+            plane, _ = _setup_plane(self.face_selector)
+            self.depth = plane.toLocalCoords(shape.val()).BoundingBox().zlen
+        if self.tool.diameter > self.width:
+            raise ValueError("The selected milling cutter exceeds the slot width.")
+        profile = {"type": "slot", "length": self.length, "width": self.width,
+            "cx": self.cx, "cy": self.cy, "angle": self.angle}
+        result, self._slot_toolpath, self._material_pass_states, self._pass_reports, self._target_comparison = run_profile_pocket(
+            shape, profile, tool=self.tool, depth=self.depth, through=self.through,
+            face_selector=self.face_selector, stepdown=self.stepdown, finish_allowance=self.finish_allowance,
+            chord_error=self.chord_error, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds))
+        self._slot_toolpath.operation = "slot"
+        self._slot_toolpath.metadata.update(tool=_tool_dict(self.tool), tool_selection=_tool_selection_dict(self.tool_selection),
+            slot_length_mm=self.length, slot_width_mm=self.width, angle_deg=self.angle,
+            pass_plan={"strategy": "selected_cutter_slot", "total_passes": len(self._pass_reports),
+                "roughing_passes": sum(row["pass_role"] == "roughing" for row in self._pass_reports),
+                "finishing_passes": sum(row["pass_role"] == "finishing" for row in self._pass_reports)})
+        for state in self._material_pass_states:
+            state["label"] = f"After slot {state['pass_role']} pass {state['pass_index']}"
+        return result
 
     def to_dict(self) -> dict:
+        passes = getattr(self, "_pass_reports", [])
+        comparison = getattr(self, "_target_comparison", {})
+        reasons = ["The slot requires qualified entry, fixture, feed, spindle, and complete target verification."]
+        if not passes:
+            reasons.append("The slot has no retained selected-cutter replay. The operation does not prove a machining result.")
+        if any(row["profile_fidelity"] == "linearized_curve" for row in passes):
+            reasons.append("The slot end paths use linear segments. The requested part tolerance is not verified.")
+        if comparison.get("remaining_target_material_mm3", 0) > 1e-6:
+            reasons.append(f"After the slot passes, {comparison['remaining_target_material_mm3']:.6g} mm³ of target cavity material remains.")
+        if comparison.get("overcut_volume_mm3", 0) > 1e-6:
+            reasons.append(f"The slot replay removes {comparison['overcut_volume_mm3']:.6g} mm³ outside the requested slot. Engineering review is required.")
+        if not (self.tool.physical_assembly or {}).get("owned"):
+            reasons.append("The slot requires an owned physical cutter assembly.")
         return {
             "operation": "slot",
             "tool_type": self.tool.tool_type,
@@ -1723,9 +1758,24 @@ class SlotOp(MachiningOperation):
             if "error" not in self.feeds_speeds
             else None,
             "notes": self._validation_note,
+            "material_passes": passes,
+            "operation_target_comparison": comparison,
+            "geometry_status": "requires_review",
+            "geometry_fidelity": "linearized_profile_cutter_replay" if any(
+                row["profile_fidelity"] == "linearized_curve" for row in passes) else "exact_cutter_sweep" if passes else "unavailable",
+            "toolpath_status": "unverified" if passes else "unavailable",
+            "verification_status": "not_verified",
+            "manufacturing_ready": False,
+            "achieved_tolerance_estimate_mm": None,
+            "review_reasons": reasons,
+            "cutter_compensation": "geometry_applied" if passes else "not_verified",
         }
 
     def to_toolpath(self) -> Toolpath:
+        if hasattr(self, "_slot_toolpath"):
+            return self._slot_toolpath
+        # A planning path is available before stock exists. Only apply() can
+        # produce the retained material and its bound native cutting path.
         return _linear_slot_toolpath(
             "slot",
             self.tool,
@@ -1736,7 +1786,8 @@ class SlotOp(MachiningOperation):
             self.width,
             self.depth,
             self.angle,
-            metadata={"tool_selection": _tool_selection_dict(self.tool_selection)},
+            metadata={"tool_selection": _tool_selection_dict(self.tool_selection),
+                "material_replay": "unavailable", "verification_status": "not_verified"},
         )
 
 
