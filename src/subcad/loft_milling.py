@@ -32,6 +32,7 @@ def loft_sections(profiles):
             raise ValueError("Loft section Z positions must increase from the base to the top.")
         if high["type"] != low["type"] or high["cx"] != low["cx"] or high["cy"] != low["cy"]:
             raise ValueError("The current loft path requires concentric sections of one type. Shifted or mixed sections need another machining plan.")
+        keys = ("diameter",) if low["type"] == "circle" else ("length", "width")
         if any(high[key] > low[key] for key in keys):
             raise ValueError("The loft has an overhang. A positive Z cutter cannot reach that wall with this plan.")
     return sections
@@ -55,6 +56,19 @@ def _target(shape, sections):
     return _boolean(shape.val(), [keep], "common")
 
 
+def _circular_wall_error(radius, cutter_radius, count):
+    """Radial material between two tangent cylindrical cutting envelopes."""
+    center_radius = radius + cutter_radius
+    angle = math.pi / count
+    ratio = center_radius * math.sin(angle) / cutter_radius
+    if not math.isfinite(ratio) or ratio >= 1:
+        return math.inf
+    # Rationalization avoids cancellation when the scallop is small.
+    root = math.sqrt(1 - ratio * ratio)
+    return max(0, cutter_radius * ratio * ratio / (1 + root)
+        - 2 * center_radius * math.sin(angle / 2) ** 2)
+
+
 def _wall_paths(sections, *, tool, tolerance, safe_z, feed, rpm):
     """Compensate the flat cutter's rim along each accessible wall generator."""
     interval = min(tool.diameter / 8, tolerance / 4)
@@ -63,13 +77,21 @@ def _wall_paths(sections, *, tool, tolerance, safe_z, feed, rpm):
     for section_index, (low, high) in enumerate(reversed(list(zip(sections, sections[1:]))), 1):
         if low["type"] == "circle":
             count = max(12, math.ceil(math.pi * low["diameter"] / spacing))
+            radius = low["diameter"] / 2
+            # Part curvature increases the scallop of an external wall. A flat
+            # surface spacing rule alone can exceed the requested preview input.
+            while count <= 200 and _circular_wall_error(radius, tool.radius, count) > tolerance:
+                count += 1
             if count > 200:
                 raise ValueError("The loft wall exceeds the finishing-path limit. Divide the operation into smaller regions.")
+            error_bound = _circular_wall_error(radius, tool.radius, count)
+            actual_spacing = math.pi * low["diameter"] / count
             directions = [(math.cos(2 * math.pi * index / count), math.sin(2 * math.pi * index / count)) for index in range(count)]
             pairs = [((high["cx"] + (high["diameter"] / 2 + tool.radius) * x,
                        high["cy"] + (high["diameter"] / 2 + tool.radius) * y, high["z_mm"]),
                       (low["cx"] + (low["diameter"] / 2 + tool.radius) * x,
-                       low["cy"] + (low["diameter"] / 2 + tool.radius) * y, low["z_mm"])) for x, y in directions]
+                       low["cy"] + (low["diameter"] / 2 + tool.radius) * y, low["z_mm"]),
+                      actual_spacing, error_bound, "adjacent_circular_cutting_envelopes") for x, y in directions]
         else:
             pairs = []
             for axis, cross in (("length", "width"), ("width", "length")):
@@ -85,8 +107,11 @@ def _wall_paths(sections, *, tool, tolerance, safe_z, feed, rpm):
                             across = fraction * section[cross] / 2
                             x, y = (along, across) if axis == "length" else (across, along)
                             points.append((section["cx"] + x, section["cy"] + y, section["z_mm"]))
-                        pairs.append(tuple(points))
-        for start, end in pairs:
+                        actual_spacing = low[cross] / count
+                        ratio = actual_spacing / (2 * tool.radius)
+                        error_bound = tool.radius * ratio * ratio / (1 + math.sqrt(1 - ratio * ratio))
+                        pairs.append((*points, actual_spacing, error_bound, "parallel_planar_cutting_envelopes"))
+        for start, end, actual_spacing, error_bound, spacing_method in pairs:
             ratio = math.dist(start, end) / interval if interval > 0 else math.inf
             if not math.isfinite(ratio) or poses + math.ceil(ratio) + 2 > 10000 or len(paths) >= 200:
                 raise ValueError("The loft wall exceeds the finishing-pose limit. Divide the operation into smaller regions.")
@@ -95,7 +120,9 @@ def _wall_paths(sections, *, tool, tolerance, safe_z, feed, rpm):
                 tool_diameter_mm=tool.diameter, feed_mm_min=feed, spindle_rpm=rpm,
                 metadata={"coordinate_system":"part_mm", "tool_axis":[0,0,1], "pass_role":"finishing",
                     "path_kind":"loft_wall_generator", "wall_section_index":section_index,
-                    "independent_motion_interval_mm":interval, "generator_spacing_mm":spacing})
+                    "independent_motion_interval_mm":interval, "generator_spacing_mm":actual_spacing,
+                    "wall_spacing_error_bound_mm":error_bound, "wall_spacing_method":spacing_method,
+                    "preview_accuracy_mm":tolerance})
             path.append(ToolpathMove("rapid", (start[0], start[1], safe_z)))
             path.append(ToolpathMove("plunge", start, feed=feed, spindle_rpm=rpm))
             path.append(ToolpathMove("feed", end, feed=feed, spindle_rpm=rpm))
@@ -180,6 +207,8 @@ def run_loft_milling(shape, profiles, *, tool, tolerance_mm, stepdown, chord_err
             removed_volume_mm3=before - result.val().Volume(), move_start_index=start,
             move_end_index=len(aggregate.moves), wall_section_index=path.metadata["wall_section_index"],
             generator_spacing_mm=path.metadata["generator_spacing_mm"],
+            wall_spacing_error_bound_mm=path.metadata["wall_spacing_error_bound_mm"],
+            wall_spacing_method=path.metadata["wall_spacing_method"],
             independent_motion_interval_mm=path.metadata["independent_motion_interval_mm"])
         reports.append(check)
         states.append({"shape":result, "pass_index":number, "pass_role":"finishing",
@@ -189,6 +218,8 @@ def run_loft_milling(shape, profiles, *, tool, tolerance_mm, stepdown, chord_err
     comparison = {"method": "native_brep_ruled_loft", "overcut_volume_mm3": max(0, missing),
         "remaining_target_material_mm3": max(0, remaining), "clearing_remaining_material_mm3": max(0, clearing_remaining),
         "wall_finishing_enabled":finish_walls, "tolerance_verified": False, "manufacturing_ready": False}
+    comparison.update(preview_accuracy_mm=tolerance,
+        wall_spacing_error_bound_mm=max((path.metadata["wall_spacing_error_bound_mm"] for path in finishing_paths), default=None))
     if missing > 1e-6:
         raise ValueError("The selected loft cutter removes required material. Review the cutter compensation and path.")
     if shape.val().Volume() - result.val().Volume() <= 1e-8:

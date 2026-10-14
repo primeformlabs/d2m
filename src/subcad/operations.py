@@ -3917,6 +3917,8 @@ class LoftMillOp(PureToleranceOp):
         comparison = getattr(self, "_comparison", None)
         if comparison:
             reasons.append(f"The nominal loft comparison finds {comparison['remaining_target_material_mm3']:.3f} mm³ of remaining wall stock. This does not verify manufacturing tolerances.")
+            if comparison.get("wall_spacing_error_bound_mm") is not None:
+                reasons.append(f"The ideal wall scallop bound is approximately {comparison['wall_spacing_error_bound_mm']:.6f} mm. Manufacturing tolerances remain unverified.")
         if not (self.tool.physical_assembly or {}).get("owned"):
             reasons.append("The loft requires an owned physical cutter assembly.")
         data.update(profiles=_profile_payload(self.profiles or []), material_passes=getattr(self, "_pass_reports", []),

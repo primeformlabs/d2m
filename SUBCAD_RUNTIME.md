@@ -13,13 +13,22 @@ python -m pip wheel --no-deps . --wheel-dir dist
 Install the wheel in the CAD environment:
 
 ```text
-python -m pip install --no-deps dist/d2o_subcad-0.2.20-py3-none-any.whl
+python -m pip install --no-deps dist/d2o_subcad-0.2.21-py3-none-any.whl
 ```
 
 Use `from subcad import Stock` from an installed package.
 Source-checkout imports with `from src.subcad import Stock` remain available.
 The package requires CadQuery, NumPy, trimesh, SciPy, and rtree.
 The optional `video` dependencies support rendered video export.
+
+Version 0.2.21 includes part curvature in external circular loft wall spacing.
+The previous flat-surface spacing rule could exceed the selected preview accuracy on a small circular part.
+The new calculation checks adjacent cylindrical cutting envelopes and increases the finishing-path count where necessary.
+It retains actual spacing, its ideal radial material bound, and the selected preview accuracy.
+Planar wall paths also retain their ideal spacing bound.
+The card explains that these ideal geometry bounds do not verify manufacturing tolerances.
+An insufficient path budget produces a specific reason. It cannot increase the selected preview accuracy.
+Mixed section types retain their specific geometry reason.
 
 Version 0.2.20 uses exact native cylinder sweeps for linear flat-cutter moves with changing Z.
 The selected cutter's leading side face and leading circular cap generate the added sweep volume.
