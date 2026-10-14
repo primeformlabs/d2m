@@ -25,6 +25,7 @@ import math
 from typing import Any, Optional, Tuple
 
 from .geometry import (
+    compute_bounding_box,
     face_mill_cut,
     rectangular_pocket_cut,
     sloped_rectangular_cut,
@@ -54,6 +55,7 @@ from .tool_selection import ToolRequirement, ToolSelectionResult, ToolUnavailabl
 from .material import get_feeds_speeds
 from .toolpath import Toolpath, ToolpathMove
 from .drilling_replay import apply_drilling, drilling_record
+from .face_motion import FaceMotionFrame, rounded_contour
 from . import turning_geometry
 
 # ---------------------------------------------------------------------------
@@ -769,6 +771,7 @@ class PocketOp(MachiningOperation):
     def apply(self, shape):
         if self.tool.diameter <= 0 or self.tool.diameter > min(self.width, self.length):
             raise ValueError("The milling cutter does not fit the pocket opening.")
+        self._motion_frame = FaceMotionFrame(compute_bounding_box(shape), self.face_selector)
         result = rectangular_pocket_cut(
             shape,
             self.cx, self.cy,
@@ -817,8 +820,21 @@ class PocketOp(MachiningOperation):
     def to_toolpath(self) -> Toolpath:
         stepover = _tool_stepover(self.tool, 0.5, 0.1)
         stepdown = _tool_stepdown(self.tool, 0.5, 0.5)
-        half_w = max(self.width / 2.0 - self.tool.radius, 0.0)
-        half_l = max(self.length / 2.0 - self.tool.radius, 0.0)
+        if self.tool.diameter <= 0 or self.tool.diameter > min(self.width, self.length):
+            raise ValueError("The milling cutter does not fit the pocket opening.")
+        half_x = max(self.length / 2.0 - self.tool.radius, 0.0)
+        half_y = max(self.width / 2.0 - self.tool.radius, 0.0)
+        contour_radius = max(self.corner_radius, self.tool.radius) - self.tool.radius
+        chord_error = 0.002
+        frame = getattr(self, "_motion_frame", None)
+        depth = self.depth
+        if self.base_height is not None:
+            if frame is None:
+                raise ValueError("A pocket base height requires the incoming stock bounds.")
+            height = frame.bounds["z_max"] - frame.bounds["z_min"]
+            depth = height - self.base_height
+            if depth > self.depth + 1e-9:
+                raise ValueError("The pocket cut does not reach the access face. Its toolpath is unavailable.")
         tp = _new_toolpath(
             "finish_pocket" if self.pass_role == "finishing" else "rough_pocket",
             self.tool,
@@ -828,23 +844,26 @@ class PocketOp(MachiningOperation):
                 "length_mm": self.length,
                 "tool_selection": _tool_selection_dict(self.tool_selection),
                 "following_finish_operation": self.finish_op is not None,
+                "coordinate_system": "face_local_mm",
+                "chord_error_mm": chord_error,
             },
         )
         feed = _feed_rate(self.feeds_speeds)
         _move(tp, "rapid", self.cx, self.cy, tp.safe_z)
-        depth_levels = _depth_levels(self.depth, stepdown)
+        depth_levels = _depth_levels(depth, stepdown)
+        final_inset = min(half_x, half_y)
+        insets = [0.0]
+        while insets[-1] < final_inset - 1e-9:
+            insets.append(min(insets[-1] + stepover, final_inset))
         max_lanes = 1
         for z in depth_levels:
             _move(tp, "plunge", self.cx, self.cy, z, feed=feed)
-            inset = 0.0
             lane_count = 0
-            while inset <= min(half_w, half_l) + 1e-9:
+            for inset in insets:
                 lane_count += 1
-                x0, x1 = self.cx - half_w + inset, self.cx + half_w - inset
-                y0, y1 = self.cy - half_l + inset, self.cy + half_l - inset
-                for x, y in ((x1, y0), (x1, y1), (x0, y1), (x0, y0), (x1, y0)):
-                    _move(tp, "feed", x, y, z, feed=feed)
-                inset += stepover
+                for x, y in rounded_contour(half_x - inset, half_y - inset,
+                                            contour_radius - inset, chord_error):
+                    _move(tp, "feed", self.cx + x, self.cy + y, z, feed=feed)
             max_lanes = max(max_lanes, lane_count)
             _move(tp, "feed", self.cx, self.cy, z, feed=feed)
         _move(tp, "retract", self.cx, self.cy, tp.safe_z)
@@ -860,7 +879,8 @@ class PocketOp(MachiningOperation):
         if self.pass_role == "finishing":
             pass_plan["finishing_passes"] = pass_plan["roughing_passes"]
             pass_plan["roughing_passes"] = 0
-        return _attach_pass_plan(tp, pass_plan)
+        tp = _attach_pass_plan(tp, pass_plan)
+        return frame.bind(tp) if frame is not None else tp
 
 
 @dataclass
@@ -3436,16 +3456,36 @@ class TurningOp(PureToleranceOp):
             rpm = turning_geometry.finite(rpm, "spindle speed", positive=True)
         if metadata.get("requires_spindle_phase") and rpm is not None:
             feed = turning_geometry.finite(metadata["pitch_mm"], "thread pitch", positive=True) * rpm
+        direction = self.feeds_speeds.get("spindle_direction")
+        phase = self.feeds_speeds.get("spindle_phase_start_radians")
+        if direction is not None and (isinstance(direction, bool) or direction not in {-1, 1}):
+            raise ValueError("The spindle direction must be +1 or -1 in the spindle frame.")
+        if phase is not None:
+            phase = turning_geometry.finite(phase, "spindle phase")
+        phase_available = direction is not None and phase is not None and rpm is not None and feed is not None
         path = Toolpath(self.operation_name, tool_type=self.tool.tool_type, tool_diameter_mm=self.tool.diameter,
             feed_mm_min=feed, spindle_rpm=rpm, metadata={"process": "turn", "spindle_axis": self.axis,
                 "spindle_origin_mm": list(self.origin), "coordinate_system": "part_mm", "radius_mode": True,
                 "verification_status": "not_verified", "requires_owned_tool": self.requires_owned_tool,
                 "requires_feed_speed_release": feed is None or rpm is None,
                 "tool_compensation": "not_applied", "roughing_passes": "not_generated", **metadata})
+        bounds = self._incoming_bounds
+        path.metadata.update(stock_to_spindle_matrix=turning_geometry.stock_to_spindle_matrix(self.axis, self.origin),
+            incoming_spindle_bounds_mm={"min": [bounds.xmin, bounds.ymin, bounds.zmin],
+                "max": [bounds.xmax, bounds.ymax, bounds.zmax]},
+            spindle_phase_status="recorded" if phase_available else "unavailable",
+            spindle_direction=direction, spindle_phase_reference="positive_local_X",
+            source="cam_intent")
         for kind, radius, axial in points:
             path.append(ToolpathMove(kind, turning_geometry.spindle_point_to_world(radius, axial, self.axis, self.origin),
                 feed=feed if kind == "feed" else None, spindle_rpm=rpm,
                 metadata={"spindle_radius_mm": radius, "spindle_z_mm": axial}))
+        if phase_available:
+            for index, move in enumerate(path.moves):
+                if index:
+                    minutes = move.time_minutes_from(path.moves[index - 1], feed, path.rapid_rate_mm_min)
+                    phase += direction * rpm * math.tau * minutes
+                move.metadata["spindle_phase_radians"] = phase
         return path
 
 
@@ -3577,8 +3617,12 @@ class TurnThreadOp(TurningOp):
         depth = self.thread_depth if self.thread_depth is not None else self.pitch / 2
         radius = self.diameter / 2 if self.internal else self.diameter / 2 - depth
         clearance = max(0, radius - depth - 2) if self.internal else self._incoming_radius + 2
-        return self._path([("rapid", clearance, self._front + self.pitch), ("rapid", radius, self._front),
-            ("feed", radius, self._front - self.length), ("retract", clearance, self._front - self.length)],
+        sign = self.feeds_speeds.get("spindle_direction")
+        increasing = sign in {-1, 1} and sign * (1 if self.left_handed else -1) > 0
+        start, end = (self._front - self.length, self._front) if increasing else (self._front, self._front - self.length)
+        approach = start - self.pitch if increasing else start + self.pitch
+        return self._path([("rapid", clearance, approach), ("rapid", radius, start),
+            ("feed", radius, end), ("retract", clearance, end)],
             strategy="synchronized_threading", pitch_mm=self.pitch, left_handed=self.left_handed, requires_spindle_phase=True)
 
     def to_dict(self) -> dict:

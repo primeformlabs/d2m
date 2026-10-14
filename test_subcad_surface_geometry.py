@@ -19,6 +19,11 @@ def test_plane_removal_uses_the_absolute_stock_datum_and_retains_each_row():
     assert record["geometry_fidelity"] == "exact_cutter_sweep"
     assert record["achieved_tolerance_estimate_mm"] is None
     assert record["depth_mm"] == pytest.approx(3)
+    metadata = record["toolpath"]["metadata"]
+    assert metadata["tool_origin"] == "cutting_tip"
+    assert metadata["coordinate_system"] == "part_mm"
+    assert metadata["tool_frame"]["z_axis"] == [0, 0, 1]
+    assert metadata["incoming_bounds_mm"]["z_max"] == pytest.approx(4)
     assert len(result._state_history) == len(record["material_passes"]) + 1
     volumes = [state["shape"].val().Volume() for state in result._state_history]
     assert all(after <= before + 1e-7 for before, after in zip(volumes, volumes[1:]))

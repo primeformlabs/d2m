@@ -13,7 +13,7 @@ python -m pip wheel --no-deps . --wheel-dir dist
 Install the wheel in the CAD environment:
 
 ```text
-python -m pip install --no-deps dist/d2o_subcad-0.2.17-py3-none-any.whl
+python -m pip install --no-deps dist/d2o_subcad-0.2.17+browser.1-py3-none-any.whl
 ```
 
 Use `from subcad import Stock` from an installed package.
@@ -160,3 +160,32 @@ The recorded tool identity remains the actual selected assembly.
 Each facing pass preserves its native material state, matching tool moves, and target-region comparison.
 An explicit facing stepover cannot exceed the selected cutter's saved maximum stepover.
 Qualified fixtures, feeds, spindle speed, insert geometry, and complete part tolerances remain required.
+
+## Browser runtime reconciliation
+
+The `0.2.14+browser.1` candidate combines native replay through commit `34504a2` with the existing browser frame and Turning clock records.
+Native drilling, spot drilling, hole finishing, measured fixture reports, nominal comparison, and Laser replay keep their material implementations.
+Browser binding adds a fixed cutter frame and actual incoming bounds to retained part-coordinate paths.
+It does not change native move positions, depth references, or material states.
+Blind drilling keeps its full-diameter depth and actual point cavity.
+Spot drilling keeps its tip depth and actual removed material.
+Unapplied planning paths have no browser stock binding.
+
+The rectangular `PocketOp` frame fixes remain because the native branch did not change that legacy operation class.
+The native `ProfilePocketOp` retains its selected-cutter material passes.
+Turning retains the supplied spindle phase, signed spindle transform, and continuous program clock.
+The separate native nominal comparison remains available.
+These records do not establish manufacturing tolerance or machine release.
+
+The combined source checks pass 277 tests and 28 subtests on Python 3.11 and CadQuery 2.4.0.
+Installed runtime, contour, facing, and profile-pocket checks pass from the candidate wheel.
+The operation-video contract passes all 46 checks.
+D2O integration and browser checks remain separate requirements before changing the application runtime pin.
+
+The `0.2.17+browser.1` candidate integrates native commit `280c488`.
+It retains the browser frame and Turning clock records from `b83fe70`.
+It includes actual incoming sheet material for Bending and exact grouped Laser contour cuts.
+STL export copies the native topology before meshing to preserve retained material states.
+This integration adds no parallel native operation implementation.
+The focused source checks pass 201 tests on Python 3.11 and CadQuery 2.4.0.
+They cover browser frames, drilling, Turning phase, native Laser material, retained Bending material, and operation-video records.

@@ -43,6 +43,9 @@ for face, axis, point in [
     assert not result._shape.val().isInside(cq.Vector(*point(3, 0, 4.5)))
     path = Toolpath.from_dict(result.process_plan()["operations"][-1]["toolpath"])
     assert path.metadata["tool_axis"] == axis
+    assert path.metadata["tool_origin"] == "cutting_tip"
+    assert path.metadata["tool_frame"]["z_axis"] == axis
+    assert path.metadata["incoming_bounds_mm"]["x_min"] == -5
     model, replay = replay_milling_independently(Stock.rectangular(10, 10, 10), path, tool, resolution_mm=1)
     assert model.get_material_at(point(0, 0, 4.5))
     assert not model.get_material_at(point(3, 0, 4.5))

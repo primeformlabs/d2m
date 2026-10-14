@@ -179,6 +179,7 @@ class Toolpath:
             "tool_diameter_mm": self.tool_diameter_mm,
             "feed_mm_min": self.feed_mm_min,
             "spindle_rpm": self.spindle_rpm,
+            "rapid_rate_mm_min": self.rapid_rate_mm_min,
             "coolant": self.coolant,
             "length_mm": self.length_mm,
             "estimated_time_min": self.estimated_time_min,

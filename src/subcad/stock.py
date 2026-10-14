@@ -250,6 +250,11 @@ class Stock:
         if hasattr(op, "to_toolpath"):
             try:
                 toolpath = op.to_toolpath()
+                if (isinstance(getattr(toolpath, "metadata", None), dict)
+                        and toolpath.metadata.get("coordinate_system") == "part_mm"
+                        and toolpath.metadata.get("tool_axis") is not None):
+                    from .face_motion import FaceMotionFrame
+                    FaceMotionFrame(compute_bounding_box(self._shape), op.face_selector).bind_absolute(toolpath)
             except Exception as error:
                 toolpath = []
                 op_dict["toolpath_status"] = "unavailable"
@@ -2378,9 +2383,16 @@ class Stock:
         """Convert the current shape to a trimesh.Trimesh."""
         return to_mesh(self._shape)
 
-    def process_plan(self) -> dict:
+    def process_plan(self, *, continuous_turning_phase: bool = False) -> dict:
         """Return the accumulated process plan as a serializable dict."""
-        return self._plan.to_dict()
+        if not isinstance(continuous_turning_phase, bool):
+            raise ValueError("The continuous Turning phase option must be a boolean.")
+        plan = self._plan.to_dict()
+        if continuous_turning_phase:
+            from .turning_program import continuous_turning_plan
+
+            return continuous_turning_plan(plan)
+        return plan
 
     def save_process_plan(self, path: str) -> None:
         """Save the process plan as a JSON file."""
