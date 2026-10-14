@@ -27,8 +27,21 @@ def replay_milling_independently(incoming, path: Toolpath, tool, *, resolution_m
         from simulation.kinematics import ToolPose
     resolution = finite(resolution_mm, "independent replay resolution", positive=True)
     tolerance = finite(tolerance_mm, "target tolerance", positive=True)
-    if path.metadata.get("coordinate_system") != "part_mm" or path.metadata.get("tool_axis", [0, 0, 1]) != [0, 0, 1]:
-        raise ValueError("Independent Milling replay requires part millimetres and the positive Z cutter axis.")
+    root_half = math.sqrt(0.5)
+    orientations = {
+        (0, 0, 1): [1, 0, 0, 0], (0, 0, -1): [0, 1, 0, 0],
+        (1, 0, 0): [root_half, 0, root_half, 0], (-1, 0, 0): [root_half, 0, -root_half, 0],
+        (0, 1, 0): [root_half, -root_half, 0, 0], (0, -1, 0): [root_half, root_half, 0, 0],
+    }
+    raw_axis = path.metadata.get("tool_axis", [0, 0, 1])
+    if not isinstance(raw_axis, (list, tuple)) or len(raw_axis) != 3 or any(
+        isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in raw_axis):
+        raise ValueError("Independent Milling replay requires a cardinal cutter axis.")
+    axis = tuple(raw_axis)
+    if path.metadata.get("coordinate_system") != "part_mm" or axis not in orientations:
+        raise ValueError("Independent Milling replay requires part millimetres and a cardinal cutter axis.")
+    orientation = np.array(orientations[axis], dtype=float)
+    direction = np.array(axis, dtype=float)
     if (path.tool_type and path.tool_type != tool.tool_type) or (path.tool_diameter_mm and path.tool_diameter_mm != tool.diameter):
         raise ValueError("The selected cutter does not match the serialized Milling path.")
     shape = getattr(incoming, "_shape", incoming)
@@ -42,19 +55,19 @@ def replay_milling_independently(incoming, path: Toolpath, tool, *, resolution_m
     selected_tool = to_sim_tool(tool)
     if selected_tool is None:
         raise ValueError("The independent Milling cutter model is unavailable.")
-    cutting_positions = [move.position[2] for move in path.moves if move.move_type in {"feed", "plunge"}]
+    cutting_positions = [np.dot(move.position, direction) for move in path.moves if move.move_type in {"feed", "plunge"}]
     if len(path.moves) > 10000:
         raise ValueError("The independent replay exceeds its move limit. Divide the process into smaller paths.")
     if not cutting_positions:
         raise ValueError("The independent Milling path has no cutting moves.")
-    validate_cutter(tool, cutting_depth=max(0, mesh.bounds[1][2] - min(cutting_positions)))
+    validate_cutter(tool, cutting_depth=max(0, max(mesh.vertices @ direction) - min(cutting_positions)))
     initial_volume, previous, cutting_moves = model.volume(), None, 0
     for move in path.moves:
         if not all(math.isfinite(value) for value in move.position):
             raise ValueError("The independent Milling path contains non-finite coordinates.")
         if move.move_type == "arc":
             raise ValueError("Independent Milling replay requires linearized arc moves.")
-        pose = ToolPose(np.asarray(move.position, dtype=float), np.array([1.0, 0.0, 0.0, 0.0]))
+        pose = ToolPose(np.asarray(move.position, dtype=float), orientation)
         if move.move_type in {"feed", "plunge"}:
             if previous is None:
                 raise ValueError("The independent cutting move requires a preceding tool position.")
@@ -81,6 +94,7 @@ def replay_milling_independently(incoming, path: Toolpath, tool, *, resolution_m
             "samples": samples, "overcut_samples": overcut, "undercut_samples": undercut,
             "resolution_mm": resolution, "requested_tolerance_mm": tolerance, "tolerance_verified": False}
     return model, {"method": "independent_tri_dexel_replay", "status": "requires_review", "cutting_moves": cutting_moves,
+        "coordinate_system": "part_mm", "tool_axis": list(axis),
         "initial_volume_mm3": initial_volume, "final_volume_mm3": model.volume(),
         "removed_volume_mm3": initial_volume - model.volume(), "resolution_mm": resolution,
         "target_comparison": comparison, "manufacturing_ready": False,

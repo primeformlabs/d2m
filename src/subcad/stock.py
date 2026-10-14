@@ -1794,6 +1794,9 @@ class Stock:
 
     def profile_contour(self, profile, depth: float, *, side: str = "outside",
                         face_selector: str = ">Z",
+                        stepdown: float = 1.0,
+                        finish_allowance: float = 0.1,
+                        chord_error: float = 0.01,
                         cx: Optional[float] = None,
                         cy: Optional[float] = None,
                         tool: Optional[ToolSpec] = None) -> "Stock":
@@ -1801,7 +1804,8 @@ class Stock:
         profile = _place_profile(profile, cx, cy)
         return self._apply_op(ProfileContourOp(
             profile=profile, depth=depth, side=side, face_selector=face_selector,
-            tool=tool, material=self._material,
+            tool=tool, material=self._material, stepdown=stepdown,
+            finish_allowance=finish_allowance, chord_error=chord_error,
         ))
 
     def machine_around_profile(self, profile, height: float, *,

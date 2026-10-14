@@ -13,7 +13,7 @@ python -m pip wheel --no-deps . --wheel-dir dist
 Install the wheel in the CAD environment:
 
 ```text
-python -m pip install --no-deps dist/d2o_subcad-0.2.3-py3-none-any.whl
+python -m pip install --no-deps dist/d2o_subcad-0.2.5-py3-none-any.whl
 ```
 
 Use `from subcad import Stock` from an installed package.
@@ -100,3 +100,26 @@ Sweep, loft, hollow-bore, and wire operations currently have no native material-
 They raise specific errors. Their public API names do not prove geometry coverage.
 Mill-turn setup remains a non-cutting instruction.
 Complete Milling coverage and independent Turning replay remain open in issues #5 and #3.
+
+Version 0.2.4 corrects `profile_contour()`.
+An outside contour removes the selected cutter channel outside the profile.
+An inside contour removes the channel inside the profile and preserves cutter-limited corners.
+The operation does not pocket the interior or discard exterior waste.
+Use separate operations to remove that material.
+Each depth pass and finishing pass retains its actual material state and matching tool moves.
+The path uses cutter-radius compensation and the actual profile boundary.
+It preserves previous holes, Turning material, and translated stock coordinates.
+All six cardinal setup faces use stable part coordinates and the correct cutter axis.
+
+Circle, rectangle, rounded rectangle, slot, and explicit polygon profiles have native contour paths.
+Circular path sections use bounded linear segments and report that approximation.
+Arc-chain source profiles retain their source sampling limit.
+Invalid profiles, divided offsets, missing cutters, and insufficient cutter reach stop the operation.
+Contour entry, waste removal, fixture clearance, feeds, spindle speed, and target tolerance require verification.
+The independent tri-dexel engine now supports all six cardinal cutter axes in part coordinates.
+It retains its finite sampling limits and cannot authorize manufacturing release.
+
+Version 0.2.5 combines these contour paths with browser stock frames and the continuous Turning clock.
+It preserves supplied spindle phase across consecutive operations with the same recorded insert and spindle conditions.
+It records non-cutting transport without changing the original operation-level plan.
+Tool, setup, speed, and direction changes still need recorded transition data.
