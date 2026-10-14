@@ -39,6 +39,10 @@ def test_loft_cuts_actual_material_and_retains_compensated_roughing_and_finishin
     for state in record["material_passes"]:
         assert 0<=state["move_start_index"]<state["move_end_index"]<=len(moves)
         assert not state["manufacturing_ready"]
+        if state.get("repeated_pass_reused"):
+            previous = record["material_passes"][state["reused_from_pass_index"] - 1]
+            assert previous["pass_index"] < state["pass_index"]
+            assert moves[previous["move_start_index"]:previous["move_end_index"]] == moves[state["move_start_index"]:state["move_end_index"]]
 
 
 def test_loft_preserves_translated_incoming_holes_and_uses_owned_tool_geometry():

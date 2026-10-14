@@ -155,6 +155,7 @@ def run_loft_milling(shape, profiles, *, tool, tolerance_mm, stepdown, chord_err
         if len(states) + len(retained) > 1000:
             raise ValueError("The loft exceeds the retained pass limit. Divide the operation into smaller regions.")
         offset = len(aggregate.moves)
+        pass_offset = len(states)
         aggregate.moves.extend(path.moves)
         for state, report in zip(retained, checks):
             number = len(states) + 1
@@ -162,6 +163,8 @@ def run_loft_milling(shape, profiles, *, tool, tolerance_mm, stepdown, chord_err
             check = {**report, "pass_index": number, "pass_role": role, "depth_level_index": level_index,
                 "section_z_mm": z, "move_start_index": offset + report["move_start_index"],
                 "move_end_index": offset + report["move_end_index"], "manufacturing_ready": False}
+            if report.get("repeated_pass_reused"):
+                check["reused_from_pass_index"] = pass_offset + report["reused_from_pass_index"]
             reports.append(check)
             states.append({**state, "pass_index": number, "pass_role": role,
                 "label": f"After loft {role} pass {number}", "geometry_replay": check})
