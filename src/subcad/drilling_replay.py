@@ -12,16 +12,17 @@ from .toolpath import Toolpath, ToolpathMove
 def point_geometry(tool):
     if tool is None or tool.tool_type not in {"drill", "reamer"}:
         raise ValueError("Axial cutter replay requires a selected drill or reamer with recorded point geometry.")
-    diameter = finite(tool.diameter, "drill diameter", positive=True)
-    angle = finite(tool.tip_angle, "drill point angle", positive=True)
-    tip = finite(tool.tip_diameter, "drill tip diameter")
+    kind = "reamer lead" if tool.tool_type == "reamer" else "drill point"
+    diameter = finite(tool.diameter, f"{tool.tool_type} diameter", positive=True)
+    angle = finite(tool.tip_angle, f"{kind} angle", positive=True)
+    tip = finite(tool.tip_diameter, f"{kind} tip diameter")
     if angle > 180 or tip < 0 or tip > diameter:
-        raise ValueError("The drill point angle must not exceed 180 degrees. Its tip diameter must fit the cutter diameter.")
+        raise ValueError(f"The {kind} angle must not exceed 180 degrees. Its tip diameter must fit the cutter diameter.")
     if tool.tool_type == "reamer" and not 0 < tip < diameter:
         raise ValueError("Reaming requires a recorded lead tip diameter smaller than the finished hole and greater than zero.")
     height = 0 if angle == 180 else (diameter - tip) / (2 * math.tan(math.radians(angle / 2)))
     if finite(tool.flute_length, "drill flute length", positive=True) <= height:
-        raise ValueError("The drill flute length does not contain its recorded point geometry.")
+        raise ValueError(f"The {tool.tool_type} flute length does not contain its recorded point geometry.")
     return diameter / 2, tip / 2, height
 
 
@@ -57,7 +58,7 @@ def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z"
     if tool.tool_type != ("reamer" if ream else "drill"):
         raise ValueError("The selected axial cutter type does not match the drilling or reaming operation.")
     if not spot and abs(tool.diameter - requested) > 1e-8:
-        raise ValueError("The selected drill diameter does not match the requested hole diameter.")
+        raise ValueError(f"The selected {tool.tool_type} diameter does not match the requested hole diameter.")
     plane, mirror = _setup_plane(face_selector)
     local = cq.Workplane("XY").newObject([plane.toLocalCoords(shape.val())])
     bounds = local.val().BoundingBox()
@@ -66,7 +67,8 @@ def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z"
         raise ValueError("The drilling depth exceeds the incoming material thickness along its cutter axis.")
     travel = full_depth if spot else full_depth + point_height
     if not through and not spot and travel > bounds.zlen + 1e-8:
-        raise ValueError("The drill point passes through the incoming material. Use through drilling or change the blind depth.")
+        raise ValueError("The reamer lead passes through the incoming material. Use through reaming or change the blind depth." if ream
+            else "The drill point passes through the incoming material. Use through drilling or change the blind depth.")
     if ream:
         # The complete lead must enter an existing hole. Test the actual
         # incoming material, including preceding cuts and the blind floor.
@@ -78,7 +80,8 @@ def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z"
         finite(tool.stickout_mm, "drill projection", positive=True),
         finite(tool.reach_mm or tool.flute_length, "drill reach", positive=True))
     if travel > limit + 1e-8:
-        raise ValueError("The selected drill cannot reach the required tip depth. Include its point length in the reach check.")
+        raise ValueError("The selected reamer cannot reach the required lead depth. Include its lead length in the reach check." if ream
+            else "The selected drill cannot reach the required tip depth. Include its point length in the reach check.")
     step = travel if peck_step is None else finite(peck_step, "drill peck step", positive=True)
     count = max(1, math.ceil(travel / step))
     if count > 100:
@@ -121,7 +124,7 @@ def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z"
         states.append({"shape": shape.newObject([result.val().transformShape(plane.rG)]), "pass_index": index,
             "pass_role": report["pass_role"], "label": f"After {operation.replace('_', ' ')} pass {index}", "geometry_replay": report})
     if local.val().Volume() - result.val().Volume() <= 1e-8:
-        raise ValueError("The drill path removes no material from the incoming stock. Review the hole position and existing geometry.")
+        raise ValueError(f"The {tool.tool_type} path removes no material from the incoming stock. Review the hole position and existing geometry.")
     path.metadata.update(material_passes=reports, pass_plan={"strategy": operation, "total_passes": count})
     return states[-1]["shape"], path, states, reports
 

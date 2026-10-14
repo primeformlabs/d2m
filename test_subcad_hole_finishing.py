@@ -105,7 +105,7 @@ def test_reaming_requires_clear_pilot_for_its_complete_lead_travel(diameter, dep
 
 @pytest.mark.parametrize("tool,reason", [
     (ToolSpec("drill", 4, tip_angle=118), "cutter type"),
-    (ToolSpec("reamer", 4), "point angle"),
+    (ToolSpec("reamer", 4), "lead angle"),
     (ToolSpec("reamer", 4, tip_angle=90), "lead tip diameter"),
     (ToolSpec("reamer", 5, tip_angle=90, tip_diameter=3.6), "does not match"),
     (reamer(flute_length=2.1), "cannot reach"),
