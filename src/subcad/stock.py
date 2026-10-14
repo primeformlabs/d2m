@@ -673,6 +673,7 @@ class Stock:
         *,
         tool: Optional[ToolSpec] = None,
         stepover: Optional[float] = None,
+        face_selector: str = ">Z",
     ) -> "Stock":
         """Face mill the top surface.
 
@@ -688,6 +689,7 @@ class Stock:
             stepover=stepover,
             tool=tool,
             material=self._material,
+            face_selector=face_selector,
         )
         op.sequence_number = self._next_op_number
         return self._apply_op(op)

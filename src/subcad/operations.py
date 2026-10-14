@@ -614,7 +614,33 @@ class FaceMillOp(MachiningOperation):
     # ------------------------------------------------------------------
 
     def apply(self, shape):
-        return face_mill_cut(shape, self.depth, face_selector=self.face_selector)
+        from dataclasses import replace
+        from .profile_milling import _setup_plane
+        from .profile_pocket_milling import run_profile_pocket
+        from .milling_replay import finite
+        finite(self.depth, "facing depth", positive=True)
+        plane, mirror = _setup_plane(self.face_selector)
+        bounds = plane.toLocalCoords(shape.val()).BoundingBox()
+        profile = {"type": "rectangle", "length": bounds.xlen, "width": bounds.ylen,
+            "cx": (bounds.xmin + bounds.xmax) / 2, "cy": (bounds.ymin + bounds.ymax) / 2 * mirror}
+        if self.tool.tool_type not in {"flat_endmill", "face_mill"}:
+            raise ValueError("Native facing requires a flat end mill or a face mill cutting envelope.")
+        cutter = replace(self.tool, tool_type="flat_endmill", corner_radius=0) if self.tool.tool_type == "face_mill" else self.tool
+        if self.stepover is not None:
+            stepover = finite(self.stepover, "facing stepover", positive=True)
+            saved_maximum = (cutter.safe_limits or {}).get("max_stepover_mm")
+            if saved_maximum is not None:
+                stepover = min(stepover, finite(saved_maximum, "maximum facing stepover", positive=True))
+            cutter = replace(cutter, safe_limits={**(cutter.safe_limits or {}),
+                "max_stepover_mm": stepover})
+        result, self._face_toolpath, self._material_pass_states, self._pass_reports, self._target_comparison = run_profile_pocket(
+            shape, profile, tool=cutter, depth=self.depth, face_selector=self.face_selector,
+            stepdown=min(self.tool.diameter / 2, 2), finish_allowance=0,
+            feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds))
+        self._face_toolpath.operation = "face_mill"
+        self._face_toolpath.tool_type = self.tool.tool_type
+        self._face_toolpath.metadata.update(tool=_tool_dict(self.tool), tool_selection=_tool_selection_dict(self.tool_selection))
+        return result
 
     def to_dict(self) -> dict:
         return {
@@ -633,9 +659,19 @@ class FaceMillOp(MachiningOperation):
             "finish_pass": self.finish_pass,
             "face_selector": self.face_selector,
             "notes": "Finishing pass included" if self.finish_pass else "",
+            "material_passes": getattr(self, "_pass_reports", []),
+            "operation_target_comparison": getattr(self, "_target_comparison", {}),
+            "geometry_status": "requires_review",
+            "geometry_fidelity": "nominal_face_mill_envelope" if self.tool.tool_type == "face_mill" else "exact_cutter_sweep",
+            "achieved_tolerance_estimate_mm": None,
+            "toolpath_status": "unverified",
+            "review_reasons": ["The facing plan requires fixture, feed, spindle, and complete target verification."] +
+                (["The face mill uses its nominal cutting envelope. Insert geometry and runout require verification."] if self.tool.tool_type == "face_mill" else []),
         }
 
     def to_toolpath(self) -> Toolpath:
+        if hasattr(self, "_face_toolpath"):
+            return self._face_toolpath
         stepover = self.stepover if self.stepover is not None else _tool_stepover(self.tool, 0.7, 0.1)
         span_x = max(self.tool.diameter * 4.0, stepover * 4.0)
         span_y = max(self.tool.diameter * 2.0, stepover * 2.0)

@@ -13,7 +13,7 @@ python -m pip wheel --no-deps . --wheel-dir dist
 Install the wheel in the CAD environment:
 
 ```text
-python -m pip install --no-deps dist/d2o_subcad-0.2.5-py3-none-any.whl
+python -m pip install --no-deps dist/d2o_subcad-0.2.6-py3-none-any.whl
 ```
 
 Use `from subcad import Stock` from an installed package.
@@ -133,3 +133,12 @@ Whole-stock openings permit cutter travel across open stock edges.
 Outside profile clearing removes waste through actual cutter passes instead of intersecting the ideal target.
 Flat cutter results unify coplanar Boolean faces only when validity and volume remain unchanged.
 Qualified entry, fixtures, feeds, spindle speed, complete target comparison, and other operation families remain incomplete.
+
+Version 0.2.6 cuts facing operations through retained cutter passes on six cardinal setup faces.
+`face_mill(depth, face_selector="<Z")` supports the bottom datum without moving the profile origin after previous cuts.
+Flat end mills use their cutter geometry. Face mills use a declared nominal cutting envelope.
+Face-mill insert geometry and runout remain unverified.
+The recorded tool identity remains the actual selected assembly.
+Each facing pass preserves its native material state, matching tool moves, and target-region comparison.
+An explicit facing stepover cannot exceed the selected cutter's saved maximum stepover.
+Qualified fixtures, feeds, spindle speed, insert geometry, and complete part tolerances remain required.
