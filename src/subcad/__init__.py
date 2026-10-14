@@ -41,6 +41,7 @@ from .toolpath import Toolpath, ToolpathMove
 from .gcode_preview import gcode_preview, to_gcode_preview
 from .postprocessor import PostProcessor, Generic3AxisDebugPost, postprocess
 from .target_compare import compare_to_target
+from .nominal_compare import compare_nominal_solids, load_nominal_step, NominalComparison
 from .milling_verification import replay_milling_independently
 from .visualization import export_visualization_package
 from .operation_video import export_simulation_package
@@ -168,6 +169,7 @@ __all__ = [
     "Generic3AxisDebugPost",
     "postprocess",
     "compare_to_target",
+    "compare_nominal_solids", "load_nominal_step", "NominalComparison",
     "replay_milling_independently",
     "export_visualization_package",
     "export_simulation_package",
