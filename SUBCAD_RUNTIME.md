@@ -13,13 +13,31 @@ python -m pip wheel --no-deps . --wheel-dir dist
 Install the wheel in the CAD environment:
 
 ```text
-python -m pip install --no-deps dist/d2o_subcad-0.2.14+browser.1-py3-none-any.whl
+python -m pip install --no-deps dist/d2o_subcad-0.2.17+browser.1-py3-none-any.whl
 ```
 
 Use `from subcad import Stock` from an installed package.
 Source-checkout imports with `from src.subcad import Stock` remain available.
 The package requires CadQuery, NumPy, trimesh, SciPy, and rtree.
 The optional `video` dependencies support rendered video export.
+
+Version 0.2.16 adds `replay_bending_material()` for actual incoming sheet meshes.
+It retains each ordered bend result and preserves closed surface topology and cut holes.
+The model uses explicit bend angles, signed directions, inside radii, and support modes.
+It reports STL seam joins within 0.00002 mm and refuses open material or excess coordinate displacement.
+It rejects incomplete sequences, insufficient panel material, changed topology, and excessive volume change.
+The model remains a kinematic preview. Material behaviour, finite flange boundaries, contact, springback, and manufacturing tolerances require qualification.
+The existing split-and-rotate `press_brake_bend()` does not provide this retained radiused model.
+
+Version 0.2.17 adds exact contour-phase Laser replay through `retain_segments=False`.
+The default replay retains every segment as before.
+Contour replay retains the pierce state and the complete cut state without changing the supplied path.
+Closed convex paths use exact round outer offsets and inner line offsets.
+Other paths use the same exact segment capsules in a grouped native cut.
+Self-crossing paths cannot use the convex offset method.
+Native comparisons show no missing or extra material relative to sequential segment cuts.
+The measured 35-point contour takes 0.41 seconds, compared with 2.09 seconds before the change.
+The model still does not qualify heat, pierce quality, head clearance, or manufacturing tolerances.
 
 Pin the exact source commit in the production dependency.
 Test the installed wheel outside the source checkout before updating that pin.
@@ -163,3 +181,11 @@ The combined source checks pass 277 tests and 28 subtests on Python 3.11 and Cad
 Installed runtime, contour, facing, and profile-pocket checks pass from the candidate wheel.
 The operation-video contract passes all 46 checks.
 D2O integration and browser checks remain separate requirements before changing the application runtime pin.
+
+The `0.2.17+browser.1` candidate integrates native commit `280c488`.
+It retains the browser frame and Turning clock records from `b83fe70`.
+It includes actual incoming sheet material for Bending and exact grouped Laser contour cuts.
+STL export copies the native topology before meshing to preserve retained material states.
+This integration adds no parallel native operation implementation.
+The focused source checks pass 201 tests on Python 3.11 and CadQuery 2.4.0.
+They cover browser frames, drilling, Turning phase, native Laser material, retained Bending material, and operation-video records.
