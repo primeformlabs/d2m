@@ -48,9 +48,11 @@ def replay_milling_independently(incoming, path: Toolpath, tool, *, resolution_m
     # Spatial grid resolution must not coarsen a retained, finer tool path.
     motion_resolution = resolution / 2
     for report in path.metadata.get("material_passes") or []:
-        if isinstance(report, dict) and report.get("sample_interval_mm") is not None:
-            motion_resolution = min(motion_resolution,
-                finite(report["sample_interval_mm"], "retained motion interval", positive=True))
+        if isinstance(report, dict):
+            for key in ("sample_interval_mm", "independent_motion_interval_mm"):
+                if report.get(key) is not None:
+                    motion_resolution = min(motion_resolution,
+                        finite(report[key], "retained motion interval", positive=True))
     if motion_resolution <= 0:
         raise ValueError("The independent Milling motion interval exceeds its numerical precision limit.")
     estimated_poses, previous_position = 0, None

@@ -1,8 +1,8 @@
 """Native fixed-axis cutter removal from tool-tip moves in part millimetres.
 
 This module does not use an operation's requested final shape. It subtracts
-the selected cutter along cutting moves. Variable-height moves use bounded
-pose sampling; the report keeps that approximation explicit.
+the selected cutter along cutting moves. Flat cutters use exact linear sweeps.
+Unsupported variable-height ball-cutter sweeps use explicit bounded pose sampling.
 """
 from __future__ import annotations
 
@@ -131,6 +131,33 @@ def _ball_sweep(radius, start, end):
     return capsule.translate(first_center)
 
 
+def _linear_flat_sweep(tool, start, end):
+    """Sweep the actual cylinder's forward faces along a straight move."""
+    import cadquery as cq
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
+    from OCP.gp import gp_Vec
+
+    delta = tuple(end[axis] - start[axis] for axis in range(3))
+    horizontal = math.hypot(delta[0], delta[1])
+    cutter = _cutter(tool)
+    additions = []
+    if horizontal > 0:
+        # Only the leading half of the curved face generates added volume.
+        # Its outward normals have a positive dot product with the move.
+        half = cq.Solid.makeCylinder(tool.radius, tool.flute_length, angleDegrees=180)
+        half = half.rotate((0, 0, 0), (0, 0, 1), math.degrees(math.atan2(delta[1], delta[0])) - 90)
+        side = next(face for face in half.Faces() if face.geomType() == "CYLINDER")
+        additions.append(cq.Shape.cast(BRepPrimAPI_MakePrism(side.wrapped, gp_Vec(*delta), True, True).Shape()))
+    if delta[2] != 0:
+        caps = [face for face in cutter.Faces() if face.geomType() == "PLANE"]
+        cap = (max if delta[2] > 0 else min)(caps, key=lambda face: face.Center().z)
+        additions.append(cq.Shape.cast(BRepPrimAPI_MakePrism(cap.wrapped, gp_Vec(*delta), True, True).Shape()))
+    sweep = _boolean(cutter, additions, "fuse") if additions else cutter
+    if not sweep.isValid():
+        raise ValueError("The linear flat-cutter sweep is not a valid solid.")
+    return sweep.translate(start)
+
+
 def replay_pass(shape, path: Toolpath, tool, *, sample_interval_mm: float = 0.25,
                 previous_sweep=None, return_sweep: bool = False):
     """Return remaining material and a geometric replay report for one pass."""
@@ -172,6 +199,9 @@ def replay_pass(shape, path: Toolpath, tool, *, sample_interval_mm: float = 0.25
                 lower = min(start[2], end[2])
                 solids = [cq.Solid.makeCylinder(tool.diameter / 2,
                     tool.flute_length + abs(start[2] - end[2]), cq.Vector(start[0], start[1], lower))]
+                exact += 1
+            elif tool.tool_type == "flat_endmill":
+                solids = [_linear_flat_sweep(tool, start, end)]
                 exact += 1
             else:
                 steps = max(1, math.ceil(math.dist(start, end) / interval))

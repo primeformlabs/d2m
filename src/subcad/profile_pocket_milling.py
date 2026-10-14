@@ -291,19 +291,31 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
     aggregate.metadata["floor_allowance_mm"] = floor_allowance
     aggregate.metadata["open_stock_edges"] = open_stock_edges
     result, states, reports = local, [], []
+    completed_paths = {}
+    current_volume = local.val().Volume()
     for index, path in enumerate(paths, 1):
-        before = result.val().Volume()
+        before = current_volume
         cutting = [move for move in path.moves if move.move_type in {"plunge", "feed"}]
-        if path.metadata["path_kind"] == "raster":
+        geometry_key = tuple((move.move_type, tuple(move.position)) for move in path.moves)
+        if geometry_key in completed_paths:
+            # Only material subtraction occurs in this loop. A repeated cutter path
+            # cannot remove material after its exact sweep was already subtracted.
+            preceding_index, preceding_report = completed_paths[geometry_key]
+            report = {**preceding_report, "repeated_pass_reused": True,
+                "reused_from_pass_index": preceding_index, "reuse_proof": "set_difference_idempotence"}
+        elif path.metadata["path_kind"] == "raster":
             result, report = _replay_raster(result, path, tool)
         elif math.dist(cutting[0].position, cutting[-1].position) < 1e-8:
             result, report = _replay_closed_contour(result, path, tool)
         else:
             result, report = _replay_open_boundary(result, path, tool)
+        if geometry_key not in completed_paths:
+            current_volume = result.val().Volume()
+            completed_paths[geometry_key] = (index, dict(report))
         start = len(aggregate.moves)
         aggregate.moves.extend(replace(move, position=plane.toWorldCoords(move.position).toTuple()) for move in path.moves)
         report.update(pass_index=index, pass_role=path.metadata["pass_role"], path_kind=path.metadata["path_kind"],
-            move_start_index=start, move_end_index=len(aggregate.moves), removed_volume_mm3=before - result.val().Volume(),
+            move_start_index=start, move_end_index=len(aggregate.moves), removed_volume_mm3=before - current_volume,
             tool_axis=normal, profile_fidelity=path.metadata.get("profile_fidelity", "linear_profile"), source_profile_sampled=sampled)
         reports.append(report)
         world = shape.newObject([result.val().transformShape(plane.rG)])

@@ -13,13 +13,27 @@ python -m pip wheel --no-deps . --wheel-dir dist
 Install the wheel in the CAD environment:
 
 ```text
-python -m pip install --no-deps dist/d2o_subcad-0.2.19-py3-none-any.whl
+python -m pip install --no-deps dist/d2o_subcad-0.2.20-py3-none-any.whl
 ```
 
 Use `from subcad import Stock` from an installed package.
 Source-checkout imports with `from src.subcad import Stock` remain available.
 The package requires CadQuery, NumPy, trimesh, SciPy, and rtree.
 The optional `video` dependencies support rendered video export.
+
+Version 0.2.20 uses exact native cylinder sweeps for linear flat-cutter moves with changing Z.
+The selected cutter's leading side face and leading circular cap generate the added sweep volume.
+The engine joins these swept faces with the initial cutter. It does not use the target as a cutting solid.
+The sweep supports ascending and descending travel, arbitrary horizontal direction, and translated coordinates.
+Continuous cylinder membership and native volume checks verify the sweep.
+Ball-cutter moves keep their existing geometry and explicit sampling limits.
+
+Profile clearing retains repeated cutter paths and their material states.
+An exactly repeated path reuses the material difference from its earlier occurrence.
+Only material subtraction occurs between these passes. The earlier cutter sweep cannot remove more material on repetition.
+Each report identifies the earlier pass. The complete physical motion remains in the timeline.
+The independent replay keeps the retained verification interval for exact loft wall sweeps.
+Generator spacing, wall scallops, fixtures, and manufacturing tolerances remain unverified.
 
 Version 0.2.19 adds loft wall-finishing paths through the selected flat cutter.
 `finish_walls=True` is the default. `finish_walls=False` retains the explicit clearing mode.
@@ -40,7 +54,7 @@ The reference loft supplies the comparison target. It does not replace the mater
 The native comparison reports overcut and remaining terraced wall material.
 Shifted sections, mixed section types, overhangs, missing dimensions, unsupported geometry fields, and unreachable cutters produce specific reasons.
 Version 0.2.19 adds wall finishing to this clearing model.
-Other cutter axes, arbitrary loft sections, exact continuous cutter-sweep geometry, and complete tolerance qualification remain incomplete.
+Other cutter axes, arbitrary loft sections, non-linear continuous cutter sweeps, and complete tolerance qualification remain incomplete.
 The operation remains a preview and cannot authorize manufacturing release.
 
 Version 0.2.16 adds `replay_bending_material()` for actual incoming sheet meshes.

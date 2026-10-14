@@ -3911,7 +3911,7 @@ class LoftMillOp(PureToleranceOp):
 
     def to_dict(self) -> dict:
         data = super().to_dict()
-        reasons = ["Loft wall finishing uses selected cutter poses. Finite pose spacing can leave wall scallops and unverified surface material."
+        reasons = ["Loft wall finishing uses native linear cutter sweeps. Generator spacing can leave wall scallops and unverified surface material."
             if self.finish_walls else "The loft uses layered cutter clearing around concentric ruled sections. Terraced wall material remains between levels.",
             "The loft requires independent path, fixture, feed, spindle, and manufacturing tolerance verification."]
         comparison = getattr(self, "_comparison", None)
@@ -3921,10 +3921,10 @@ class LoftMillOp(PureToleranceOp):
             reasons.append("The loft requires an owned physical cutter assembly.")
         data.update(profiles=_profile_payload(self.profiles or []), material_passes=getattr(self, "_pass_reports", []),
             operation_target_comparison=comparison, geometry_status="requires_review",
-            geometry_fidelity="sampled_cutter" if self.finish_walls else "layered_selected_cutter_replay", manufacturing_completeness="requires_validation",
+            geometry_fidelity="layered_selected_cutter_replay", manufacturing_completeness="requires_validation",
             verification_status="not_verified", toolpath_status="unverified", cutter_compensation="geometry_applied",
             face_selector=self.face_selector, stepdown_mm=self.stepdown, chord_error_mm=self.chord_error, wall_finishing_enabled=self.finish_walls,
-            wall_sample_interval_mm=min(self.tool.diameter / 8, self.tolerance_mm / 4) if self.finish_walls else None,
+            independent_wall_sample_interval_mm=min(self.tool.diameter / 8, self.tolerance_mm / 4) if self.finish_walls else None,
             review_reasons=reasons)
         data["tool_selection"] = _tool_selection_dict(getattr(self, "tool_selection", None))
         return data

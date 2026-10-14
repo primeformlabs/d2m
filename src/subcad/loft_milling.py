@@ -95,7 +95,7 @@ def _wall_paths(sections, *, tool, tolerance, safe_z, feed, rpm):
                 tool_diameter_mm=tool.diameter, feed_mm_min=feed, spindle_rpm=rpm,
                 metadata={"coordinate_system":"part_mm", "tool_axis":[0,0,1], "pass_role":"finishing",
                     "path_kind":"loft_wall_generator", "wall_section_index":section_index,
-                    "sample_interval_mm":interval, "generator_spacing_mm":spacing})
+                    "independent_motion_interval_mm":interval, "generator_spacing_mm":spacing})
             path.append(ToolpathMove("rapid", (start[0], start[1], safe_z)))
             path.append(ToolpathMove("plunge", start, feed=feed, spindle_rpm=rpm))
             path.append(ToolpathMove("feed", end, feed=feed, spindle_rpm=rpm))
@@ -170,13 +170,14 @@ def run_loft_milling(shape, profiles, *, tool, tolerance_mm, stepdown, chord_err
         if len(states) >= 1000:
             raise ValueError("The loft exceeds the retained pass limit. Divide the operation into smaller regions.")
         before = result.val().Volume()
-        result, check = replay_pass(result, path, tool, sample_interval_mm=path.metadata["sample_interval_mm"])
+        result, check = replay_pass(result, path, tool, sample_interval_mm=path.metadata["independent_motion_interval_mm"])
         number, start = len(states) + 1, len(aggregate.moves)
         aggregate.moves.extend(path.moves)
         check.update(pass_index=number, pass_role="finishing", machining_phase="wall_finishing",
             removed_volume_mm3=before - result.val().Volume(), move_start_index=start,
             move_end_index=len(aggregate.moves), wall_section_index=path.metadata["wall_section_index"],
-            generator_spacing_mm=path.metadata["generator_spacing_mm"])
+            generator_spacing_mm=path.metadata["generator_spacing_mm"],
+            independent_motion_interval_mm=path.metadata["independent_motion_interval_mm"])
         reports.append(check)
         states.append({"shape":result, "pass_index":number, "pass_role":"finishing",
             "label":f"After loft wall-finishing pass {number}", "geometry_replay":check})

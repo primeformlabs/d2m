@@ -3,15 +3,16 @@ from src.subcad import Stock, ToolSpec, replay_milling_independently
 from src.subcad.toolpath import Toolpath, ToolpathMove
 
 
-def path(interval):
+def path(interval, key="sample_interval_mm"):
     return Toolpath("loft_mill",tool_type="flat_endmill",tool_diameter_mm=2,
         metadata={"coordinate_system":"part_mm","tool_axis":[0,0,1],
-            "material_passes":[{"sample_interval_mm":interval}]},
+            "material_passes":[{key:interval}]},
         moves=[ToolpathMove("rapid",(-1,0,4)),ToolpathMove("plunge",(-1,0,1)),ToolpathMove("feed",(1,0,0))])
 
 
-def test_independent_motion_keeps_the_retained_resolution_with_a_coarser_spatial_grid():
-    _,report=replay_milling_independently(Stock.rectangular(4,4,4),path(0.05),ToolSpec("flat_endmill",2),resolution_mm=0.5)
+@pytest.mark.parametrize("key", ["sample_interval_mm", "independent_motion_interval_mm"])
+def test_independent_motion_keeps_the_retained_resolution_with_a_coarser_spatial_grid(key):
+    _,report=replay_milling_independently(Stock.rectangular(4,4,4),path(0.05,key),ToolSpec("flat_endmill",2),resolution_mm=0.5)
     assert report["motion_resolution_mm"]==0.05
     assert report["resolution_mm"]==0.5
     assert report["removed_volume_mm3"]>0
