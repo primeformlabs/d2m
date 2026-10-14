@@ -13,7 +13,7 @@ python -m pip wheel --no-deps . --wheel-dir dist
 Install the wheel in the CAD environment:
 
 ```text
-python -m pip install --no-deps dist/d2o_subcad-0.2.4-py3-none-any.whl
+python -m pip install --no-deps dist/d2o_subcad-0.2.5-py3-none-any.whl
 ```
 
 Use `from subcad import Stock` from an installed package.
@@ -118,3 +118,18 @@ Invalid profiles, divided offsets, missing cutters, and insufficient cutter reac
 Contour entry, waste removal, fixture clearance, feeds, spindle speed, and target tolerance require verification.
 The independent tri-dexel engine now supports all six cardinal cutter axes in part coordinates.
 It retains its finite sampling limits and cannot authorize manufacturing release.
+
+Version 0.2.5 replaces ideal profile-pocket cuts with selected-cutter replay.
+Rasters and boundary passes respect the actual profile and retained islands.
+Each roughing and finishing pass retains its actual material and matching cutter moves.
+The selected cutter leaves the inside corner material that it cannot reach.
+A native operation-region comparison reports remaining target material and overcut volume.
+That comparison does not verify the complete part tolerance or manufacturing release.
+
+Tool selection checks the accessible cutter-center region, including triangular openings and island gaps.
+Matching circular cutters can use a point or line center path for circles and slots.
+Through depth uses the actual selected stock axis.
+Whole-stock openings permit cutter travel across open stock edges.
+Outside profile clearing removes waste through actual cutter passes instead of intersecting the ideal target.
+Flat cutter results unify coplanar Boolean faces only when validity and volume remain unchanged.
+Qualified entry, fixtures, feeds, spindle speed, complete target comparison, and other operation families remain incomplete.

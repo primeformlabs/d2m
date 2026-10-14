@@ -42,6 +42,14 @@ def _profile_bounds_for_stock(profile) -> tuple[float, float]:
     return profile_span_yx(profile)
 
 
+def _profile_through_depth(stock, face_selector: str) -> float:
+    if face_selector not in {">X", "<X", ">Y", "<Y", ">Z", "<Z"}:
+        raise ValueError("The profile requires one of the six cardinal setup faces.")
+    axis = face_selector[-1].lower()
+    bounds = stock.bounding_box
+    return bounds[f"{axis}_max"] - bounds[f"{axis}_min"]
+
+
 def _profiles_bounds_for_stock(profiles) -> tuple[float, float]:
     """Return (width_y, length_x) spanning multiple lightweight profiles."""
     bounds = []
@@ -77,6 +85,13 @@ def _place_profile(profile, cx: Optional[float] = None, cy: Optional[float] = No
             placed["cx"] = dx
         if cy is not None:
             placed["cy"] = dy
+        if placed.get("center") is not None:
+            center = list(placed["center"])
+            if cx is not None:
+                center[0] = dx
+            if cy is not None:
+                center[1] = dy
+            placed["center"] = center
         return placed
     if isinstance(profile, (list, tuple)):
         return [(float(point[0]) + dx, float(point[1]) + dy) for point in profile]
@@ -1676,20 +1691,24 @@ class Stock:
 
     def profile_pocket(self, profile, depth: float, *, face_selector: str = ">Z",
                        through: bool = False, islands=None,
+                       stepdown: float = 1.0, finish_allowance: float = 0.1, chord_error: float = 0.01,
                        cx: Optional[float] = None,
                        cy: Optional[float] = None,
                        tool: Optional[ToolSpec] = None) -> "Stock":
         from .operations import ProfilePocketOp
         profile = _place_profile(profile, cx, cy)
         width, length = _profile_bounds_for_stock(profile)
+        if through:
+            depth = _profile_through_depth(self, face_selector)
         return self._apply_op(ProfilePocketOp(
             profile=profile, islands=islands, width=width, length=length,
             depth=depth, through=through, face_selector=face_selector,
-            tool=tool, material=self._material,
+            tool=tool, material=self._material, stepdown=stepdown, finish_allowance=finish_allowance, chord_error=chord_error,
         ))
 
     def profile_cutout(self, profile, *, depth: Optional[float] = None,
                        through: bool = False, face_selector: str = ">Z",
+                       stepdown: float = 1.0, finish_allowance: float = 0.1, chord_error: float = 0.01,
                        cx: Optional[float] = None,
                        cy: Optional[float] = None,
                        tool: Optional[ToolSpec] = None) -> "Stock":
@@ -1697,10 +1716,12 @@ class Stock:
         profile = _place_profile(profile, cx, cy)
         width, length = _profile_bounds_for_stock(profile)
         cut_depth = depth if depth is not None else self._stock_dims.get("height", 1.0)
+        if through:
+            cut_depth = _profile_through_depth(self, face_selector)
         return self._apply_op(ProfileCutoutOp(
             profile=profile, width=width, length=length, depth=cut_depth,
             through=through, face_selector=face_selector,
-            tool=tool, material=self._material,
+            tool=tool, material=self._material, stepdown=stepdown, finish_allowance=finish_allowance, chord_error=chord_error,
         ))
 
     def laser_cut_profile(self, profile, *, kerf_width: float = 0.15,

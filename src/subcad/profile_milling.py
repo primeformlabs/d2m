@@ -9,7 +9,7 @@ import math
 from dataclasses import replace
 from typing import Any
 
-from .milling_replay import finite, _boolean, validate_cutter
+from .milling_replay import finite, _boolean, validate_cutter, clean_flat_result
 from .pocket_geometry import rounded_rectangle
 from .profiles import normalize_profile_points
 from .toolpath import Toolpath, ToolpathMove
@@ -43,13 +43,13 @@ def _profile_wire(profile: Any):
     if len(points) < 3 or (not is_slot_circle and any(math.dist(a, b) < 1e-8 for a, b in zip(points, points[1:] + points[:1]))):
         raise ValueError("The contour profile contains repeated or missing vertices.")
     plane = cq.Workplane("XY")
-    sampled = isinstance(profile, dict) and any(str(segment.get("type", "")).lower() == "arc" for segment in profile.get("segments", []))
+    sampled = isinstance(profile, dict) and any(str(segment.get("type", "")).lower() in {"arc", "curve_tessellated"} for segment in profile.get("segments", []))
     if isinstance(profile, dict) and not explicit_points and not profile.get("segments"):
         center = profile.get("center", (profile.get("cx", profile.get("x", 0)), profile.get("cy", profile.get("y", 0))))
         cx, cy = finite(center[0], "profile X coordinate"), finite(center[1], "profile Y coordinate")
         angle = finite(profile.get("rotation_deg", profile.get("angle", 0)), "profile rotation")
         if kind in {"circle", "circular"} or (not kind and ("radius" in profile or "diameter" in profile)):
-            radius = finite(profile.get("radius", float(profile.get("diameter", 0)) / 2), "profile radius", positive=True)
+            radius = finite(profile["radius"], "profile radius", positive=True) if "radius" in profile else finite(profile.get("diameter", 0), "profile diameter", positive=True) / 2
             wire = plane.circle(radius).val().translate((cx, cy, 0))
         elif kind in {"rect", "rectangle", "rib", "pad", "slot", "obround", "obround_slot", "slot2d"} or (not kind and "width" in profile):
             width = finite(profile.get("width"), "profile width", positive=True)
@@ -73,7 +73,7 @@ def _profile_wire(profile: Any):
     return wire, sampled
 
 
-def _linearized_wire(wire, chord_error: float):
+def _linearized_wire(wire, chord_error: float, *, tangent_curves: bool = False):
     """Traverse ordered edges. Keep line edges exact and bound circular chords."""
     import cadquery as cq
     from OCP.BRepTools import BRepTools_WireExplorer
@@ -99,6 +99,17 @@ def _linearized_wire(wire, chord_error: float):
         if native.Orientation() == TopAbs_REVERSED:
             positions.reverse()
         values = [(point.x, point.y) for point in positions]
+        if kind == "CIRCLE" and tangent_curves:
+            center = edge.arcCenter()
+            vertices = []
+            for first, second in zip(positions, positions[1:]):
+                a, b = first - center, second - center
+                denominator = radius * radius + a.dot(b)
+                if denominator <= 1e-12:
+                    raise ValueError("The contour arc requires smaller linear segments for cutter compensation.")
+                point = center + (a + b) * (radius * radius / denominator)
+                vertices.append((point.x, point.y))
+            values = [values[0], *vertices, values[-1]]
         if points and math.dist(points[-1], values[0]) > 1e-6:
             raise ValueError("The compensated contour path is not continuous.")
         points.extend(values if not points else values[1:])
@@ -140,7 +151,22 @@ def _replay_closed_contour(shape, path, tool):
     points = [entry.position] + [move.position for move in feed_moves]
     if not feed_moves or math.dist(points[0], points[-1]) > 1e-8 or any(abs(point[2] - entry.position[2]) > 1e-8 for point in points):
         raise ValueError("Native contour replay requires a closed horizontal cutter path.")
-    center = cq.Workplane("XY").polyline([(point[0], point[1]) for point in points[:-1]]).close().val()
+    outline = [(point[0], point[1]) for point in points[:-1]]
+    # Clipped paths can split an unchanged straight segment into short edges.
+    # Remove those collinear vertices before the two-dimensional offset.
+    changed = True
+    while changed and len(outline) > 3:
+        changed = False
+        for index, middle in enumerate(outline):
+            before, after = outline[index - 1], outline[(index + 1) % len(outline)]
+            first = (middle[0] - before[0], middle[1] - before[1])
+            second = (after[0] - middle[0], after[1] - middle[1])
+            cross = first[0] * second[1] - first[1] * second[0]
+            if abs(cross) <= 1e-9 * max(1, math.hypot(*first) * math.hypot(*second)) and first[0] * second[0] + first[1] * second[1] >= 0:
+                outline.pop(index)
+                changed = True
+                break
+    center = cq.Workplane("XY").polyline(outline).close().val()
     try:
         outer = center.offset2D(tool.radius, kind="arc")
         inner = center.offset2D(-tool.radius, kind="arc")
@@ -155,9 +181,10 @@ def _replay_closed_contour(shape, path, tool):
     result = shape.newObject([_boolean(shape.val(), [cutter], "cut")])
     if not result.solids().vals() or not result.val().isValid():
         raise ValueError("The contour cutter path did not produce valid remaining material.")
+    result, cleaned = clean_flat_result(result)
     return result, {"method": "selected_cutter_closed_path_sweep", "coordinate_system": "part_mm",
         "geometry_fidelity": "exact_cutter_sweep", "exact_segments": len(points),
-        "sample_interval_mm": None, "sampled_poses": 0, "topology_repaired": False,
+        "sample_interval_mm": None, "sampled_poses": 0, "topology_repaired": False, "topology_cleaned": cleaned,
         "manufacturing_ready": False, "verification_status": "not_verified"}
 
 
@@ -212,7 +239,7 @@ def run_profile_contour(shape, profile, *, tool, depth: float, side: str = "outs
             raise ValueError("The selected cutter cannot produce a continuous compensated contour for this profile.") from error
         if len(offsets) != 1 or not offsets[0].isValid():
             raise ValueError("The selected cutter does not fit the profile. Its compensated contour is empty or divided.")
-        points, has_curve = _linearized_wire(offsets[0], min(chord, tool.radius / 4))
+        points, has_curve = _linearized_wire(offsets[0], min(chord, tool.radius / 4), tangent_curves=side == "outside")
         curved |= has_curve
         path = Toolpath("profile_contour", safe_z=safe, tool_type=tool.tool_type,
             tool_diameter_mm=tool.diameter, feed_mm_min=feed, spindle_rpm=rpm,

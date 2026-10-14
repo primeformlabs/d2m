@@ -2807,31 +2807,69 @@ class EdgeFilletOp(MachiningOperation):
 
 @dataclass
 class ProfilePocketOp(PocketOp):
-    """Arbitrary profile pocket using profile bounds for current B-Rep cut."""
+    """Profile cavity replay from the selected cutter and clipped tool paths."""
 
     profile: Any = field(default_factory=dict)
     islands: Optional[list[Any]] = None
     through: bool = False
+    stepdown: float = 1.0
+    finish_allowance: float = 0.1
+    chord_error: float = 0.01
 
     def __post_init__(self):
-        if self.profile:
-            width, length = _profile_bounds(self.profile)
-            self.width = self.width or width
-            self.length = self.length or length
-        super().__post_init__()
+        from .milling_replay import finite
+        from .profile_pocket_milling import pocket_tool_limit
+        finite(self.depth, "profile pocket depth", positive=True)
+        self.width, self.length = _profile_bounds(self.profile)
+        if self.tool is None:
+            maximum = pocket_tool_limit(self.profile, self.islands, finish_allowance=self.finish_allowance)
+            self.tool, self.tool_selection = _select_inventory_tool(
+                ToolRequirement("flat_endmill", max_diameter_mm=maximum, min_flute_length_mm=self.depth,
+                    feature="profile_pocket", reason="selected cutter for the profile opening and island clearances", prefer_largest=True),
+                ToolSpec("flat_endmill", maximum))
+        self.feeds_speeds = get_feeds_speeds(_resolve_fs_tool_type(self.tool.tool_type), self.tool.diameter, self.material)
+        self.position = None
+        self.finish_op = None
 
     def apply(self, shape):
-        return profile_pocket_cut(
-            shape,
-            self.profile or {"width": self.width, "length": self.length},
-            self.depth,
-            face_selector=self.face_selector,
-            through=self.through,
-            islands=self.islands,
-        )
+        return self._apply_native_profile(shape)
+
+    def _apply_native_profile(self, shape, *, outside=False):
+        from .profile_pocket_milling import run_profile_pocket
+        result, self._pocket_toolpath, self._material_pass_states, self._pass_reports, self._target_comparison = run_profile_pocket(
+            shape, self.profile, tool=self.tool, depth=self.depth, islands=self.islands, through=self.through,
+            face_selector=self.face_selector, stepdown=self.stepdown, finish_allowance=self.finish_allowance,
+            chord_error=self.chord_error, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds), outside=outside)
+        self._pocket_toolpath.metadata.update(tool=_tool_dict(self.tool), tool_selection=_tool_selection_dict(self.tool_selection),
+            width_mm=self.width, length_mm=self.length)
+        return result
+
+    def to_toolpath(self):
+        if not hasattr(self, "_pocket_toolpath"):
+            raise ValueError("The profile operation has no retained selected-cutter path. Its material-removal simulation needs verification.")
+        return self._pocket_toolpath
 
     def to_dict(self) -> dict:
         data = super().to_dict()
+        for key in ("geometry_review_reasons", "corner_radius_mm", "modeled_corner_radius_mm", "has_finish_pass", "notes"):
+            data.pop(key, None)
+        passes = getattr(self, "_pass_reports", [])
+        comparison = getattr(self, "_target_comparison", {})
+        reasons = ["The profile operation requires qualified entry, fixture, feed, spindle, and complete target verification."]
+        if not passes:
+            reasons.append("This profile operation has no retained selected-cutter replay. The displayed geometry is not machining proof.")
+        elif not isinstance(self, ProfileCutoutOp):
+            kind = str(self.profile.get("type", self.profile.get("shape", ""))).lower() if isinstance(self.profile, dict) else "polygon"
+            if kind in {"rect", "rectangle", "rib", "pad", "polygon"} and not (self.profile.get("corner_radius") if isinstance(self.profile, dict) else None):
+                reasons.append("The requested sharp inside corners require another process or a design change.")
+        if any(row["profile_fidelity"] == "linearized_curve" or row["source_profile_sampled"] for row in passes):
+            reasons.append("Curved profile paths use linear segments. The requested part tolerance is not verified.")
+        if comparison.get("remaining_target_material_mm3", 0) > 1e-6:
+            reasons.append(f"After all planned passes, {comparison['remaining_target_material_mm3']:.6g} mm³ of target cavity material remains. Review the cutter size and remaining features.")
+        if comparison.get("overcut_volume_mm3", 0) > 1e-6:
+            reasons.append(f"The native profile replay removes {comparison['overcut_volume_mm3']:.6g} mm³ outside the requested operation region. Engineering review is required.")
+        if not (self.tool.physical_assembly or {}).get("owned"):
+            reasons.append("The profile operation requires an owned physical cutter assembly.")
         data.update({
             "operation": "profile_pocket",
             "profile": _profile_payload(self.profile),
@@ -2839,7 +2877,16 @@ class ProfilePocketOp(PocketOp):
             "through": self.through,
             "process": "mill",
             "coverage_family": "arbitrary_profile_2_5d",
-            "manufacturing_completeness": "pure_operation",
+            "manufacturing_completeness": "requires_validation",
+            "geometry_status": "requires_review",
+            "geometry_fidelity": "linearized_profile_cutter_replay" if any(
+                row["profile_fidelity"] == "linearized_curve" or row["source_profile_sampled"] for row in passes) else "exact_cutter_sweep" if passes else "ideal_profile_cut",
+            "achieved_tolerance_estimate_mm": None,
+            "toolpath_status": "unverified" if passes else "unavailable",
+            "material_passes": passes,
+            "operation_target_comparison": comparison,
+            "review_reasons": reasons,
+            "cutter_compensation": "geometry_applied" if passes else "not_verified",
         })
         return data
 
@@ -2851,13 +2898,7 @@ class ProfileCutoutOp(ProfilePocketOp):
     through: bool = False
 
     def apply(self, shape):
-        return profile_cutout_cut(
-            shape,
-            self.profile or {"width": self.width, "length": self.length},
-            self.depth,
-            face_selector=self.face_selector,
-            through=self.through,
-        )
+        return self._apply_native_profile(shape, outside=True)
 
     def to_dict(self) -> dict:
         data = super().to_dict()

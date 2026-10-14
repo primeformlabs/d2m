@@ -34,6 +34,15 @@ def _boolean(first, others, operation: str, *, tolerance: float | None = None):
     return cq.Shape.cast(job.Shape())
 
 
+def clean_flat_result(result):
+    """Unify coplanar Boolean faces only when valid geometry and volume remain."""
+    previous = result.val()
+    cleaned = previous.clean()
+    if cleaned.isValid() and abs(cleaned.Volume() - previous.Volume()) <= max(1e-6, abs(previous.Volume()) * 1e-9):
+        return result.newObject([cleaned]), True
+    return result, False
+
+
 def finite(value: Any, name: str, *, positive: bool = False) -> float:
     if isinstance(value, bool):
         raise ValueError(f"The {name} must be finite.")
@@ -188,6 +197,9 @@ def replay_pass(shape, path: Toolpath, tool, *, sample_interval_mm: float = 0.25
         if not united.isValid():
             raise ValueError("The surface cutter sweep is not a valid solid.")
         result = shape.newObject([_boolean(shape.val(), [united], "cut")])
+    topology_cleaned = False
+    if tool.tool_type == "flat_endmill" and result.solids().vals() and result.val().isValid():
+        result, topology_cleaned = clean_flat_result(result)
     topology_repaired = False
     if result.solids().vals() and not result.val().isValid():
         volume_before = result.val().Volume()
@@ -200,7 +212,7 @@ def replay_pass(shape, path: Toolpath, tool, *, sample_interval_mm: float = 0.25
     report = {"method": "selected_cutter_brep_replay", "coordinate_system": "part_mm",
         "tool_axis": [0, 0, 1], "geometry_fidelity": "sampled_cutter" if sampled else "exact_cutter_sweep",
         "sample_interval_mm": interval if sampled else None, "sampled_poses": count,
-        "exact_segments": exact, "topology_repaired": topology_repaired,
+        "exact_segments": exact, "topology_repaired": topology_repaired, "topology_cleaned": topology_cleaned,
         "manufacturing_ready": False, "verification_status": "not_verified"}
     return (result, report, united) if return_sweep else (result, report)
 
