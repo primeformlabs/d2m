@@ -19,6 +19,7 @@ def test_ream_hole_selects_actual_pilot_and_retains_each_tool_and_material(face,
     records = result.process_plan()["operations"]
     assert [op["operation"] for op in records] == ["drill", "ream"]
     assert [op["tool"]["catalog_id"] for op in records] == ["OWNED-PILOT-3_8", "OWNED-REAMER-4"]
+    assert all(op["tool_selection"]["ok"] and op["tool_selection"]["inventory_revision"] == "r1" for op in records)
     assert all(op["toolpath"]["metadata"]["tool_axis"] == axis for op in records)
     assert len(result._state_history) == 3
     assert initial.volume - result.volume == pytest.approx(math.pi * 4 * 10, abs=1e-6)

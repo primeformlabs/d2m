@@ -7,7 +7,7 @@ def prepare_reaming(stock, diameter, depth, *, cx, cy, through, face_selector, e
     import cadquery as cq
     from .drilling_replay import point_geometry
     from .milling_replay import _boolean
-    from .operations import ReamOp
+    from .operations import DrillOp, ReamOp
     from .profile_milling import _setup_plane
     from .tool_selection import ToolRequirement, ToolUnavailableError, select_tool
     if not isinstance(through, bool):
@@ -46,8 +46,9 @@ def prepare_reaming(stock, diameter, depth, *, cx, cy, through, face_selector, e
             selection.errors.append("Reaming requires an available pilot drill larger than the lead tip and smaller than the finished hole.")
             raise ToolUnavailableError(selection)
         drill = selection.selected_tool
-        prepared = stock.drill(drill.diameter, pilot_depth, cx=cx, cy=cy, through=through,
-            face_selector=face, spot_drill=False, tool=drill)
+        prepared = stock._apply_op(DrillOp(diameter=drill.diameter, depth=pilot_depth, cx=cx, cy=cy,
+            through=through, face_selector=face, spot_drill=False, tool=drill,
+            tool_selection=selection, material=stock._material))
         operation._pilot_preparation = {"method": "selected_pilot_drill", "diameter_mm": drill.diameter,
             "tool_id": drill.catalog_id, "tool_selection": selection.to_dict(), "allowance_qualified": False,
             "point_extension_mm": point_geometry(drill)[2]}
