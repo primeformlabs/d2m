@@ -3405,6 +3405,8 @@ class TurningOp(PureToleranceOp):
 
     def __post_init__(self):
         self.axis, self.origin = turning_geometry.frame(self.axis, self.origin)
+        from .turning_tooling import select_turning_tool
+        self.tool, self.tool_selection = select_turning_tool(self, self.tool)
         self.requires_owned_tool = self.tool is None or not self.tool.catalog_id or self.tool.inventory_count <= 0
         if self.tool is None:
             self.tool = ToolSpec("turning_insert", 0.0, inventory_count=0)
@@ -3426,6 +3428,10 @@ class TurningOp(PureToleranceOp):
             review_reasons=["The Turning toolpath needs feed, spindle, fixture, and tool verification."])
         if self.requires_owned_tool:
             data["review_reasons"].append("The Turning operation needs an owned tool assembly.")
+        if self.tool_selection is not None:
+            data['tool_selection'] = self.tool_selection.to_dict()
+            data['tool_diameter_mm'] = None
+            data['review_reasons'].append('The recorded insert needs cutting-material, holder clearance, offset, and compensation verification.')
         return data
 
     def _path(self, points: list[tuple[str, float, float]], **metadata) -> Toolpath:

@@ -37,6 +37,7 @@ from .quality_context import (
 )
 from .tool_library import ToolSpec, ToolAssembly, ToolCatalog, to_sim_tool
 from .tool_selection import ToolRequirement, ToolSelectionResult, ToolUnavailableError, select_tool, tool_inventory
+from .turning_tooling import TurningToolSpec, turning_tool_inventory
 from .toolpath import Toolpath, ToolpathMove
 from .gcode_preview import gcode_preview, to_gcode_preview
 from .postprocessor import PostProcessor, Generic3AxisDebugPost, postprocess
@@ -158,6 +159,8 @@ __all__ = [
     "load_quality_context",
     "load_collision_policy",
     "ToolSpec",
+    "TurningToolSpec",
+    "turning_tool_inventory",
     "ToolAssembly",
     "ToolCatalog",
     "ToolRequirement",
