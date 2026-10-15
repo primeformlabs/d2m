@@ -36,11 +36,16 @@ from .quality_context import (
     load_collision_policy,
 )
 from .tool_library import ToolSpec, ToolAssembly, ToolCatalog, to_sim_tool
-from .tool_selection import ToolRequirement, ToolSelectionResult, select_tool
+from .tool_selection import ToolRequirement, ToolSelectionResult, ToolUnavailableError, select_tool, tool_inventory
+from .turning_tooling import TurningToolSpec, turning_tool_inventory
 from .toolpath import Toolpath, ToolpathMove
 from .gcode_preview import gcode_preview, to_gcode_preview
 from .postprocessor import PostProcessor, Generic3AxisDebugPost, postprocess
 from .target_compare import compare_to_target
+from .nominal_compare import compare_nominal_solids, load_nominal_step, NominalComparison
+from .laser_material import replay_laser_material, release_laser_part, laser_selection_region, LaserMaterialReplay, LaserReleasedPart
+from .bending_material import replay_bending_material, BendingMaterialReplay, BendingMaterialPass
+from .milling_verification import replay_milling_independently
 from .visualization import export_visualization_package
 from .operation_video import export_simulation_package
 from .economics import estimate_cost, compare_programs
@@ -154,6 +159,8 @@ __all__ = [
     "load_quality_context",
     "load_collision_policy",
     "ToolSpec",
+    "TurningToolSpec",
+    "turning_tool_inventory",
     "ToolAssembly",
     "ToolCatalog",
     "ToolRequirement",
@@ -167,6 +174,10 @@ __all__ = [
     "Generic3AxisDebugPost",
     "postprocess",
     "compare_to_target",
+    "compare_nominal_solids", "load_nominal_step", "NominalComparison",
+    "replay_laser_material", "release_laser_part", "laser_selection_region", "LaserMaterialReplay", "LaserReleasedPart",
+    "replay_bending_material", "BendingMaterialReplay", "BendingMaterialPass",
+    "replay_milling_independently",
     "export_visualization_package",
     "export_simulation_package",
     "build_video_export_plan",

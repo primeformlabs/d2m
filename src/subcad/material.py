@@ -23,7 +23,16 @@ try:
     )
     _kg_available = True
 except ImportError:
-    pass
+    try:
+        from knowledge_graph.rules import (
+            get_material_properties,
+            list_materials as _kg_list_materials,
+            get_compatible_processes as _kg_get_compatible_processes,
+            get_feeds_speeds as _kg_get_feeds_speeds,
+        )
+        _kg_available = True
+    except ImportError:
+        pass
 
 
 # ---------------------------------------------------------------------------

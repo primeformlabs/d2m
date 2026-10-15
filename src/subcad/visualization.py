@@ -156,6 +156,7 @@ def export_visualization_package(
 
 
 def _export_stock_states(stock: Any, out: Path, plan: dict) -> list[dict]:
+    import hashlib
     from .geometry import export_stl
 
     operations_by_sequence = {
@@ -182,7 +183,9 @@ def _export_stock_states(stock: Any, out: Path, plan: dict) -> list[dict]:
             continue
 
         sequence_number = state.get("sequence_number", index)
-        filename = f"stock_state_{int(sequence_number):03d}.stl"
+        pass_index = state.get("pass_index")
+        suffix = f"_pass_{int(pass_index):04d}" if pass_index is not None else ""
+        filename = f"stock_state_{int(sequence_number):03d}{suffix}.stl"
         path = states_dir / filename
         export_stl(shape, str(path))
 
@@ -193,11 +196,19 @@ def _export_stock_states(stock: Any, out: Path, plan: dict) -> list[dict]:
         states.append({
             "index": len(states),
             "sequence_number": sequence_number,
+            "pass_index": pass_index,
+            "pass_role": state.get("pass_role"),
             "operation": op.get("operation") or state.get("operation"),
             "label": label,
             "path": f"states/{filename}",
             "format": "stl",
             "role": "stock_state",
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "volume_mm3": state["shape"].val().Volume(),
+            "geometry_fidelity": op.get("geometry_fidelity", "unknown"),
+            "verification_status": op.get("verification_status", "not_run"),
+            "coordinate_frame": {"basis": "stock_world", "units": "mm", "spindle_axis": op.get("axis"),
+                "spindle_origin_mm": op.get("spindle_origin_mm", [0, 0, 0])},
         })
 
     return states
@@ -425,7 +436,10 @@ def _try_export_diff_mesh(
     try:
         import numpy as np
 
-        from src.simulation.mesh_compare import compute_signed_deviation
+        try:
+            from src.simulation.mesh_compare import compute_signed_deviation
+        except ImportError:
+            from simulation.mesh_compare import compute_signed_deviation
     except Exception:
         return None
 

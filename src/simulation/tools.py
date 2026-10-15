@@ -655,20 +655,20 @@ class Drill(Tool):
     """
 
     def __init__(self, diameter: float, tip_angle: float = 118.0,
-                 flute_length: float = 50.0, length: float = 100.0):
+                 flute_length: float = 50.0, length: float = 100.0, tip_diameter: float = 0.0):
         params = ToolParameters(
             diameter=diameter,
             length=length,
             flute_length=flute_length,
             tip_angle=tip_angle,
-            tip_diameter=0.0,
+            tip_diameter=tip_diameter,
         )
         super().__init__(params)
 
     @property
     def cone_height(self) -> float:
         """Height of the conical tip from apex to full diameter."""
-        return self.radius / np.tan(np.radians(self.params.tip_angle / 2.0))
+        return 0.0 if self.params.tip_angle == 180 else (self.radius - self.params.tip_diameter / 2) / np.tan(np.radians(self.params.tip_angle / 2.0))
 
     def ray_intersection(self, ray_origin: np.ndarray,
                          ray_direction: np.ndarray) -> DexelColumn:
@@ -695,9 +695,31 @@ class Drill(Tool):
         cyl = _ray_cylinder(O, D, R, h_cone, FL)
         all_intervals.extend(cyl)
 
-        # 2. Cone (apex at origin)
-        cone = _ray_cone(O, D, np.zeros(3), half_angle, h_cone, 0.0)
-        all_intervals.extend(cone)
+        # Intersect the finite point frustum directly. The radius at z is
+        # r0 + z*tan(B/2). Clip the quadratic inequality to its actual Z slab.
+        if h_cone > 1e-12:
+            if abs(D[2]) <= 1e-12:
+                lower, upper = (0.0, np.inf) if 0 <= O[2] <= h_cone else (1.0, 0.0)
+            else:
+                ends = sorted(((0 - O[2]) / D[2], (h_cone - O[2]) / D[2]))
+                lower, upper = max(0.0, ends[0]), ends[1]
+            if lower < upper:
+                slope = np.tan(half_angle)
+                r0 = self.params.tip_diameter / 2 + O[2] * slope
+                a = D[0] ** 2 + D[1] ** 2 - (D[2] * slope) ** 2
+                b = O[0] * D[0] + O[1] * D[1] - r0 * D[2] * slope
+                c = O[0] ** 2 + O[1] ** 2 - r0 ** 2
+                if abs(a) <= 1e-12:
+                    if abs(b) <= 1e-12:
+                        intervals = [(lower, upper)] if c <= 0 else []
+                    else:
+                        crossing = -c / (2 * b)
+                        intervals = [(-np.inf, crossing)] if b > 0 else [(crossing, np.inf)]
+                else:
+                    roots = _solve_quadratic(a, b, c)
+                    intervals = ([(-np.inf, np.inf)] if a < 0 else []) if roots is None else [roots] if a > 0 else [(-np.inf, roots[0]), (roots[1], np.inf)]
+                all_intervals.extend((max(lower, first), min(upper, last)) for first, last in intervals
+                    if max(lower, first) < min(upper, last))
 
         return self._collect_intervals(all_intervals)
 

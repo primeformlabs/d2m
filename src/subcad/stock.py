@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from copy import deepcopy
 from typing import Optional, Tuple
 
 from .geometry import (
@@ -34,11 +35,20 @@ from .geometry import (
 from .process_plan import ProcessPlan
 from .profiles import profile_span_yx
 from .tool_library import ToolSpec
+from .tool_selection import validate_inventory_tool
 
 
 def _profile_bounds_for_stock(profile) -> tuple[float, float]:
     """Return (width_y, length_x) from a lightweight profile description."""
     return profile_span_yx(profile)
+
+
+def _profile_through_depth(stock, face_selector: str) -> float:
+    if face_selector not in {">X", "<X", ">Y", "<Y", ">Z", "<Z"}:
+        raise ValueError("The profile requires one of the six cardinal setup faces.")
+    axis = face_selector[-1].lower()
+    bounds = stock.bounding_box
+    return bounds[f"{axis}_max"] - bounds[f"{axis}_min"]
 
 
 def _profiles_bounds_for_stock(profiles) -> tuple[float, float]:
@@ -76,6 +86,13 @@ def _place_profile(profile, cx: Optional[float] = None, cy: Optional[float] = No
             placed["cx"] = dx
         if cy is not None:
             placed["cy"] = dy
+        if placed.get("center") is not None:
+            center = list(placed["center"])
+            if cx is not None:
+                center[0] = dx
+            if cy is not None:
+                center[1] = dy
+            placed["center"] = center
         return placed
     if isinstance(profile, (list, tuple)):
         return [(float(point[0]) + dx, float(point[1]) + dy) for point in profile]
@@ -150,6 +167,12 @@ class Stock:
 
     def _apply_op(self, op) -> "Stock":
         """Apply a machining operation: modify shape, record in plan, return new Stock."""
+        if getattr(op, "spot_op", None) is not None:
+            prepared = self._apply_op(op.spot_op)
+            op.spot_op = None
+            op.sequence_number = prepared._next_op_number
+            return prepared._apply_op(op)
+        validate_inventory_tool(getattr(op, "tool", None), depth=getattr(op, "depth", 0.0))
         if getattr(op, "sequence_number", 0) == 0:
             op.sequence_number = self._next_op_number
 
@@ -169,12 +192,17 @@ class Stock:
                 "label": "Initial stock",
                 "shape": self._shape,
             })
-        state_history.append({
-            "sequence_number": op.sequence_number,
-            "operation": getattr(op, "operation_name", op.__class__.__name__),
-            "label": f"After OP {op.sequence_number}",
-            "shape": new_shape,
-        })
+        passes = getattr(op, "_material_pass_states", None)
+        if passes:
+            state_history.extend({**state, "sequence_number": op.sequence_number,
+                "operation": getattr(op, "operation_name", op.__class__.__name__)} for state in passes)
+        else:
+            state_history.append({
+                "sequence_number": op.sequence_number,
+                "operation": getattr(op, "operation_name", op.__class__.__name__),
+                "label": f"After OP {op.sequence_number}",
+                "shape": new_shape,
+            })
 
         # Serialize fixture and setups for the plan. Runtime FixtureSpec/Setup
         # objects win, but context-only setup intent must survive operation chains.
@@ -222,8 +250,10 @@ class Stock:
         if hasattr(op, "to_toolpath"):
             try:
                 toolpath = op.to_toolpath()
-            except Exception:
+            except Exception as error:
                 toolpath = []
+                op_dict["toolpath_status"] = "unavailable"
+                op_dict["toolpath_reason"] = str(error)
             if toolpath:
                 serialized_toolpath = _serialize_toolpath(toolpath)
                 if serialized_toolpath:
@@ -243,6 +273,7 @@ class Stock:
         if active_setup is not None and active_setup in self._setups:
             op_dict["setup"] = active_setup
             op_dict["face_selector"] = self._setups[active_setup].face_selector
+            op_dict["fixture_setup"] = deepcopy(setups_dict[active_setup])
         elif self._plan.setup_intent and len(setups_dict) == 1:
             setup_name, setup = next(iter(setups_dict.items()))
             op_dict.setdefault("setup", setup_name)
@@ -602,6 +633,21 @@ class Stock:
         )
 
     @classmethod
+    def round_bar(cls, length: float, diameter: float, material: str = "aluminum_6061", *,
+                  axis: str = "Z", origin: Tuple[float, float, float] = (0, 0, 0)) -> "Stock":
+        """Create actual round stock in the spindle's part coordinate frame."""
+        from .turning_geometry import finite, frame, from_spindle
+
+        length = finite(length, "stock length", positive=True)
+        diameter = finite(diameter, "stock diameter", positive=True)
+        axis, origin = frame(axis, origin)
+        shape = from_spindle(create_cylindrical_stock(diameter, length), axis, origin)
+        dims = {"diameter": diameter, "height": length, "length": length, "stock_form": "round_bar",
+            "axis": axis, "spindle_origin_mm": list(origin)}
+        return cls(_shape=shape, _material=material, _plan=ProcessPlan(material=material, stock_dimensions=dims),
+            _stock_dims=dims)
+
+    @classmethod
     def from_step(
         cls,
         path: str,
@@ -634,6 +680,7 @@ class Stock:
         *,
         tool: Optional[ToolSpec] = None,
         stepover: Optional[float] = None,
+        face_selector: str = ">Z",
     ) -> "Stock":
         """Face mill the top surface.
 
@@ -649,6 +696,7 @@ class Stock:
             stepover=stepover,
             tool=tool,
             material=self._material,
+            face_selector=face_selector,
         )
         op.sequence_number = self._next_op_number
         return self._apply_op(op)
@@ -698,6 +746,7 @@ class Stock:
         # If PocketOp auto-created a finish op, apply it too
         finish = getattr(op, "finish_op", None)
         if finish is not None:
+            finish.face_selector = op.face_selector
             finish.sequence_number = result._next_op_number
             result = result._apply_op(finish)
 
@@ -898,6 +947,9 @@ class Stock:
         from .operations import DrillOp, SpotDrillOp
 
         result = self
+        if through:
+            setup = self._setups.get(self._active_setup) if self._active_setup else None
+            depth = _profile_through_depth(self, setup.face_selector if setup else face_selector)
 
         # Apply spot-drill first so it's recorded in the plan
         if spot_drill:
@@ -925,6 +977,13 @@ class Stock:
         )
         op.sequence_number = result._next_op_number
         return result._apply_op(op)
+
+    def spot_drill(self, hole_diameter: float, depth: float = 1.0, *, cx: float = 0.0,
+                   cy: float = 0.0, face_selector: str = ">Z", tool: Optional[ToolSpec] = None) -> "Stock":
+        """Cut a drill-point start with explicit tip depth and selected geometry."""
+        from .operations import SpotDrillOp
+        return self._apply_op(SpotDrillOp(hole_diameter=hole_diameter, depth=depth, cx=cx, cy=cy,
+            face_selector=face_selector, tool=tool, material=self._material))
 
     def drill_at(
         self,
@@ -1227,6 +1286,9 @@ class Stock:
         through: bool = False,
         face_selector: str = ">Z",
         tool: Optional[ToolSpec] = None,
+        stepdown: float = 1.0,
+        finish_allowance: float = 0.0,
+        chord_error: float = 0.01,
     ) -> "Stock":
         """Cut a straight slot (obround).
 
@@ -1241,6 +1303,9 @@ class Stock:
         """
         from .operations import SlotOp
 
+        if through:
+            setup = self._setups.get(self._active_setup) if self._active_setup else None
+            depth = _profile_through_depth(self, setup.face_selector if setup else face_selector)
         op = SlotOp(
             cx=cx,
             cy=cy,
@@ -1252,6 +1317,9 @@ class Stock:
             face_selector=face_selector,
             tool=tool,
             material=self._material,
+            stepdown=stepdown,
+            finish_allowance=finish_allowance,
+            chord_error=chord_error,
         )
         op.sequence_number = self._next_op_number
         return self._apply_op(op)
@@ -1339,6 +1407,9 @@ class Stock:
         """Peck-drill a deep hole."""
         from .operations import PeckDrillOp
 
+        if through:
+            setup = self._setups.get(self._active_setup) if self._active_setup else None
+            depth = _profile_through_depth(self, setup.face_selector if setup else face_selector)
         op = PeckDrillOp(
             cx=cx,
             cy=cy,
@@ -1366,16 +1437,29 @@ class Stock:
         """Finish a pre-drilled hole with a reamer."""
         from .operations import ReamOp
 
+        if through:
+            setup = self._setups.get(self._active_setup) if self._active_setup else None
+            depth = _profile_through_depth(self, setup.face_selector if setup else face_selector)
         op = ReamOp(
             cx=cx,
             cy=cy,
             diameter=diameter,
             depth=depth,
             through=through,
+            face_selector=face_selector,
             tool=tool,
             material=self._material,
         )
         return self._apply_op(op)
+
+    def ream_hole(
+        self, diameter: float, depth: float = 10.0, *, cx: float = 0.0, cy: float = 0.0,
+        through: bool = False, face_selector: str = ">Z", entry_plane_mm: Optional[float] = None,
+    ) -> "Stock":
+        """Select a reamer and retain an existing pilot or prepare it with an available drill."""
+        from .hole_finishing import prepare_reaming
+        return prepare_reaming(self, diameter, depth, cx=cx, cy=cy,
+            through=through, face_selector=face_selector, entry_plane_mm=entry_plane_mm)
 
     def bore(
         self,
@@ -1387,16 +1471,26 @@ class Stock:
         through: bool = False,
         face_selector: str = ">Z",
         tool: Optional[ToolSpec] = None,
+        stepdown: float = 1.0,
+        finish_allowance: float = 0.0,
+        chord_error: float = 0.01,
     ) -> "Stock":
-        """Bore a hole for trueness and finish."""
+        """Circular-mill a hole with the selected cutter and retained material passes."""
         from .operations import BoreOp
 
+        if through:
+            setup = self._setups.get(self._active_setup) if self._active_setup else None
+            depth = _profile_through_depth(self, setup.face_selector if setup else face_selector)
         op = BoreOp(
             cx=cx,
             cy=cy,
             diameter=diameter,
             depth=depth,
             through=through,
+            face_selector=face_selector,
+            stepdown=stepdown,
+            finish_allowance=finish_allowance,
+            chord_error=chord_error,
             tool=tool,
             material=self._material,
         )
@@ -1651,20 +1745,24 @@ class Stock:
 
     def profile_pocket(self, profile, depth: float, *, face_selector: str = ">Z",
                        through: bool = False, islands=None,
+                       stepdown: float = 1.0, finish_allowance: float = 0.1, chord_error: float = 0.01,
                        cx: Optional[float] = None,
                        cy: Optional[float] = None,
                        tool: Optional[ToolSpec] = None) -> "Stock":
         from .operations import ProfilePocketOp
         profile = _place_profile(profile, cx, cy)
         width, length = _profile_bounds_for_stock(profile)
+        if through:
+            depth = _profile_through_depth(self, face_selector)
         return self._apply_op(ProfilePocketOp(
             profile=profile, islands=islands, width=width, length=length,
             depth=depth, through=through, face_selector=face_selector,
-            tool=tool, material=self._material,
+            tool=tool, material=self._material, stepdown=stepdown, finish_allowance=finish_allowance, chord_error=chord_error,
         ))
 
     def profile_cutout(self, profile, *, depth: Optional[float] = None,
                        through: bool = False, face_selector: str = ">Z",
+                       stepdown: float = 1.0, finish_allowance: float = 0.1, chord_error: float = 0.01,
                        cx: Optional[float] = None,
                        cy: Optional[float] = None,
                        tool: Optional[ToolSpec] = None) -> "Stock":
@@ -1672,10 +1770,12 @@ class Stock:
         profile = _place_profile(profile, cx, cy)
         width, length = _profile_bounds_for_stock(profile)
         cut_depth = depth if depth is not None else self._stock_dims.get("height", 1.0)
+        if through:
+            cut_depth = _profile_through_depth(self, face_selector)
         return self._apply_op(ProfileCutoutOp(
             profile=profile, width=width, length=length, depth=cut_depth,
             through=through, face_selector=face_selector,
-            tool=tool, material=self._material,
+            tool=tool, material=self._material, stepdown=stepdown, finish_allowance=finish_allowance, chord_error=chord_error,
         ))
 
     def laser_cut_profile(self, profile, *, kerf_width: float = 0.15,
@@ -1769,6 +1869,9 @@ class Stock:
 
     def profile_contour(self, profile, depth: float, *, side: str = "outside",
                         face_selector: str = ">Z",
+                        stepdown: float = 1.0,
+                        finish_allowance: float = 0.1,
+                        chord_error: float = 0.01,
                         cx: Optional[float] = None,
                         cy: Optional[float] = None,
                         tool: Optional[ToolSpec] = None) -> "Stock":
@@ -1776,7 +1879,8 @@ class Stock:
         profile = _place_profile(profile, cx, cy)
         return self._apply_op(ProfileContourOp(
             profile=profile, depth=depth, side=side, face_selector=face_selector,
-            tool=tool, material=self._material,
+            tool=tool, material=self._material, stepdown=stepdown,
+            finish_allowance=finish_allowance, chord_error=chord_error,
         ))
 
     def machine_around_profile(self, profile, height: float, *,
@@ -1857,48 +1961,63 @@ class Stock:
             height=height, tool=tool, material=self._material,
         ))
 
-    def turn_profile(self, profile, *, axis: str = "Z",
+    def _turning_frame(self, axis=None, origin=None) -> dict:
+        return {"axis": axis or self._stock_dims.get("axis", "Z"),
+            "origin": origin if origin is not None else self._stock_dims.get("spindle_origin_mm", (0, 0, 0))}
+
+    def turn_profile(self, profile, *, axis: Optional[str] = None, origin=None,
                      stock_diameter: Optional[float] = None,
                      tool: Optional[ToolSpec] = None) -> "Stock":
         from .operations import TurnProfileOp
         return self._apply_op(TurnProfileOp(
-            profile=profile, axis=axis, stock_diameter=stock_diameter,
+            profile=profile, **self._turning_frame(axis, origin), stock_diameter=stock_diameter,
             tool=tool, material=self._material,
         ))
 
-    def turn_face(self, z: float, *, tool: Optional[ToolSpec] = None) -> "Stock":
+    def turn_face(self, z: float, *, axis: Optional[str] = None, origin=None, side: str = "front",
+                  tool: Optional[ToolSpec] = None) -> "Stock":
         from .operations import TurnFaceOp
-        return self._apply_op(TurnFaceOp(z=z, tool=tool, material=self._material))
+        return self._apply_op(TurnFaceOp(z=z, **self._turning_frame(axis, origin), side=side, tool=tool, material=self._material))
 
     def turn_od(self, diameter: float, length: float, *,
+                axis: Optional[str] = None, origin=None, start_z: Optional[float] = None,
                 tool: Optional[ToolSpec] = None) -> "Stock":
         from .operations import TurnODOp
         return self._apply_op(TurnODOp(
             diameter=diameter, length=length, tool=tool, material=self._material,
+            **self._turning_frame(axis, origin), start_z=start_z,
         ))
 
     def turn_id(self, diameter: float, depth: float, *,
+                axis: Optional[str] = None, origin=None, start_z: Optional[float] = None,
                 tool: Optional[ToolSpec] = None) -> "Stock":
         from .operations import TurnIDOp
         return self._apply_op(TurnIDOp(
             diameter=diameter, length=depth, depth=depth,
             tool=tool, material=self._material,
+            **self._turning_frame(axis, origin), start_z=start_z,
         ))
 
     def turn_groove(self, width: float, depth: float, z: float, *,
+                    axis: Optional[str] = None, origin=None, diameter: Optional[float] = None, internal: bool = False,
                     tool: Optional[ToolSpec] = None) -> "Stock":
         from .operations import TurnGrooveOp
         return self._apply_op(TurnGrooveOp(
             width=width, depth=depth, z=z, tool=tool, material=self._material,
+            **self._turning_frame(axis, origin), diameter=diameter, internal=internal,
         ))
 
     def turn_thread(self, diameter: float, pitch: float, length: float, *,
                     internal: bool = False,
+                    axis: Optional[str] = None, origin=None, start_z: Optional[float] = None,
+                    thread_depth: Optional[float] = None, angle: float = 60.0, left_handed: bool = False,
                     tool: Optional[ToolSpec] = None) -> "Stock":
         from .operations import TurnThreadOp
         return self._apply_op(TurnThreadOp(
             diameter=diameter, pitch=pitch, length=length, internal=internal,
             tool=tool, material=self._material,
+            **self._turning_frame(axis, origin), start_z=start_z,
+            thread_depth=thread_depth, angle=angle, left_handed=left_handed,
         ))
 
     def mill_turn_setup(self, axis: str = "Z", work_offset: str = "G54") -> "Stock":
@@ -1982,11 +2101,13 @@ class Stock:
         ))
 
     def loft_mill(self, profiles, *, tolerance_mm: float = 0.10,
-                  tool: Optional[ToolSpec] = None) -> "Stock":
+                  tool: Optional[ToolSpec] = None, stepdown: float = 1.0,
+                  chord_error: float = 0.01, face_selector: str = ">Z", finish_walls: bool = True) -> "Stock":
         from .operations import LoftMillOp
         return self._apply_op(LoftMillOp(
             profiles=profiles, tolerance_mm=tolerance_mm,
-            tool=tool, material=self._material,
+            tool=tool, material=self._material, stepdown=stepdown,
+            chord_error=chord_error, face_selector=face_selector, finish_walls=finish_walls,
         ))
 
     def dome_mill(self, radius: float, height: float, *, cx: float = 0.0,
@@ -2042,7 +2163,9 @@ class Stock:
 
         if self._fixture is None:
             raise ValueError("No fixture assigned. Call .with_fixture() first.")
-        setup = Setup(name=name, fixture=self._fixture, face_selector=face_selector,
+        if name in self._setups:
+            raise ValueError(f"Setup {name!r} already exists. Use a new name for a revised fixture setup.")
+        setup = Setup(name=name, fixture=deepcopy(self._fixture), face_selector=face_selector,
                       work_offset=work_offset, work_offset_values=work_offset_values,
                       rotation_deg=rotation_deg, description=description)
         new_setups = dict(self._setups)
@@ -2076,19 +2199,16 @@ class Stock:
         )
 
     def validate_fixture_clearance(self) -> list[str]:
-        """Check all operations against the active fixture's clamping zones."""
-        from .fixturing import check_operation_against_fixture
+        """Check each operation against its recorded fixture and cardinal tool axis."""
+        from .validation import _check_fixture_clearance
 
-        warnings = []
-        active_name = self._active_setup
-        if active_name is None or active_name not in self._setups:
-            return warnings
-        active_setup = self._setups[active_name]
-        for op_dict in self._plan.operations:
-            warnings.extend(
-                check_operation_against_fixture(op_dict, active_setup, self._stock_dims)
-            )
-        return warnings
+        setups = ({name: setup.to_dict() for name, setup in self._setups.items()}
+                  if self._setups else self._plan.setups)
+        fixture = self._fixture.to_dict() if self._fixture else self._plan.fixture
+        return [issue.message for issue in _check_fixture_clearance({
+            "operations": self._plan.operations, "fixture": fixture,
+            "setups": setups, "stock_dimensions": self._stock_dims,
+        })]
 
     # -------------------------------------------------------------------
     #  Simulation bridge
@@ -2520,6 +2640,8 @@ def _toolpath_from_serialized(toolpath_data, *, z_offset: float = 0.0) -> list:
     import numpy as np
 
     if isinstance(toolpath_data, dict):
+        if toolpath_data.get("metadata", {}).get("coordinate_system") == "part_mm":
+            z_offset = 0.0
         if "moves" in toolpath_data:
             toolpath_data = toolpath_data["moves"]
         elif "positions" in toolpath_data:

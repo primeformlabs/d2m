@@ -174,8 +174,8 @@ try:
     )
     raised = False
 except ValueError as exc:
-    raised = "5-axis" in str(exc)
-check("raise_on_error raises machine validation error", raised)
+    raised = "explicit geometry" in str(exc)
+check("unresolved surface geometry stops the fluent operation", raised)
 
 print("\n" + "=" * 60)
 print(f"Passed: {passed}")

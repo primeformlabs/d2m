@@ -68,6 +68,9 @@ class Generic3AxisDebugPost(PostProcessor):
             work_offset = setup.get("work_offset") if isinstance(setup, dict) else None
             lines.append("")
             lines.append(f"(OP {seq}: {name}; setup={setup_name}; DEBUG ONLY)")
+            if op.get("process") == "turn" or str(name).startswith("turn_"):
+                lines.append("(Turning requires a lathe postprocessor; no motion emitted.)")
+                continue
             if work_offset:
                 lines.append(str(work_offset))
             tool = op.get("tool") or {}

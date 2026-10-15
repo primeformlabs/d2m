@@ -78,6 +78,12 @@ def build_simulation_timeline(
     segments, operations, captions = _compile_timeline_segments(plan, mesh_bbox)
     total_time_sec = segments[-1]["end_time_sec"] if segments else 0.0
 
+    if any(op.get("process") == "turn" and op.get("geometry_status") == "modeled" for op in plan.get("operations", [])):
+        return _native_operation_timeline(stock, plan, out, segments, operations, captions,
+            fps=fps, playback_rate=playback_rate, keyframe_interval_sec=keyframe_interval_sec,
+            resolution_mm=resolution_mm, started=started, initial_source=initial_source,
+            include_machine=include_machine, include_fixtures=include_fixtures)
+
     tri_model = None
     engine = None
     simulation_notes: list[dict] = []
@@ -244,6 +250,44 @@ def build_simulation_timeline(
     }
 
 
+def _native_operation_timeline(stock, plan, out, segments, operations, captions, *, fps, playback_rate,
+                               keyframe_interval_sec, resolution_mm, started, initial_source,
+                               include_machine, include_fixtures):
+    """Retain real operation states without claiming independent tool replay."""
+    from .visualization import _export_stock_states
+
+    history = list(getattr(stock, "_state_history", []) or [])
+    by_sequence = {op["sequence_number"]: op for op in operations}
+    exported = _export_stock_states(stock, out, plan) if out is not None else []
+    frames = []
+    for index, state in enumerate(history):
+        sequence = state.get("sequence_number", index)
+        operation = by_sequence.get(sequence, {})
+        asset = next((item for item in exported if item["sequence_number"] == sequence), {})
+        shape = state.get("shape")
+        frames.append({"index": index, "time_sec": operation.get("end_time_sec", 0),
+            "sequence_number": sequence, "operation": state.get("operation"), "label": state.get("label"),
+            "path": asset.get("path"), "format": asset.get("format"), "sha256": asset.get("sha256"),
+            "role": "native_operation_stock_state", "volume_mm3": shape.val().Volume() if shape is not None else None,
+            "geometry_fidelity": asset.get("geometry_fidelity", "unknown"), "verification_status": "not_verified"})
+    return {"schema_version": SIMULATION_TIMELINE_SCHEMA_VERSION, "units": "mm",
+        "source_plan": {"schema_version": plan.get("schema_version"), "operation_count": len(operations),
+            "material": plan.get("material"), "stock_dimensions": plan.get("stock_dimensions", {})},
+        "timeline": {"fps": int(fps), "playback_rate": float(playback_rate),
+            "total_time_sec": segments[-1]["end_time_sec"] if segments else 0,
+            "keyframe_interval_sec": float(keyframe_interval_sec), "segments": segments,
+            "timing_status": "preview_estimate"},
+        "operations": operations, "tools": _tool_payloads(plan.get("operations", [])),
+        "machines": _machine_payloads(plan, include_machine=include_machine),
+        "fixtures": plan.get("fixture") if include_fixtures else None,
+        "stock_keyframes": frames, "captions": captions,
+        "fidelity": {"stock_geometry": "native_operation_geometry", "independent_tool_replay": "not_run",
+            "processes": _process_fidelity(plan.get("operations", [])), "notes": [{"severity": "warning",
+                "message": "The material states come from native operation geometry. They do not verify the toolpath, fixture, or machine execution."}]},
+        "performance": {"generation_time_sec": _round_float(time.perf_counter() - started),
+            "resolution_mm": resolution_mm, "keyframe_count": len(frames), "initial_stock_source": initial_source}}
+
+
 def export_simulation_package(
     stock: Any,
     output_dir: str | Path,
@@ -302,7 +346,7 @@ def export_simulation_package(
         "keyframe_count": len(timeline.get("stock_keyframes", [])),
     }
     assets["simulation_states"] = {
-        "path": "simulation_states/",
+        "path": "states/" if timeline.get("fidelity", {}).get("stock_geometry") == "native_operation_geometry" else "simulation_states/",
         "format": "stl",
         "state_count": len([
             state for state in timeline.get("stock_keyframes", [])
@@ -614,10 +658,14 @@ def _operation_moves(op: dict, mesh_bbox: dict) -> list[dict]:
             records = []
 
     moves = []
-    top_z = float(mesh_bbox.get("z_max", 0.0))
+    top_z = 0.0 if isinstance(data, dict) and data.get("metadata", {}).get("coordinate_system") == "part_mm" else float(mesh_bbox.get("z_max", 0.0))
     for record in records:
         normalized = _normalize_move(record, top_z)
         if normalized is not None:
+            if isinstance(data, dict) and data.get("metadata", {}).get("coordinate_system") == "part_mm":
+                # Cutting classification uses depth below the incoming top.
+                # Mesh coordinates already use the absolute part datum.
+                normalized["program_position"][2] -= float(mesh_bbox.get("z_max", 0.0))
             moves.append(normalized)
     return moves
 
@@ -993,7 +1041,7 @@ def _operation_fidelity(op: dict) -> str:
     operation = str(op.get("operation") or "").lower()
     tool_type = str(op.get("tool_type") or "").lower()
     if "turn" in operation:
-        return "timeline_only_turning_v1_pending"
+        return "native_turning_geometry_unverified" if op.get("geometry_status") == "modeled" else "timeline_only_turning_v1_pending"
     if "laser" in operation or tool_type == "fiber_laser":
         return "visual_process_approximation"
     if "press_brake" in operation or "bend" in operation:
