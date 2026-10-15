@@ -94,8 +94,8 @@ def test_loft_requires_owned_tools_and_rejects_unreachable_cutter_or_setup():
         Stock.rectangular(8,8,4).loft_mill(sections())
     with pytest.raises(ValueError,match="cannot reach"):
         Stock.rectangular(8,8,4).loft_mill(sections(),tool=ToolSpec("flat_endmill",4,flute_length=1))
-    with pytest.raises(ValueError,match="positive Z"):
-        Stock.rectangular(8,8,4).loft_mill(sections(),tool=ToolSpec("flat_endmill",4),face_selector=">X")
+    with pytest.raises(ValueError,match="cardinal setup faces"):
+        Stock.rectangular(8,8,4).loft_mill(sections(),tool=ToolSpec("flat_endmill",4),face_selector="tilted")
 
 
 def test_loft_path_replays_independently_against_incoming_material():

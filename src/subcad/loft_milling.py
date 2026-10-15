@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 from .milling_replay import _boolean, finite, validate_cutter, replay_pass
-from .profile_milling import _profile_wire
+from .profile_milling import _profile_wire, _setup_plane
 from .profile_pocket_milling import run_profile_pocket
 from .toolpath import Toolpath, ToolpathMove
 
@@ -34,7 +35,7 @@ def loft_sections(profiles):
             raise ValueError("The current loft path requires concentric sections of one type. Shifted or mixed sections need another machining plan.")
         keys = ("diameter",) if low["type"] == "circle" else ("length", "width")
         if any(high[key] > low[key] for key in keys):
-            raise ValueError("The loft has an overhang. A positive Z cutter cannot reach that wall with this plan.")
+            raise ValueError("The loft has an overhang. The selected setup cutter cannot reach that wall with this plan.")
     return sections
 
 
@@ -67,6 +68,18 @@ def _circular_wall_error(radius, cutter_radius, count):
     root = math.sqrt(1 - ratio * ratio)
     return max(0, cutter_radius * ratio * ratio / (1 + root)
         - 2 * center_radius * math.sin(angle / 2) ** 2)
+
+
+def _comparison_differences(incoming, target, result):
+    """Condition coincident Boolean boundaries without changing cutter material."""
+    box = incoming.BoundingBox()
+    shift = (-(box.xmin + box.xmax) / 2, -(box.ymin + box.ymax) / 2, -(box.zmin + box.zmax) / 2)
+    required, actual = target.translate(shift), result.translate(shift)
+    missing = _boolean(required, [actual], "cut")
+    remaining = _boolean(actual, [required], "cut")
+    if not missing.isValid() or not remaining.isValid():
+        raise ValueError("The native loft material comparison is invalid. The required shape is not verified.")
+    return max(0, missing.Volume()), max(0, remaining.Volume())
 
 
 def _wall_paths(sections, *, tool, tolerance, safe_z, feed, rpm):
@@ -132,8 +145,34 @@ def _wall_paths(sections, *, tool, tolerance, safe_z, feed, rpm):
 
 
 def run_loft_milling(shape, profiles, *, tool, tolerance_mm, stepdown, chord_error, feed, rpm, face_selector=">Z", finish_walls=True):
-    if face_selector != ">Z":
-        raise ValueError("Loft milling requires a positive Z setup. Another cutter axis needs an explicit loft transform.")
+    if not isinstance(face_selector, str) or face_selector not in {">Z", "<Z", ">X", "<X", ">Y", "<Y"}:
+        raise ValueError("The loft requires one of the six cardinal setup faces.")
+    plane, mirror = _setup_plane(face_selector)
+    sections = loft_sections(profiles)
+    if face_selector == ">Z":
+        return _run_local_loft(shape, sections, tool=tool, tolerance_mm=tolerance_mm, stepdown=stepdown,
+            chord_error=chord_error, feed=feed, rpm=rpm, finish_walls=finish_walls)
+    local = shape.newObject([plane.toLocalCoords(shape.val())])
+    result, path, states, reports, comparison, depth = _run_local_loft(local,
+        [{**section, "cy": section["cy"] * mirror} for section in sections],
+        tool=tool, tolerance_mm=tolerance_mm, stepdown=stepdown, chord_error=chord_error,
+        feed=feed, rpm=rpm, finish_walls=finish_walls)
+    axis = list(plane.zDir.toTuple())
+    path.moves = [replace(move, position=plane.toWorldCoords(move.position).toTuple(),
+        arc_center=plane.toWorldCoords(move.arc_center).toTuple() if move.arc_center is not None else None)
+        for move in path.moves]
+    path.metadata.update(coordinate_system="part_mm", tool_axis=axis, face_selector=face_selector,
+        sections=sections, section_coordinate_system="face_profile_part_mm",
+        safe_z_coordinate_system="setup_mm", safe_plane_coordinate_mm=path.safe_z)
+    for report in reports:
+        report.update(coordinate_system="part_mm", tool_axis=axis, face_selector=face_selector,
+            section_coordinate_system="face_profile_part_mm")
+    world_states = [{**state, "shape": shape.newObject([state["shape"].val().transformShape(plane.rG)])}
+        for state in states]
+    return world_states[-1]["shape"], path, world_states, reports, comparison, depth
+
+
+def _run_local_loft(shape, profiles, *, tool, tolerance_mm, stepdown, chord_error, feed, rpm, finish_walls):
     sections = loft_sections(profiles)
     tolerance = finite(tolerance_mm, "loft preview tolerance", positive=True)
     step = finite(stepdown, "loft stepdown", positive=True)
@@ -145,7 +184,8 @@ def run_loft_milling(shape, profiles, *, tool, tolerance_mm, stepdown, chord_err
     bounds = shape.val().BoundingBox()
     if sections[0]["z_mm"] <= bounds.zmin:
         raise ValueError("The loft base must leave incoming material below it.")
-    if abs(sections[-1]["z_mm"] - bounds.zmax) > 1e-7:
+    # Rigid frame transforms can add the CAD kernel's bounding-box margin.
+    if abs(sections[-1]["z_mm"] - bounds.zmax) > 1e-6:
         raise ValueError("The incoming material top must match the loft top. Correct the preceding facing operation and datum.")
     footprint = _profile_wire(sections[0])[0].BoundingBox()
     if footprint.xmin < bounds.xmin - 1e-7 or footprint.xmax > bounds.xmax + 1e-7 or footprint.ymin < bounds.ymin - 1e-7 or footprint.ymax > bounds.ymax + 1e-7:
@@ -195,7 +235,7 @@ def run_loft_milling(shape, profiles, *, tool, tolerance_mm, stepdown, chord_err
             reports.append(check)
             states.append({**state, "pass_index": number, "pass_role": role,
                 "label": f"After loft {role} pass {number}", "geometry_replay": check})
-    clearing_remaining = _boolean(result.val(), [target], "cut").Volume()
+    _, clearing_remaining = _comparison_differences(shape.val(), target, result.val())
     for path in finishing_paths:
         if len(states) >= 1000:
             raise ValueError("The loft exceeds the retained pass limit. Divide the operation into smaller regions.")
@@ -213,12 +253,12 @@ def run_loft_milling(shape, profiles, *, tool, tolerance_mm, stepdown, chord_err
         reports.append(check)
         states.append({"shape":result, "pass_index":number, "pass_role":"finishing",
             "label":f"After loft wall-finishing pass {number}", "geometry_replay":check})
-    missing = _boolean(target, [result.val()], "cut").Volume()
-    remaining = _boolean(result.val(), [target], "cut").Volume()
+    missing, remaining = _comparison_differences(shape.val(), target, result.val())
     comparison = {"method": "native_brep_ruled_loft", "overcut_volume_mm3": max(0, missing),
         "remaining_target_material_mm3": max(0, remaining), "clearing_remaining_material_mm3": max(0, clearing_remaining),
         "wall_finishing_enabled":finish_walls, "tolerance_verified": False, "manufacturing_ready": False}
     comparison.update(preview_accuracy_mm=tolerance,
+        comparison_conditioning="centered_incoming_bounds", comparison_validated=True,
         wall_spacing_error_bound_mm=max((path.metadata["wall_spacing_error_bound_mm"] for path in finishing_paths), default=None))
     if missing > 1e-6:
         raise ValueError("The selected loft cutter removes required material. Review the cutter compensation and path.")

@@ -13,13 +13,26 @@ python -m pip wheel --no-deps . --wheel-dir dist
 Install the wheel in the CAD environment:
 
 ```text
-python -m pip install --no-deps dist/d2o_subcad-0.2.21-py3-none-any.whl
+python -m pip install --no-deps dist/d2o_subcad-0.2.22-py3-none-any.whl
 ```
 
 Use `from subcad import Stock` from an installed package.
 Source-checkout imports with `from src.subcad import Stock` remain available.
 The package requires CadQuery, NumPy, trimesh, SciPy, and rtree.
 The optional `video` dependencies support rendered video export.
+
+Version 0.2.22 applies ruled loft Milling on all six cardinal setup faces.
+Section `cx` and `cy` use the existing face-profile convention.
+Section `z_mm` is the signed position along the outward cutter axis.
+The operation transforms actual incoming material into the setup frame for cutter replay.
+It transforms every retained material state and tool move into stable part coordinates.
+The final operation result uses the exact last retained shape.
+Nominal Boolean comparisons use a common local origin and reject invalid results.
+This avoids a CadQuery 2.8 comparison failure on translated material with a preceding hole.
+The comparison transform cannot change the actual cutter result or increase the allowed overcut.
+The toolpath records its cutter axis, selected face, section frame, and safe-plane coordinate frame.
+Independent replay uses the world-coordinate path and the same selected cutter.
+Other cutter axes and arbitrary loft sections still require another machining plan.
 
 Version 0.2.21 includes part curvature in external circular loft wall spacing.
 The previous flat-surface spacing rule could exceed the selected preview accuracy on a small circular part.
