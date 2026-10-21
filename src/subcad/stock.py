@@ -1748,7 +1748,11 @@ class Stock:
                        stepdown: float = 1.0, finish_allowance: float = 0.1, chord_error: float = 0.01,
                        cx: Optional[float] = None,
                        cy: Optional[float] = None,
-                       tool: Optional[ToolSpec] = None) -> "Stock":
+                       tool: Optional[ToolSpec] = None,
+                       max_tool_diameter: Optional[float] = None,
+                       rest_from_diameter: Optional[float] = None) -> "Stock":
+        """``max_tool_diameter`` limits the selected cutter. ``rest_from_diameter``: rest machining; the pass
+        cuts only the material that a previous flat end mill of that diameter left in the corners."""
         from .operations import ProfilePocketOp
         profile = _place_profile(profile, cx, cy)
         width, length = _profile_bounds_for_stock(profile)
@@ -1758,6 +1762,7 @@ class Stock:
             profile=profile, islands=islands, width=width, length=length,
             depth=depth, through=through, face_selector=face_selector,
             tool=tool, material=self._material, stepdown=stepdown, finish_allowance=finish_allowance, chord_error=chord_error,
+            max_tool_diameter=max_tool_diameter, rest_from_diameter=rest_from_diameter,
         ))
 
     def profile_cutout(self, profile, *, depth: Optional[float] = None,
