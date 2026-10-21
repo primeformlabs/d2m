@@ -19,6 +19,7 @@ Usage::
 """
 
 from .stock import Stock
+from .program_mode import program_mode, is_program_mode
 from .process_plan import ProcessPlan, OperationStep
 from .machine_context import MachineContext, load_machine_context
 from .controller_context import ControllerContext, load_controller_context
@@ -142,6 +143,8 @@ def export_video(*args, **kwargs):
 __all__ = [
     # Core classes
     "Stock",
+    "program_mode",
+    "is_program_mode",
     "ProcessPlan",
     "OperationStep",
     "MachineContext",
