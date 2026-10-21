@@ -233,10 +233,47 @@ def _exact_width_center(profile, tool, mirror):
     return None
 
 
+def _grown(region, distance):
+    """The faces of a region grown by a distance (outer boundaries only)."""
+    import cadquery as cq
+    faces = []
+    for face in region.Faces():
+        for wire in face.outerWire().offset2D(distance, kind="arc"):
+            faces.append(cq.Face.makeFromWires(wire))
+    if not faces:
+        return None
+    return faces[0] if len(faces) == 1 else _boolean(faces[0], faces[1:], "fuse")
+
+
+def _rest_region(target_region, outer, keep, tool, previous_diameter, center):
+    """Rest machining: the part of the cutter-centre region near the material that a previous flat end mill
+    of ``previous_diameter`` left (its corners). None when nothing is left for this cutter."""
+    previous = previous_diameter / 2
+    if previous <= tool.radius + 1e-6:
+        raise ValueError("The rest pass cutter must be smaller than the previous cutter.")
+    try:
+        cleared = _grown(_center_region(outer, keep, previous), previous)
+    except ValueError:
+        cleared = None
+    left = target_region if cleared is None else _boolean(target_region, [cleared], "cut")
+    if not left.Faces() or sum(face.Area() for face in left.Faces()) <= 1e-6:
+        return None
+    zone = _grown(left, tool.radius + 1e-3)
+    if zone is None:
+        return None
+    region = _boolean(center, [zone], "common")
+    if not region.Faces() or sum(face.Area() for face in region.Faces()) <= 1e-8:
+        return None
+    return region
+
+
 def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=False,
                        face_selector=">Z", stepdown=1, finish_allowance=0.1, chord_error=0.01,
-                       feed=100, rpm=None, outside=False):
-    """Return material, actual toolpath, retained pass states and target comparison."""
+                       feed=100, rpm=None, outside=False, rest_from_diameter=None):
+    """Return material, actual toolpath, retained pass states and target comparison.
+
+    ``rest_from_diameter``: rest machining. The passes cut only near the material that a previous flat end mill
+    of that diameter left; the boundary pass at the full depth makes the corners with the radius of this cutter."""
     import cadquery as cq
     if tool is None or tool.tool_type != "flat_endmill":
         raise ValueError("Native profile pocket replay requires a selected flat end mill.")
@@ -289,6 +326,11 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
             rough_center = _center_region(outer, keep, tool.radius + allowance)
         except ValueError:
             raise ValueError("The cutter and finish allowance do not fit the pocket region. Reduce the allowance or select another cutter.") from None
+        if rest_from_diameter is not None:
+            rest = _rest_region(target_region, outer, keep, tool, float(rest_from_diameter), center)
+            if rest is None:
+                raise ValueError("The previous cutter left no material that this rest pass can reach.")
+            center, rough_center = rest, rest
     maximum = finite((tool.safe_limits or {}).get("max_stepdown_mm", tool.diameter / 2), "maximum pocket stepdown", positive=True)
     stepdown = min(stepdown, maximum, tool.diameter / 2)
     count = max(1, math.ceil(depth / stepdown))

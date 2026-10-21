@@ -2869,14 +2869,22 @@ class ProfilePocketOp(PocketOp):
     stepdown: float = 1.0
     finish_allowance: float = 0.1
     chord_error: float = 0.01
+    # Rest machining: the largest cutter of this pass, and the diameter of the previous flat end mill
+    # whose left material this pass cuts (only near the corners that it could not reach).
+    max_tool_diameter: Optional[float] = None
+    rest_from_diameter: Optional[float] = None
 
     def __post_init__(self):
         from .milling_replay import finite
         from .profile_pocket_milling import pocket_tool_limit
         finite(self.depth, "profile pocket depth", positive=True)
         self.width, self.length = _profile_bounds(self.profile)
+        if self.rest_from_diameter is not None:
+            finite(self.rest_from_diameter, "rest machining previous cutter diameter", positive=True)
         if self.tool is None:
             maximum = pocket_tool_limit(self.profile, self.islands, finish_allowance=self.finish_allowance)
+            if self.max_tool_diameter is not None:
+                maximum = min(maximum, finite(self.max_tool_diameter, "maximum cutter diameter", positive=True))
             self.tool, self.tool_selection = _select_inventory_tool(
                 ToolRequirement("flat_endmill", max_diameter_mm=maximum, min_flute_length_mm=self.depth,
                     feature="profile_pocket", reason="selected cutter for the profile opening and island clearances", prefer_largest=True),
@@ -2893,7 +2901,8 @@ class ProfilePocketOp(PocketOp):
         result, self._pocket_toolpath, self._material_pass_states, self._pass_reports, self._target_comparison = run_profile_pocket(
             shape, self.profile, tool=self.tool, depth=self.depth, islands=self.islands, through=self.through,
             face_selector=self.face_selector, stepdown=self.stepdown, finish_allowance=self.finish_allowance,
-            chord_error=self.chord_error, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds), outside=outside)
+            chord_error=self.chord_error, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds), outside=outside,
+            rest_from_diameter=None if outside else self.rest_from_diameter)
         self._pocket_toolpath.metadata.update(tool=_tool_dict(self.tool), tool_selection=_tool_selection_dict(self.tool_selection),
             width_mm=self.width, length_mm=self.length)
         return result
