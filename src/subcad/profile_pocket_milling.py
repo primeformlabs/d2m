@@ -267,6 +267,19 @@ def _rest_region(target_region, outer, keep, tool, previous_diameter, center):
     return region
 
 
+def _no_rest_pass(shape, plane, face_selector, tool, feed, rpm, bounds):
+    """A rest pass with no material left: an empty toolpath and the incoming material."""
+    safe = bounds.zmax + max(2, tool.radius)
+    aggregate = Toolpath("profile_pocket", safe_z=safe, tool_type=tool.tool_type, tool_diameter_mm=tool.diameter,
+        feed_mm_min=feed, spindle_rpm=rpm, metadata={"coordinate_system": "part_mm", "tool_axis": list(plane.zDir.toTuple()),
+            "face_selector": face_selector, "rest_machining": True, "rest_material_left": False})
+    comparison = {"method": "rest_machining_nothing_left", "tolerance_verified": False, "manufacturing_ready": False}
+    aggregate.metadata.update(material_passes=[], operation_target_comparison=comparison, pass_count=0)
+    state = {"shape": shape, "pass_index": 0, "pass_role": "rest", "label": "No material left for the rest pass",
+             "geometry_replay": {"rest_material_left": False}}
+    return shape, aggregate, [state], [], comparison
+
+
 def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=False,
                        face_selector=">Z", stepdown=1, finish_allowance=0.1, chord_error=0.01,
                        feed=100, rpm=None, outside=False, rest_from_diameter=None):
@@ -329,7 +342,8 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
         if rest_from_diameter is not None:
             rest = _rest_region(target_region, outer, keep, tool, float(rest_from_diameter), center)
             if rest is None:
-                raise ValueError("The previous cutter left no material that this rest pass can reach.")
+                # Nothing left for this cutter: no moves, no time, the material stays as it is.
+                return _no_rest_pass(shape, plane, face_selector, tool, feed, rpm, bounds)
             center, rough_center = rest, rest
     maximum = finite((tool.safe_limits or {}).get("max_stepdown_mm", tool.diameter / 2), "maximum pocket stepdown", positive=True)
     stepdown = min(stepdown, maximum, tool.diameter / 2)
