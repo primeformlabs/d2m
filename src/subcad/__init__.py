@@ -19,7 +19,7 @@ Usage::
 """
 
 from .stock import Stock
-from .program_mode import program_mode, is_program_mode
+from .program_mode import program_mode, is_program_mode, feeds_speeds
 from .process_plan import ProcessPlan, OperationStep
 from .machine_context import MachineContext, load_machine_context
 from .controller_context import ControllerContext, load_controller_context
@@ -145,6 +145,7 @@ __all__ = [
     "Stock",
     "program_mode",
     "is_program_mode",
+    "feeds_speeds",
     "ProcessPlan",
     "OperationStep",
     "MachineContext",

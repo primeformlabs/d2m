@@ -73,6 +73,13 @@ def get_feeds_speeds(
     Returns dict with ``'error'`` key if the combination is not found, or
     an empty dict if the rules module is unavailable.
     """
+    from .program_mode import feeds_speeds_provider
+    provider = feeds_speeds_provider()
+    if provider is not None:
+        # The caller's own cutting data (D2O #729): its tools, its material groups, its machine.
+        supplied = provider(tool_type, tool_diameter_mm, material)
+        if supplied:
+            return dict(supplied)
     if _kg_available:
         return _kg_get_feeds_speeds(tool_type, tool_diameter_mm, material)
     return {}

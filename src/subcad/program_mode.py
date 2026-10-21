@@ -24,3 +24,23 @@ def program_mode(enabled: bool = True):
         yield
     finally:
         _PROGRAM_MODE.reset(token)
+
+
+_FEEDS_SPEEDS: ContextVar = ContextVar("subcad_feeds_speeds_provider", default=None)
+
+
+def feeds_speeds_provider():
+    return _FEEDS_SPEEDS.get()
+
+
+@contextmanager
+def feeds_speeds(provider):
+    """Use the caller's cutting data in this block.
+
+    ``provider(tool_type, tool_diameter_mm, material)`` returns the ``get_feeds_speeds`` dict
+    (``rpm``, ``feed_rate_mm_min`` and the other keys), or None for the built-in handbook."""
+    token = _FEEDS_SPEEDS.set(provider)
+    try:
+        yield
+    finally:
+        _FEEDS_SPEEDS.reset(token)
