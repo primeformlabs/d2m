@@ -7,6 +7,7 @@ import math
 from .milling_replay import _boolean, finite, clean_flat_result
 from .profile_milling import _setup_plane
 from .toolpath import Toolpath, ToolpathMove
+from .program_mode import is_program_mode
 
 
 def point_geometry(tool):
@@ -94,6 +95,20 @@ def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z"
             "point_angle_deg": tool.tip_angle, "tip_diameter_mm": tool.tip_diameter,
             "point_length_mm": point_height, "full_diameter_depth_mm": None if spot else full_depth,
             "tip_depth_mm": travel, "depth_reference": "tip" if spot else "full_diameter"})
+    if is_program_mode():
+        # The same moves for every peck, one cut to the full tip depth (program_mode.py).
+        start = (cx, cy * mirror, safe)
+        for index in range(1, count + 1):
+            end = (cx, cy * mirror, bounds.zmax - min(index * step, travel))
+            moves = [ToolpathMove("rapid", start), ToolpathMove("plunge", end, feed=feed, spindle_rpm=rpm),
+                ToolpathMove("retract", start)]
+            path.moves.extend(replace(move, position=plane.toWorldCoords(move.position).toTuple()) for move in moves)
+        cut = _boolean(local.val(), [axial_sweep(tool, start, (cx, cy * mirror, bounds.zmax - travel))], "cut")
+        world = shape.newObject([cut.transformShape(plane.rG)])
+        path.metadata.update(material_passes=[], pass_plan={"strategy": operation, "total_passes": count}, program_mode=True)
+        state = {"shape": world, "pass_index": count, "pass_role": "program", "label": "After the program operation",
+            "geometry_replay": {"program_mode": True}}
+        return world, path, [state], []
     result, states, reports = local, [], []
     for index in range(1, count + 1):
         start = (cx, cy * mirror, safe)

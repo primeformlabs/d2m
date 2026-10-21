@@ -13,6 +13,7 @@ from .milling_replay import finite, _boolean, validate_cutter, clean_flat_result
 from .pocket_geometry import rounded_rectangle
 from .profiles import normalize_profile_points
 from .toolpath import Toolpath, ToolpathMove
+from .program_mode import is_program_mode
 
 
 def _profile_wire(profile: Any):
@@ -251,7 +252,11 @@ def run_profile_contour(shape, profile, *, tool, depth: float, side: str = "outs
         x, y = points[-1]
         path.append(ToolpathMove("retract", (x, y, safe)))
         before = result.val().Volume()
-        result, report = _replay_closed_contour(result, path, tool)
+        if is_program_mode() and index < len(levels):
+            # Program mode cuts only at the finish level: the same moves, one cut (program_mode.py).
+            report = {"program_mode": True}
+        else:
+            result, report = _replay_closed_contour(result, path, tool)
         start = len(aggregate.moves)
         aggregate.moves.extend(replace(move, position=plane.toWorldCoords(move.position).toTuple()) for move in path.moves)
         report.update(pass_index=index, pass_role=role, move_start_index=start,

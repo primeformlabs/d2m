@@ -7,6 +7,7 @@ import math
 from .milling_replay import _boolean, finite, replay_pass, validate_cutter, _horizontal_sweep, _cutter, clean_flat_result
 from .profile_milling import _profile_wire, _linearized_wire, _setup_plane, _replay_closed_contour
 from .toolpath import Toolpath, ToolpathMove
+from .program_mode import is_program_mode
 
 
 def pocket_tool_limit(profile, islands=(), *, finish_allowance=0.1):
@@ -116,6 +117,14 @@ def _replay_open_boundary(shape, path, tool):
         "manufacturing_ready": False, "verification_status": "not_verified"}
 
 
+def _segment_distance(point, first, second):
+    """Distance from a point to the segment first-second (2D)."""
+    dx, dy = second[0] - first[0], second[1] - first[1]
+    length = dx * dx + dy * dy
+    t = 0.0 if length <= 0 else max(0.0, min(1.0, ((point[0] - first[0]) * dx + (point[1] - first[1]) * dy) / length))
+    return math.dist(point, (first[0] + t * dx, first[1] + t * dy))
+
+
 def _clearing_paths(region, outer, islands, *, z, safe, tool, feed, rpm, role, allowance, chord):
     import cadquery as cq
     if not region.Faces():
@@ -134,13 +143,20 @@ def _clearing_paths(region, outer, islands, *, z, safe, tool, feed, rpm, role, a
     if rows > 500:
         raise ValueError("The pocket exceeds the raster row limit. Divide the operation into smaller regions.")
     paths = []
-    for row in range(rows + 1):
-        y = bounds.ymin + bounds.ylen * row / rows
-        line = cq.Edge.makeLine(cq.Vector(bounds.xmin - 1, y, 0), cq.Vector(bounds.xmax + 1, y, 0))
-        clipped = _boolean(region, [line], "common")
-        intervals = sorted((min(edge.startPoint().x, edge.endPoint().x), max(edge.startPoint().x, edge.endPoint().x))
-            for edge in clipped.Edges() if edge.Length() > 1e-7)
-        for start, end in intervals:
+    levels = [bounds.ymin + bounds.ylen * row / rows for row in range(rows + 1)]
+    # One boolean clips every raster line (not one boolean for each line); each clipped piece
+    # keeps the y of its line.
+    lines = [cq.Edge.makeLine(cq.Vector(bounds.xmin - 1, y, 0), cq.Vector(bounds.xmax + 1, y, 0)) for y in levels]
+    clipped_rows: dict[int, list[tuple[float, float]]] = {}
+    for edge in _boolean(region, [cq.Compound.makeCompound(lines)], "common").Edges():
+        if edge.Length() <= 1e-7:
+            continue
+        mid = (edge.startPoint().y + edge.endPoint().y) / 2
+        row = min(range(len(levels)), key=lambda index: abs(levels[index] - mid))
+        clipped_rows.setdefault(row, []).append(
+            (min(edge.startPoint().x, edge.endPoint().x), max(edge.startPoint().x, edge.endPoint().x)))
+    for row, y in enumerate(levels):
+        for start, end in sorted(clipped_rows.get(row, [])):
             points = [(start, y), (end, y)]
             if row % 2:
                 points.reverse()
@@ -154,13 +170,21 @@ def _clearing_paths(region, outer, islands, *, z, safe, tool, feed, rpm, role, a
             # Islands can meet the outer wall. A complete boundary loop would
             # then cut the protected island. Clip every boundary segment too.
             chains, current = [], []
-            for first, second in zip(points, points[1:]):
-                if math.dist(first, second) < 1e-8:
-                    continue
-                edge = cq.Edge.makeLine(cq.Vector(*first, 0), cq.Vector(*second, 0))
-                clipped = _boolean(region, [edge], "common")
+            pairs = [(first, second) for first, second in zip(points, points[1:]) if math.dist(first, second) >= 1e-8]
+            # One boolean clips every boundary segment; each clipped piece goes back to the segment
+            # that it lies on (not one boolean for each segment).
+            pieces: dict[int, list] = {}
+            if pairs:
+                edges = [cq.Edge.makeLine(cq.Vector(*first, 0), cq.Vector(*second, 0)) for first, second in pairs]
+                for part in _boolean(region, [cq.Compound.makeCompound(edges)], "common").Edges():
+                    if part.Length() <= 1e-7:
+                        continue
+                    centre = part.positionAt(0.5)
+                    pieces.setdefault(min(range(len(pairs)), key=lambda index: _segment_distance(
+                        (centre.x, centre.y), *pairs[index])), []).append(part)
+            for index, (first, second) in enumerate(pairs):
                 segments = []
-                for part in clipped.Edges():
+                for part in pieces.get(index, []):
                     if part.Length() <= 1e-7:
                         continue
                     ends = [(part.startPoint().x, part.startPoint().y), (part.endPoint().x, part.endPoint().y)]
@@ -290,6 +314,20 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
             "finish_allowance_mm": allowance, "chord_error_mm": chord, "waste_discarded": False})
     aggregate.metadata["floor_allowance_mm"] = floor_allowance
     aggregate.metadata["open_stock_edges"] = open_stock_edges
+    if is_program_mode():
+        # The same moves, one cut of the target region, no pass states (program_mode.py).
+        for path in paths:
+            aggregate.moves.extend(replace(move, position=plane.toWorldCoords(move.position).toTuple()) for move in path.moves)
+        solids = [cq.Solid.extrudeLinear(face.outerWire(), face.innerWires(), cq.Vector(0, 0, depth)).translate(
+            (0, 0, bounds.zmax - depth)) for face in target_region.Faces()]
+        cut = _boolean(local.val(), [cq.Compound.makeCompound(solids)], "cut")
+        world = shape.newObject([cut.transformShape(plane.rG)])
+        comparison = {"method": "program_mode_target_region", "tolerance_verified": False, "manufacturing_ready": False}
+        aggregate.metadata.update(material_passes=[], operation_target_comparison=comparison, program_mode=True,
+            pass_count=len(paths))
+        state = {"shape": world, "pass_index": len(paths), "pass_role": "program", "label": "After the program operation",
+            "geometry_replay": {"program_mode": True}}
+        return world, aggregate, [state], [], comparison
     result, states, reports = local, [], []
     completed_paths = {}
     current_volume = local.val().Volume()
