@@ -218,7 +218,7 @@ def _run_local_loft(shape, profiles, *, tool, tolerance_mm, stepdown, chord_erro
         profile = _section_at(sections, z)
         result, path, retained, checks, _ = run_profile_pocket(result, profile, tool=tool,
             depth=bounds.zmax - z, face_selector=">Z", stepdown=depth, finish_allowance=0,
-            chord_error=chord, feed=feed, rpm=rpm, outside=True)
+            chord_error=chord, feed=feed, rpm=rpm, outside=True, layers=False)
         if len(states) + len(retained) > 1000:
             raise ValueError("The loft exceeds the retained pass limit. Divide the operation into smaller regions.")
         offset = len(aggregate.moves)
