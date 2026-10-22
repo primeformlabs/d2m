@@ -184,12 +184,12 @@ def face_paths(face, tolerance_mm: float = TARGET_TOLERANCE_MM) -> Paths:
 def _segment_arcs(points: np.ndarray, centers: np.ndarray, tree, radius: float) -> np.ndarray:
     """For each segment i -> i+1 of a closed loop: the index of the cutter circle that it is a chord of, or -1.
 
-    A chord has both ends and its middle in the band from twice the arc tolerance inside the circle to the circle
+    A chord has both ends and its middle in the band from five times the arc tolerance inside the circle to the circle
     (integer rounding: a few nm). Two overlapping polygonal arcs of one circle meet inside this band."""
     following = np.roll(points, -1, axis=0)
     middle = (points + following) / 2
-    # pyclipper can end an arc with a chord somewhat deeper than its arc tolerance: allow twice the tolerance.
-    near, band = 4.0, 2 * ARC_TOLERANCE_MM * SCALE + 4.0
+    # pyclipper can close a circle with a chord deeper than its arc tolerance: allow five times the tolerance.
+    near, band = 4.0, 5 * ARC_TOLERANCE_MM * SCALE + 4.0
     result = np.full(len(points), -1)
 
     def on_band(values, center):
