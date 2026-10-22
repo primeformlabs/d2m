@@ -2902,7 +2902,7 @@ class ProfilePocketOp(PocketOp):
             shape, self.profile, tool=self.tool, depth=self.depth, islands=self.islands, through=self.through,
             face_selector=self.face_selector, stepdown=self.stepdown, finish_allowance=self.finish_allowance,
             chord_error=self.chord_error, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds), outside=outside,
-            rest_from_diameter=None if outside else self.rest_from_diameter)
+            rest_from_diameter=self.rest_from_diameter)
         self._pocket_toolpath.metadata.update(tool=_tool_dict(self.tool), tool_selection=_tool_selection_dict(self.tool_selection),
             width_mm=self.width, length_mm=self.length)
         return result
