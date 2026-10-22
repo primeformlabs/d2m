@@ -245,9 +245,10 @@ def _grown(region, distance):
     return faces[0] if len(faces) == 1 else _boolean(faces[0], faces[1:], "fuse")
 
 
-def _rest_region(target_region, outer, keep, tool, previous_diameter, center):
+def _rest_region(target_region, outer, keep, tool, previous_diameter, center, limit=None):
     """Rest machining: the part of the cutter-centre region near the material that a previous flat end mill
-    of ``previous_diameter`` left (its corners). None when nothing is left for this cutter."""
+    of ``previous_diameter`` left (its corners). None when nothing is left for this cutter.
+    ``limit``: the region that has material (an outside cut: the stock footprint, not the clearing margin)."""
     previous = previous_diameter / 2
     if previous <= tool.radius + 1e-6:
         raise ValueError("The rest pass cutter must be smaller than the previous cutter.")
@@ -256,6 +257,8 @@ def _rest_region(target_region, outer, keep, tool, previous_diameter, center):
     except ValueError:
         cleared = None
     left = target_region if cleared is None else _boolean(target_region, [cleared], "cut")
+    if limit is not None and left.Faces():
+        left = _boolean(left, [limit], "common")
     if not left.Faces() or sum(face.Area() for face in left.Faces()) <= 1e-6:
         return None
     zone = _grown(left, tool.radius + 1e-3)
@@ -317,7 +320,8 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
         if keep:
             raise ValueError("The outside clearing operation requires one retained profile and no additional islands.")
         keep = [outer]
-        margin = tool.diameter * 2
+        # A rest pass needs the margin of the previous cutter: its cleared region is computed in the same frame.
+        margin = max(tool.diameter, float(rest_from_diameter or 0)) * 2
         outer = cq.Workplane("XY").rect(bounds.xlen + margin, bounds.ylen + margin).val().translate(
             ((bounds.xmin + bounds.xmax) / 2, (bounds.ymin + bounds.ymax) / 2, 0))
     target_region = _region(outer, keep)
@@ -340,7 +344,9 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
         except ValueError:
             raise ValueError("The cutter and finish allowance do not fit the pocket region. Reduce the allowance or select another cutter.") from None
         if rest_from_diameter is not None:
-            rest = _rest_region(target_region, outer, keep, tool, float(rest_from_diameter), center)
+            footprint = cq.Face.makeFromWires(cq.Workplane("XY").rect(bounds.xlen, bounds.ylen).val().translate(
+                ((bounds.xmin + bounds.xmax) / 2, (bounds.ymin + bounds.ymax) / 2, 0))) if outside else None
+            rest = _rest_region(target_region, outer, keep, tool, float(rest_from_diameter), center, footprint)
             if rest is None:
                 # Nothing left for this cutter: no moves, no time, the material stays as it is.
                 return _no_rest_pass(shape, plane, face_selector, tool, feed, rpm, bounds)

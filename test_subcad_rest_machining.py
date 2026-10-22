@@ -72,3 +72,29 @@ def test_rest_pass_with_no_material_left_has_no_moves() -> None:
         assert rest["material_passes"] == []
         assert _path_length(rest) == 0
         assert rested.volume == pytest.approx(roughed.volume, rel=1e-9)
+
+
+L_PROFILE = {"type": "polygon", "points": [[-30, -20], [30, -20], [30, 0], [0, 0], [0, 20], [-30, 20]]}
+
+
+def test_outside_rest_pass_cuts_the_concave_corner_of_the_outer_profile() -> None:
+    with tool_inventory([BIG, SMALL], revision="rest-test", strict=True):
+        stock = Stock.rectangular(60, 40, 10)
+        middle = stock._shape.val().BoundingBox().center.z
+        roughed = stock.profile_cutout(L_PROFILE, through=True, finish_allowance=0, max_tool_diameter=16)
+        assert _last(roughed)["tool"]["diameter_mm"] == 16
+        assert roughed._shape.val().isInside(cq.Vector(1, 1, middle))
+        assert not roughed._shape.val().isInside(cq.Vector(20, 10, middle))
+
+        rested = roughed.profile_cutout(L_PROFILE, through=True, finish_allowance=0, max_tool_diameter=4,
+                                        rest_from_diameter=16)
+        rest = _last(rested)
+        assert rest["tool"]["diameter_mm"] == 4
+        assert not rested._shape.val().isInside(cq.Vector(1, 1, middle))
+        # The corner keeps the 4 mm cutter radius.
+        assert rested._shape.val().isInside(cq.Vector(0.3, 0.3, middle))
+        # Only the corner: no pass along the whole outline, and no cut in the air outside the stock.
+        full = _last(stock.profile_cutout(L_PROFILE, through=True, finish_allowance=0, max_tool_diameter=4))
+        assert 0 < _path_length(rest) < 0.35 * _path_length(full)
+        assert all(abs(move["position"][0]) <= 30 + 2 + 1e-6 and abs(move["position"][1]) <= 20 + 2 + 1e-6
+                   for move in rest["toolpath"]["moves"] if move["type"] in {"feed", "plunge"})
