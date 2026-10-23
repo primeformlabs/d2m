@@ -86,6 +86,16 @@ times its layer height). This combination needs setups along the part axes (the 
 
 ### Speed
 
+The closing of a flat cutter is built from the top layer down (`CutterReach._closing`): the shadow of a layer is the
+shadow above it plus its new strip, and a dilation distributes over a union. A layer whose shadow keeps its area
+keeps the closing of the layer above. A layer with a new strip dilates and erodes its whole shadow: with the closed
+holes dropped and the outlines cleaned to 0.5 µm this takes milliseconds. A window around the strip gives no gain:
+on a sloped outline the strip has hundreds of small pieces all around the part, and their dilation is the slow
+step (measured on NIST CTC 05). On nine parts this closing and the layer-by-layer reach of the earlier version
+(`SUBCAD_INCREMENTAL_CLOSING=0`) give the same left regions within 0.03 mm³ after the 1 µm contact opening.
+
+Other rules:
+
 * The faces mesh in parallel.
 * The reference setup divides its sloped layers only where some setup cuts (`reach_ranges`).
 * A cutter takes its free centres only within its radius of the region (`_unreached`), and the offset uses the
@@ -100,8 +110,9 @@ times its layer height). This combination needs setups along the part axes (the 
 | Value | mm | Reason |
 |---|---|---|
 | Mesh chord (`layers.MESH_DEFLECTION_MM`) | 0.001 | The part and stock sections. |
-| Cutter fit (`FIT_MM`) | 0.002 | The obstacle uses `r − 0.002`: the mesh chords and the offset chords lie inside the true surfaces, so a hole of the cutter size fits. |
-| Disk reach | `r − 0.001` | The cutter disk reaches the mesh chord of the part polygon, not past the true surface. |
+| Cutter fit (`FIT_MM`) | 0.0025 | The obstacle uses `r − 0.0025`: the mesh chords, the offset chords and the outline cleaning lie inside the true surfaces, so a hole of the cutter size fits. |
+| Disk reach (`REACH_INSET_MM`) | `r − 0.0015` | The cutter disk reaches the mesh chord of the part polygon, not past the true surface. |
+| Outline cleaning (`CLEAN_MM`) | 0.0005 | Before an offset of 1 mm or more, a vertex within 0.5 µm of the line of its neighbours goes (not in loops under 0.5 mm). |
 | Obstacle arc tolerance | 0.001 | Inside the fit. |
 | Contact tolerance (`layers.CONTACT_MM`) | 0.001 | Left material thinner than 1 µm does not count (as the layer replay). |
 
