@@ -41,9 +41,13 @@ thread), a profile cutter acts as a flat cutter with its tip at `z`.
 
 ### Drills
 
-A drill makes holes. It reaches only where its free centres form a small spot: a hole at most 10 % larger than the
-drill. It does not take out a pocket or the open stock by plunge milling. The drill point leaves its cone at a flat
-floor (for example a counterbore floor with a smaller hole below it).
+A drill makes holes (`DrillReach`). A hole is a small spot of free tool centres under the shadow of a layer: a
+closed hole at most 10 % larger than the drill. The drill does not take out a pocket, an open groove or the open
+stock by plunge milling. The layers are worked from the top down, so the drill finds each hole where its full disk
+fits. For each hole axis the deepest tip `t*` is a 1D search: the point goes down while `ρ(z − t) ≤ d(z) − fit` at
+the middle of every layer, where `d(z)` is the distance of the axis to the part section. The reach at the height `z`
+is the disk of radius `ρ(z − t*)`. A modelled drill point of the same angle is reached exactly. The drill point
+leaves its cone at a flat floor (for example a counterbore floor with a smaller hole below it).
 
 ### Reach
 
