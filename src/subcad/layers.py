@@ -548,10 +548,10 @@ class LayeredMaterial:
     def volume(self) -> float:
         return sum(area(layer.material) * layer.height for layer in self.layers)
 
-    def remove(self, sweep: Paths, z_tip: float, z_top: float = math.inf) -> float:
+    def remove(self, sweep: Paths, z_tip: float, z_top: float = math.inf, collect: list | None = None) -> float:
         """Remove the sweep region from the layers between the tool tip and the flute top.
 
-        Returns the removed volume (mm³)."""
+        Returns the removed volume (mm³). ``collect`` gets (z low, z high, removed region) of each layer."""
         box = bounds(sweep)
         removed = 0.0
         for layer in self.layers:
@@ -563,6 +563,8 @@ class LayeredMaterial:
             if not cut:
                 continue
             removed += area(cut) * layer.height
+            if collect is not None:
+                collect.append((layer.z_low, layer.z_high, cut))
             layer.set(difference(layer.material, sweep))
         return removed
 

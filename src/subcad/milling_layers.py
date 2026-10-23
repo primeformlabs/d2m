@@ -18,6 +18,12 @@ import math
 from . import layers as L
 
 
+# The operation player gets a B-Rep material state after each pass (True, the old player) or only the 2D removed
+# region of each pass (False: ``state["player_layers"]``, schema ``layer_player.SCHEMA``; the last pass keeps its
+# B-Rep result for the next operation). The B-Rep states are most of the time of a small operation.
+PLAYER_BREP_STATES = True
+
+
 class LayerCheckUnavailable(ValueError):
     """The layer model cannot represent this material (for example an open mesh)."""
 
@@ -57,11 +63,14 @@ class LayerReplay:
             raise LayerCheckUnavailable(str(error)) from error
         self.before = self.material.copy_material()
         self.snapshots = []
+        self.removed: list[list] = []  # (z low, z high, removed region) rows of each pass
         self.sweeps_by_level: dict[float, list] = {}
 
     def cut(self, path, method: str):
         z, sweep, info = path_sweep(path, self.tool)
-        removed = self.material.remove(sweep, z, z + self.tool.flute_length)
+        rows = []
+        removed = self.material.remove(sweep, z, z + self.tool.flute_length, collect=rows)
+        self.removed.append(rows)
         level = self.sweeps_by_level.setdefault(z, ([], []))
         level[0].extend(sweep)
         level[1].extend(info["points"])
@@ -74,6 +83,20 @@ class LayerReplay:
     def repeat(self):
         """A repeated path: no material change; keep the state of this pass."""
         self.snapshots.append(self.material.copy_material())
+        self.removed.append([])
+
+    def player_layers(self, index: int, frame: dict) -> dict:
+        """The 2D region that pass ``index`` (0-based) removes, as player bands in the setup frame."""
+        from .layer_player import SCHEMA, bands
+        return {"schema": SCHEMA, "frame": frame, "removed": bands(self.removed[index])}
+
+    def state(self, final, index: int, frame: dict):
+        """The material state of pass ``index`` for the player: the B-Rep state (``PLAYER_BREP_STATES``) or
+        None, with its 2D removed region in both cases."""
+        layers = self.player_layers(index, frame)
+        if index == len(self.removed) - 1:
+            return final, layers
+        return (self.state_shape(final, index) if PLAYER_BREP_STATES else None), layers
 
     def result_shape(self):
         """The B-Rep result: the incoming solid less the level prisms, deepest level first.

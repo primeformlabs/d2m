@@ -284,7 +284,8 @@ def _no_rest_pass(shape, plane, face_selector, tool, feed, rpm, bounds):
     return shape, aggregate, [state], [], comparison
 
 
-def _layer_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, depth, target_region, normal, sampled):
+def _layer_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, depth, target_region, normal, sampled,
+                        face_selector=">Z"):
     """The pass replay and the operation region check on 2.5D layers (``milling_layers.py``).
 
     The pass order, the pass reports, the repeated-path reuse and the retained states are the same
@@ -321,12 +322,15 @@ def _layer_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, de
     result = local.newObject([replay.result_shape()])
     result, cleaned = clean_flat_result(result)
     final = result.val()
+    from .layer_player import plane_frame
+    frame = plane_frame(face_selector, plane)
     for index, path in enumerate(paths):
         report = reports[index]
-        local_state = final if index == len(paths) - 1 else replay.state_shape(final, index)
-        world = shape.newObject([local_state.transformShape(plane.rG)])
+        local_state, layers = replay.state(final, index, frame)
+        world = None if local_state is None else shape.newObject([local_state.transformShape(plane.rG)])
         states.append({"shape": world, "pass_index": index + 1, "pass_role": path.metadata["pass_role"],
-            "label": f"After profile pocket {path.metadata['pass_role']} pass {index + 1}", "geometry_replay": report})
+            "label": f"After profile pocket {path.metadata['pass_role']} pass {index + 1}", "geometry_replay": report,
+            "player_layers": layers})
     reports[-1]["topology_cleaned"] = cleaned
     comparison = replay.comparison(face_paths(target_region), bounds.zmax - depth, bounds.zmax)
     aggregate.metadata.update(material_passes=reports, operation_target_comparison=comparison)
@@ -445,7 +449,7 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
     if layers:
         try:
             return _layer_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, depth, target_region,
-                                        normal, sampled)
+                                        normal, sampled, face_selector)
         except LayerCheckUnavailable:
             aggregate.moves.clear()  # The B-Rep replay below remains for material that the layers cannot represent.
     result, states, reports = local, [], []

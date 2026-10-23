@@ -190,7 +190,7 @@ def _replay_closed_contour(shape, path, tool):
         "manufacturing_ready": False, "verification_status": "not_verified"}
 
 
-def _layer_contour_replay(shape, local, plane, built, tool, bounds, finish, states, reports):
+def _layer_contour_replay(shape, local, plane, built, tool, bounds, finish, states, reports, face_selector=">Z"):
     """2.5D layer replay of the contour levels: removed volumes from 2D areas; one Boolean for the result."""
     replay = LayerReplay(local, bounds.zmax, [path.moves[1].position[2] for _, _, path, _ in built], tool)
     for index, role, path, has_curve in built:
@@ -200,10 +200,13 @@ def _layer_contour_replay(shape, local, plane, built, tool, bounds, finish, stat
     result, cleaned = clean_flat_result(local.newObject([replay.result_shape()]))
     reports[-1]["topology_cleaned"] = cleaned
     final = result.val()
+    from .layer_player import plane_frame
+    frame = plane_frame(face_selector, plane)
     for position, (index, role, path, _) in enumerate(built):
-        local_state = final if position == len(built) - 1 else replay.state_shape(final, position)
-        states.append({"shape": shape.newObject([local_state.transformShape(plane.rG)]), "pass_index": index,
-            "pass_role": role, "label": f"After profile contour {role} pass {index}", "geometry_replay": reports[position]})
+        local_state, layers = replay.state(final, position, frame)
+        states.append({"shape": None if local_state is None else shape.newObject([local_state.transformShape(plane.rG)]),
+            "pass_index": index, "pass_role": role, "label": f"After profile contour {role} pass {index}",
+            "geometry_replay": reports[position], "player_layers": layers})
     return True
 
 
@@ -283,7 +286,7 @@ def run_profile_contour(shape, profile, *, tool, depth: float, side: str = "outs
     done = False
     if not is_program_mode():
         try:
-            done = _layer_contour_replay(shape, local, plane, built, tool, bounds, finish, states, reports)
+            done = _layer_contour_replay(shape, local, plane, built, tool, bounds, finish, states, reports, face_selector)
         except LayerCheckUnavailable:
             # The B-Rep replay below remains for material that the layers cannot represent.
             aggregate.moves.clear()
