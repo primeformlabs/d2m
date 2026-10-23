@@ -203,6 +203,8 @@ class SetupLayers:
     face: float = 0.0  # the setup face: the part top in the setup frame (the plan faces it first)
     planar: list = field(default_factory=list)  # the heights of the horizontal faces (floors)
     run: list = field(default_factory=list)     # the first layer of the run of equal part sections of each layer
+    part_low: list = field(default_factory=list)   # part section just above the bottom of each layer
+    part_high: list = field(default_factory=list)  # part section just below the top of each layer
 
     @property
     def count(self) -> int:
@@ -314,8 +316,11 @@ def setup_layers(stock_mesh: L.SolidMesh, part_mesh: L.SolidMesh, setup, chord: 
         edge = min(1e-6, (b - a) / 4)
         result.stock.append(_section(stock, middle, b - a))
         mid = _section(part, middle, b - a)
+        low, high = _section(part, a + edge, edge), _section(part, b - edge, edge)
         result.part.append(mid)
-        result.part_band.append(L.union(mid, L.union(_section(part, a + edge, edge), _section(part, b - edge, edge))))
+        result.part_low.append(low)
+        result.part_high.append(high)
+        result.part_band.append(L.union(mid, L.union(low, high)))
     for index, band in enumerate(result.part_band):
         same = index and band == result.part_band[index - 1]
         result.run.append(result.run[-1] if same else index)
@@ -708,30 +713,34 @@ class DrillReach:
         return 0.0 if inside > 0 else best / L.SCALE
 
     def _deepest_tip(self, centre, index: int) -> float:
-        """The lowest tip height of a plunge on the axis: every layer from the tip up keeps ρ(top - t) within the
-        distance of the axis to its part section (less the fit), and the reach depth holds."""
+        """The lowest tip height of a plunge on the axis: every layer from the tip up to the spot layer keeps the
+        drill radius within the distance of the axis to its part section (less the fit), and the reach depth holds.
+        From the spot layer up, the spot itself proves the fit (the shadow holds every layer above)."""
         layers, cutter = self.layers, self.cutter
         c = cutter.profile_height
         lowest = max(layers.z_low - c, layers.face - cutter.reach_depth)
+        spot_bottom = layers.limits[index]
         distances = {}
 
-        def distance(k):
-            if k not in distances:
-                distances[k] = self._distance(centre, layers.part[k])
-            return distances[k]
+        def distance(k, which):
+            if (k, which) not in distances:
+                sections = (layers.part_low, layers.part, layers.part_high)[which]
+                distances[(k, which)] = self._distance(centre, sections[k])
+            return distances[(k, which)]
 
         def fits(tip):
-            # Each layer at its middle: the drill radius there against the distance of the axis to the middle section
-            # (a modelled drill point of the same angle fits; the error is the layer chord bound).
+            # Each layer at its bottom, middle and top: the drill radius there against the distance of the axis to the
+            # part section there. Within a layer the drill point and a sloped wall are straight lines, so the three
+            # heights decide (a modelled drill point of the same angle fits exactly).
             for k in range(layers.layer_at(tip) if tip > layers.z_low else 0, layers.count):
                 bottom, top = layers.limits[k], layers.limits[k + 1]
                 if top <= tip:
                     continue
-                if bottom >= tip + c:
-                    break  # above the point: the straight part of the drill passed the shadow test of the spot
-                height = (bottom + top) / 2 - tip
-                if height > 0 and cutter.radius_at(height) - FIT_MM > distance(k):
-                    return False
+                if bottom >= spot_bottom - L.Z_MERGE_MM:
+                    break  # the spot layer and above: the drill passed the shadow test of the spot
+                for which, height in enumerate((bottom - tip, (bottom + top) / 2 - tip, top - tip)):
+                    if height > 0 and cutter.radius_at(height) - FIT_MM > distance(k, which):
+                        return False
             return True
         high = layers.limits[index]
         if not fits(high):
