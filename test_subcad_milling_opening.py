@@ -112,3 +112,23 @@ def test_player_bands_hold_the_removed_volume_of_each_pass():
         total += volume
         reported += state["geometry_replay"]["removed_volume_mm3"]
     assert total == pytest.approx(reported, rel=2e-3)
+
+
+def test_drill_plunges_make_an_open_groove_and_leave_the_cusps():
+    # A half-round groove D6.5 through the part at its edge x = 50, and a slot of two plunges 5 mm apart.
+    groove = cq.Workplane().box(100, 60, 20).cut(cq.Workplane().cylinder(30, 3.25).translate((50, 0, 0)))
+    part = groove.cut(cq.Workplane().cylinder(30, 3.25).translate((-20, 0, 0)))
+    part = part.cut(cq.Workplane().cylinder(30, 3.25).translate((-15, 0, 0)))
+    part = part.cut(cq.Workplane().box(5, 6.5, 30).translate((-17.5, 0, 0))).val()
+    drill = {"tool_type": "drill", "diameter_mm": 6.5, "tip_angle_deg": 118, "flute_length_mm": 50, "stickout_mm": 50}
+    groove_volume = math.pi * 3.25 ** 2 * 20 / 2
+    slot_volume = (math.pi * 3.25 ** 2 + 5 * 6.5) * 20
+    # Without plunge points a drill makes only closed holes of its size: the open groove and the slot stay.
+    plain = left(part, [">Z"], [drill])["left_after_all_setups_mm3"]
+    assert plain == pytest.approx(groove_volume + slot_volume, rel=1e-3)
+    # With the plunge points of the plan: the groove is made; the slot keeps the two cusps between the plunges.
+    plunged = left(part, [">Z"], [{**drill, "plunges": [[50, 0, 0], [-20, 0, 0], [-15, 0, 0]]}])
+    half = 2.5
+    # The slot region between the plunge axes (x from -20 to -15) less the two disks: two cusps at y = ±3.25.
+    between = 5 * 6.5 - (math.pi * 3.25 ** 2 - 2 * (3.25 ** 2 * math.acos(half / 3.25) - half * math.sqrt(3.25 ** 2 - half ** 2)))
+    assert plunged["left_after_all_setups_mm3"] == pytest.approx(between * 20, rel=2e-2)

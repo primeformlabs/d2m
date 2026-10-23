@@ -130,6 +130,9 @@ class Cutter:
     shank_diameter: float = 0.0
     tip_angle: float = 0.0
     name: str = ""
+    # Drill: the plunge points of its passes (part frame, any point on each drill axis). Each plunge is a hole of the
+    # drill radius down to the deepest tip that fits, with the point cone; the drill still does not side-cut.
+    plunges: tuple = ()
 
     @classmethod
     def of(cls, tool) -> "Cutter":
@@ -141,7 +144,8 @@ class Cutter:
             return cls(str(tool.get("tool_type") or "flat_endmill"), get("diameter_mm", "diameter"),
                        get("corner_radius_mm", "corner_radius"), get("flute_length_mm", "flute_length", default=50.0),
                        get("stickout_mm", default=35.0), get("reach_mm"), get("shank_diameter_mm", "shank_diameter"),
-                       get("tip_angle_deg", "tip_angle"), str(tool.get("catalog_id") or tool.get("label") or ""))
+                       get("tip_angle_deg", "tip_angle"), str(tool.get("catalog_id") or tool.get("label") or ""),
+                       tuple(tuple(float(value) for value in point) for point in tool.get("plunges") or ()))
         return cls(tool.tool_type, float(tool.diameter), float(tool.corner_radius or 0.0), float(tool.flute_length),
                    float(tool.stickout_mm), float(tool.reach_mm or 0.0), float(tool.shank_diameter or 0.0),
                    float(tool.tip_angle or 0.0), tool.catalog_id or "")
@@ -722,35 +726,12 @@ class DrillReach:
         self.holes: dict[tuple, float] = {}   # (x, y) in nm -> deepest tip height
         self._spots: dict[tuple, list] = {}
         self._clips: dict[tuple, list] = {}
-        self._flat: dict[int, list] = {}
-
-    def _unreached_flat(self, tip: float, radius: float, region) -> list:
-        """A flat cutter (or a profile cutter on a straight stretch) with its tip at the height: the region inside the
-        closing of the shadow, all near the region. A centre within the radius of the region matters, and the
-        obstacle there depends only on the shadow within twice the radius: the shadow is clipped to the region grown
-        by twice the radius and a margin, then grown by the radius less the fit."""
-        layers = self.layers
-        index = layers.layer_at(tip) if tip > layers.z_low else 0
-        if self.cutter.profile_height <= 0 and abs(layers.limits[index] - tip) > L.Z_MERGE_MM and tip > layers.z_low:
-            index = self._first_layer_from(tip)
-        shadow = layers.shadow[index] if index < layers.count else []
-        reach = max(radius - L.MESH_DEFLECTION_MM, 0.0)
-        if not shadow:
-            return []
-        key = (_signature(region), _signature(shadow), round(radius, 7))
-        if key in self._eroded:
-            return self._eroded[key]
-        far = _near(region, 2 * radius + 4 * NEAR_ARC_MM)
-        local = L.intersection(shadow, far)
-        if not local:
-            result = []
-        else:
-            obstacle = _offset(local, _fit(radius))
-            free = L.difference(_near(region, reach + 2 * NEAR_ARC_MM), obstacle)
-            result = L.difference(region, _offset(free, reach)) if free else region
-        self._eroded[key] = result
-        return result
-
+        for point in cutter.plunges:
+            local = layers.setup.to_setup(np.asarray(point, float)[None, :3])[0]
+            centre = (int(round(local[0] * L.SCALE)), int(round(local[1] * L.SCALE)))
+            key = (int(round(centre[0], -4)), int(round(centre[1], -4)))
+            if key not in self.holes:
+                self.holes[key] = self._deepest_tip(centre, None)
 
     def _clip(self, paths, clip):
         if not paths:
@@ -809,7 +790,8 @@ class DrillReach:
         layers, cutter = self.layers, self.cutter
         c = cutter.profile_height
         lowest = max(layers.z_low - c, layers.face - cutter.reach_depth)
-        spot_bottom = layers.limits[index]
+        # A plunge of the plan (no spot): every layer up to the top must let the drill pass.
+        spot_bottom = layers.limits[index] if index is not None else math.inf
         distances = {}
 
         def distance(k, which):
@@ -832,7 +814,7 @@ class DrillReach:
                     if height > 0 and cutter.radius_at(height) - FIT_MM > distance(k, which):
                         return False
             return True
-        high = layers.limits[index]
+        high = layers.limits[index] if index is not None else layers.z_high
         if not fits(high):
             return high
         low = lowest
