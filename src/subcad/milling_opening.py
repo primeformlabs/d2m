@@ -832,6 +832,21 @@ class SetupVerdict:
     seconds: float
     reach_low: float = -math.inf  # below this height no cutter of the setup cuts (its left is all the material)
 
+    def band_edges(self, paths):
+        cache = self.__dict__.setdefault("_edges", {})
+        key = id(paths)
+        if key not in cache:
+            cache[key] = (paths, _edges(paths))
+        return cache[key][1]
+
+    def band_box(self, paths):
+        """The bounds of a left region, kept (the setup combination asks each region for each reference plane)."""
+        cache = self.__dict__.setdefault("_boxes", {})
+        key = id(paths)
+        if key not in cache:
+            cache[key] = (paths, L.bounds(paths))
+        return cache[key][1]
+
     def to_dict(self, *, regions: int = 10):
         return {"setup": self.layers.setup.to_dict(), "layer_count": self.layers.count,
                 "z_range_mm": [self.layers.z_low, self.layers.z_high], "setup_face_mm": self.layers.face, "chord_mm": self.layers.chord_mm,
@@ -935,21 +950,25 @@ def _axis_of(vector) -> tuple[int, float]:
     return axis, float(np.sign(vector[axis]))
 
 
-def _line_intervals(paths, coordinate: int, value: float):
+def _edges(paths):
+    """All the edges of a region as two arrays of start and end points."""
+    if not paths:
+        return np.zeros((0, 2)), np.zeros((0, 2))
+    points = [np.asarray(path, float) for path in paths]
+    return np.concatenate(points), np.concatenate([np.roll(item, -1, axis=0) for item in points])
+
+
+def _line_intervals(paths, coordinate: int, value: float, edges=None):
     """The intervals of the region on the line (x or y of the paths) = value (even-odd crossings)."""
     other = 1 - coordinate
-    crossings = []
+    a, b = edges if edges is not None else _edges(paths)
     target = value * L.SCALE
-    for path in paths:
-        points = np.asarray(path, float)
-        a, b = points, np.roll(points, -1, axis=0)
-        ca, cb = a[:, coordinate], b[:, coordinate]
-        cross = ((ca <= target) & (cb > target)) | ((cb <= target) & (ca > target))
-        if not np.any(cross):
-            continue
-        t = (target - ca[cross]) / (cb[cross] - ca[cross])
-        crossings.extend((a[cross, other] + t * (b[cross, other] - a[cross, other])).tolist())
-    crossings.sort()
+    ca, cb = a[:, coordinate], b[:, coordinate]
+    cross = ((ca <= target) & (cb > target)) | ((cb <= target) & (ca > target))
+    if not np.any(cross):
+        return []
+    t = (target - ca[cross]) / (cb[cross] - ca[cross])
+    crossings = np.sort(a[cross, other] + t * (b[cross, other] - a[cross, other])).tolist()
     return list(zip(crossings[0::2], crossings[1::2]))
 
 
@@ -993,11 +1012,15 @@ def section_in(verdict: SetupVerdict, reference: Setup, z: float):
         # Below the reach of this setup: all the material stays (one rectangle over the whole plane width).
         wide = 1e5 * L.SCALE
         rects.append(rectangle(-wide, wide, verdict.layers.z_low - 1.0, min(reach_low, verdict.layers.z_high + 1.0)))
+    target = level * L.SCALE
     for bands in verdict.left:
         for low, high, paths in bands:
             if high <= reach_low + L.Z_MERGE_MM:
                 continue
-            for start, end in _line_intervals(paths, normal_axis, level):
+            box = verdict.band_box(paths)
+            if box is None or not box[normal_axis] <= target <= box[normal_axis + 2]:
+                continue
+            for start, end in _line_intervals(paths, normal_axis, level, verdict.band_edges(paths)):
                 # The rectangle: the in-plane coordinate of the other frame from start to end, z from low to high.
                 rects.append(rectangle(start, end, low, high))
     return L.union(rects)
