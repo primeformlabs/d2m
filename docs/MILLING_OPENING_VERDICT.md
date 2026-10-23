@@ -49,6 +49,12 @@ the middle of every layer, where `d(z)` is the distance of the axis to the part 
 is the disk of radius `ρ(z − t*)`. A modelled drill point of the same angle is reached exactly. The drill point
 leaves its cone at a flat floor (for example a counterbore floor with a smaller hole below it).
 
+A drill cutter can also carry the plunge points of its passes (`Cutter.plunges`, part frame, any point on each drill
+axis). Each plunge is a hole of the drill radius down to the deepest tip that fits, with the point cone; the fit is
+checked from the tip up to the top. An open groove or a slot made by repeated plunges is reached; the region left
+is the cusps between the plunges. A spot face that is open at its side (the part around it is lower, so the free
+centres are not a closed spot) is found only through its plunge point.
+
 ### Reach
 
 A layer deeper below the setup face than `min(flute length, stick-out, reach)` is out of reach for that cutter.
@@ -77,6 +83,17 @@ times its layer height). This combination needs setups along the part axes (the 
   Deeper, no cutter of that setup cuts, so its left material is all the material and it adds no constraint.
 * The material of a layer is its middle section. The shadow takes the sections at the bottom, the middle and
   the top of each layer.
+
+### Speed
+
+* The faces mesh in parallel.
+* The reference setup divides its sloped layers only where some setup cuts (`reach_ranges`).
+* A cutter takes its free centres only within its radius of the region (`_unreached`), and the offset uses the
+  smaller of two outlines: the free centres grown by the radius, or the local obstacle shrunk by the radius.
+* Before an offset, a loop that the offset closes is dropped (a hole narrower than twice the growth, an outer loop
+  narrower than twice the shrink). This is exact, and it keeps the many small holes of a large section out.
+* A layer band that leaves the shadow unchanged adds no offset. Equal inputs reuse their results.
+* A part mesh of 50,000 triangles or more gets one process for each setup.
 
 ### Tolerances
 
