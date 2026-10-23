@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "d2o-subcad"
-version = "0.2.23"
+version = "0.2.25"
 description = "SubCAD geometry, manufacturing plans, and operation simulation runtime"
 requires-python = ">=3.11"
 dependencies = [
@@ -13,6 +13,7 @@ dependencies = [
   "trimesh>=4.4.0",
   "scipy>=1.13.0",
   "rtree>=1.2.0",
+  "pyclipper>=1.3.0",
 ]
 
 [project.optional-dependencies]

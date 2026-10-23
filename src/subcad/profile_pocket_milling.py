@@ -8,6 +8,7 @@ from .milling_replay import _boolean, finite, replay_pass, validate_cutter, _hor
 from .profile_milling import _profile_wire, _linearized_wire, _setup_plane, _replay_closed_contour
 from .toolpath import Toolpath, ToolpathMove
 from .program_mode import is_program_mode
+from .milling_layers import LayerCheckUnavailable, LayerReplay
 
 
 def pocket_tool_limit(profile, islands=(), *, finish_allowance=0.1):
@@ -283,13 +284,68 @@ def _no_rest_pass(shape, plane, face_selector, tool, feed, rpm, bounds):
     return shape, aggregate, [state], [], comparison
 
 
+def _layer_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, depth, target_region, normal, sampled,
+                        face_selector=">Z"):
+    """The pass replay and the operation region check on 2.5D layers (``milling_layers.py``).
+
+    The pass order, the pass reports, the repeated-path reuse and the retained states are the same
+    as in the B-Rep replay. The removed volumes and the comparison are 2D areas times layer heights."""
+    from .layers import face_paths
+    replay = LayerReplay(local, bounds.zmax, [path.moves[1].position[2] for path in paths], tool)
+    states, reports, completed_paths = [], [], {}
+    for index, path in enumerate(paths, 1):
+        geometry_key = tuple((move.move_type, tuple(move.position)) for move in path.moves)
+        if geometry_key in completed_paths:
+            # Only material subtraction occurs in this loop. A repeated cutter path
+            # cannot remove material after its exact sweep was already subtracted.
+            preceding_index, preceding_report = completed_paths[geometry_key]
+            report = {**preceding_report, "repeated_pass_reused": True,
+                "reused_from_pass_index": preceding_index, "reuse_proof": "set_difference_idempotence",
+                "removed_volume_mm3": 0.0}
+            replay.repeat()
+        else:
+            kind = path.metadata["path_kind"]
+            cutting = [move for move in path.moves if move.move_type in {"plunge", "feed"}]
+            method = ("selected_cutter_raster_sweep" if kind == "raster" else "selected_cutter_closed_path_sweep"
+                      if math.dist(cutting[0].position, cutting[-1].position) < 1e-8 and len(cutting) > 3
+                      else "selected_cutter_boundary_segments")
+            report = replay.cut(path, method)
+            completed_paths[geometry_key] = (index, dict(report))
+        start = len(aggregate.moves)
+        aggregate.moves.extend(replace(move, position=plane.toWorldCoords(move.position).toTuple()) for move in path.moves)
+        report.update(pass_index=index, pass_role=path.metadata["pass_role"], path_kind=path.metadata["path_kind"],
+            move_start_index=start, move_end_index=len(aggregate.moves),
+            tool_axis=normal, profile_fidelity=path.metadata.get("profile_fidelity", "linear_profile"), source_profile_sampled=sampled)
+        reports.append(report)
+    if sum(report["removed_volume_mm3"] for report in reports) <= 1e-8:
+        raise ValueError("The pocket path does not remove material from the incoming stock.")
+    result = local.newObject([replay.result_shape()])
+    result, cleaned = clean_flat_result(result)
+    final = result.val()
+    from .layer_player import plane_frame
+    frame = plane_frame(face_selector, plane)
+    for index, path in enumerate(paths):
+        report = reports[index]
+        local_state, layers = replay.state(final, index, frame)
+        world = None if local_state is None else shape.newObject([local_state.transformShape(plane.rG)])
+        states.append({"shape": world, "pass_index": index + 1, "pass_role": path.metadata["pass_role"],
+            "label": f"After profile pocket {path.metadata['pass_role']} pass {index + 1}", "geometry_replay": report,
+            "player_layers": layers})
+    reports[-1]["topology_cleaned"] = cleaned
+    comparison = replay.comparison(face_paths(target_region), bounds.zmax - depth, bounds.zmax)
+    aggregate.metadata.update(material_passes=reports, operation_target_comparison=comparison)
+    return states[-1]["shape"], aggregate, states, reports, comparison
+
+
 def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=False,
                        face_selector=">Z", stepdown=1, finish_allowance=0.1, chord_error=0.01,
-                       feed=100, rpm=None, outside=False, rest_from_diameter=None):
+                       feed=100, rpm=None, outside=False, rest_from_diameter=None, layers=True):
     """Return material, actual toolpath, retained pass states and target comparison.
 
     ``rest_from_diameter``: rest machining. The passes cut only near the material that a previous flat end mill
-    of that diameter left; the boundary pass at the full depth makes the corners with the radius of this cutter."""
+    of that diameter left; the boundary pass at the full depth makes the corners with the radius of this cutter.
+    ``layers``: replay the passes on 2.5D layers (``milling_layers.py``); False keeps the B-Rep replay
+    (the loft operation compares its levels with the exact loft by B-Rep)."""
     import cadquery as cq
     if tool is None or tool.tool_type != "flat_endmill":
         raise ValueError("Native profile pocket replay requires a selected flat end mill.")
@@ -390,6 +446,12 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
         state = {"shape": world, "pass_index": len(paths), "pass_role": "program", "label": "After the program operation",
             "geometry_replay": {"program_mode": True}}
         return world, aggregate, [state], [], comparison
+    if layers:
+        try:
+            return _layer_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, depth, target_region,
+                                        normal, sampled, face_selector)
+        except LayerCheckUnavailable:
+            aggregate.moves.clear()  # The B-Rep replay below remains for material that the layers cannot represent.
     result, states, reports = local, [], []
     completed_paths = {}
     current_volume = local.val().Volume()

@@ -24,8 +24,10 @@ def test_rectangular_profile_leaves_selected_cutter_corner_material_and_retains_
     record = result.process_plan()["operations"][-1]
     assert len(result._state_history) == len(record["material_passes"]) + 1
     assert {row["pass_role"] for row in record["material_passes"]} == {"roughing", "finishing"}
-    assert sum(row["removed_volume_mm3"] for row in record["material_passes"]) == pytest.approx(removed)
-    assert record["operation_target_comparison"]["remaining_target_material_mm3"] == pytest.approx((4 - math.pi) * 8)
+    # Layer removal: 2D chords within 0.25 um of the cutter arcs (docs/MILLING_LAYER_REPLAY.md).
+    assert sum(row["removed_volume_mm3"] for row in record["material_passes"]) == pytest.approx(removed, rel=1e-4)
+    # The layer check: cutter chords within 0.25 um leave a little more corner material (docs/MILLING_LAYER_REPLAY.md).
+    assert record["operation_target_comparison"]["remaining_target_material_mm3"] == pytest.approx((4 - math.pi) * 8, rel=1e-3)
     assert record["operation_target_comparison"]["overcut_volume_mm3"] < 1e-6
     assert record["achieved_tolerance_estimate_mm"] is None
     assert record["geometry_status"] == "requires_review"
@@ -96,7 +98,8 @@ def test_six_faces_preserve_profile_coordinates_and_cutter_orientation(face, axi
 def test_matching_cutter_can_follow_a_point_or_line_center_path(profile, expected):
     stock = Stock.rectangular(16, 16, 8)
     result = stock.profile_pocket(profile, 2, tool=ToolSpec("flat_endmill", 4), finish_allowance=0)
-    assert stock.volume - result.volume == pytest.approx(expected, abs=1e-6)
+    # The result arcs come back from polygon vertices on the cutter circle (integer nm scale).
+    assert stock.volume - result.volume == pytest.approx(expected, abs=1e-4)
     comparison = result.process_plan()["operations"][-1]["operation_target_comparison"]
     assert comparison["remaining_target_material_mm3"] < 1e-6
     assert comparison["overcut_volume_mm3"] < 1e-6

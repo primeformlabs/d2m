@@ -51,7 +51,8 @@ def test_each_roughing_and_finishing_pass_has_its_actual_state_and_moves():
     assert [row["pass_role"] for row in reports] == ["roughing"] * 4 + ["finishing"]
     assert len(result._state_history) == 6
     assert all(row["removed_volume_mm3"] > 0 for row in reports)
-    assert sum(row["removed_volume_mm3"] for row in reports) == pytest.approx(stock.volume - result.volume)
+    # Layer removal (2D chords within 0.25 um) against the B-Rep result (docs/MILLING_LAYER_REPLAY.md).
+    assert sum(row["removed_volume_mm3"] for row in reports) == pytest.approx(stock.volume - result.volume, rel=1e-4)
     assert result._state_history[-1]["shape"].val().isSame(result._shape.val())
     assert record["achieved_tolerance_estimate_mm"] is None
     assert record["geometry_status"] == "requires_review"

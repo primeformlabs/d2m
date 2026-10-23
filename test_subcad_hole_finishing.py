@@ -32,7 +32,8 @@ def assert_retained(result, before, operation, axis):
         shape = state["shape"].val()
         assert shape.isValid()
         assert shape.Volume() <= previous + 1e-6
-        assert report["removed_volume_mm3"] == pytest.approx(previous - shape.Volume(), abs=1e-6)
+        # Layer removal (2D chords within 0.25 um) against the shown state (docs/MILLING_LAYER_REPLAY.md).
+        assert report["removed_volume_mm3"] == pytest.approx(previous - shape.Volume(), abs=1e-3)
         assert report["move_end_index"] > report["move_start_index"]
         previous = shape.Volume()
     assert record["manufacturing_ready"] is False

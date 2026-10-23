@@ -14,6 +14,7 @@ from .pocket_geometry import rounded_rectangle
 from .profiles import normalize_profile_points
 from .toolpath import Toolpath, ToolpathMove
 from .program_mode import is_program_mode
+from .milling_layers import LayerCheckUnavailable, LayerReplay
 
 
 def _profile_wire(profile: Any):
@@ -189,6 +190,26 @@ def _replay_closed_contour(shape, path, tool):
         "manufacturing_ready": False, "verification_status": "not_verified"}
 
 
+def _layer_contour_replay(shape, local, plane, built, tool, bounds, finish, states, reports, face_selector=">Z"):
+    """2.5D layer replay of the contour levels: removed volumes from 2D areas; one Boolean for the result."""
+    replay = LayerReplay(local, bounds.zmax, [path.moves[1].position[2] for _, _, path, _ in built], tool)
+    for index, role, path, has_curve in built:
+        reports.append(finish(index, role, path, has_curve, replay.cut(path, "selected_cutter_closed_path_sweep")))
+    if sum(report["removed_volume_mm3"] for report in reports) <= 1e-8:
+        raise ValueError("The compensated contour does not remove material from the incoming stock.")
+    result, cleaned = clean_flat_result(local.newObject([replay.result_shape()]))
+    reports[-1]["topology_cleaned"] = cleaned
+    final = result.val()
+    from .layer_player import plane_frame
+    frame = plane_frame(face_selector, plane)
+    for position, (index, role, path, _) in enumerate(built):
+        local_state, layers = replay.state(final, position, frame)
+        states.append({"shape": None if local_state is None else shape.newObject([local_state.transformShape(plane.rG)]),
+            "pass_index": index, "pass_role": role, "label": f"After profile contour {role} pass {index}",
+            "geometry_replay": reports[position], "player_layers": layers})
+    return True
+
+
 def run_profile_contour(shape, profile, *, tool, depth: float, side: str = "outside",
                         face_selector: str = ">Z", stepdown: float = 1,
                         finish_allowance: float = 0.1, chord_error: float = 0.01,
@@ -231,8 +252,7 @@ def run_profile_contour(shape, profile, *, tool, depth: float, side: str = "outs
             "safe_axis_position_mm": safe, "chord_error_mm": chord,
             "maximum_stepdown_mm": stepdown, "finish_allowance_mm": allowance,
             "waste_discarded": False})
-    result, states, reports = local, [], []
-    curved = False
+    built, curved = [], False
     for index, (z, role, leave) in enumerate(levels, 1):
         try:
             offsets = wire.offset2D((tool.radius + leave) * (1 if side == "outside" else -1), kind="arc")
@@ -251,22 +271,42 @@ def run_profile_contour(shape, profile, *, tool, depth: float, side: str = "outs
         path.moves.extend(ToolpathMove("feed", (x, y, z), feed=feed, spindle_rpm=rpm) for x, y in points[1:])
         x, y = points[-1]
         path.append(ToolpathMove("retract", (x, y, safe)))
-        before = result.val().Volume()
-        if is_program_mode() and index < len(levels):
-            # Program mode cuts only at the finish level: the same moves, one cut (program_mode.py).
-            report = {"program_mode": True}
-        else:
-            result, report = _replay_closed_contour(result, path, tool)
+        built.append((index, role, path, has_curve))
+
+    def finish(index, role, path, has_curve, report):
         start = len(aggregate.moves)
         aggregate.moves.extend(replace(move, position=plane.toWorldCoords(move.position).toTuple()) for move in path.moves)
         report.update(pass_index=index, pass_role=role, move_start_index=start,
-            move_end_index=len(aggregate.moves), removed_volume_mm3=before - result.val().Volume(),
+            move_end_index=len(aggregate.moves),
             tool_axis=normal, profile_fidelity="linearized_curve" if has_curve or sampled_profile else "linear_profile",
             chord_error_mm=chord if has_curve else None, source_profile_sampled=sampled_profile)
-        reports.append(report)
-        world = shape.newObject([result.val().transformShape(plane.rG)])
-        states.append({"shape": world, "pass_index": index, "pass_role": role,
-            "label": f"After profile contour {role} pass {index}", "geometry_replay": report})
+        return report
+
+    states, reports = [], []
+    done = False
+    if not is_program_mode():
+        try:
+            done = _layer_contour_replay(shape, local, plane, built, tool, bounds, finish, states, reports, face_selector)
+        except LayerCheckUnavailable:
+            # The B-Rep replay below remains for material that the layers cannot represent.
+            aggregate.moves.clear()
+            states.clear()
+            reports.clear()
+    if not done:
+        result = local
+        for index, role, path, has_curve in built:
+            before = result.val().Volume()
+            if is_program_mode() and index < len(levels):
+                # Program mode cuts only at the finish level: the same moves, one cut (program_mode.py).
+                report = {"program_mode": True}
+            else:
+                result, report = _replay_closed_contour(result, path, tool)
+            report = finish(index, role, path, has_curve, report)
+            report["removed_volume_mm3"] = before - result.val().Volume()
+            reports.append(report)
+            world = shape.newObject([result.val().transformShape(plane.rG)])
+            states.append({"shape": world, "pass_index": index, "pass_role": role,
+                "label": f"After profile contour {role} pass {index}", "geometry_replay": report})
     if shape.val().Volume() - states[-1]["shape"].val().Volume() <= 1e-8:
         raise ValueError("The compensated contour does not remove material from the incoming stock.")
     aggregate.metadata.update(material_passes=reports, profile_fidelity="linearized_curve" if curved or sampled_profile else "linear_profile")
