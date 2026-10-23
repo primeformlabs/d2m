@@ -54,7 +54,9 @@ Paths = list  # list of closed integer paths [(x, y), ...]
 # -- 2D polygon operations -------------------------------------------------------------------------
 
 def to_paths(loops_mm: Iterable[Sequence[Sequence[float]]]) -> Paths:
-    return [[(int(round(x * SCALE)), int(round(y * SCALE))) for x, y in loop] for loop in loops_mm if len(loop) >= 3]
+    # np.rint rounds half to even, as round() does.
+    return [[tuple(point) for point in np.rint(np.asarray(loop, float)[:, :2] * SCALE).astype(np.int64).tolist()]
+            for loop in loops_mm if len(loop) >= 3]
 
 
 def _clip(operation, subject: Paths, clip: Paths | None = None, *, fill=pyclipper.PFT_NONZERO) -> Paths:
@@ -444,7 +446,40 @@ class SolidMesh:
 
 
 def _join(keys: np.ndarray, points: np.ndarray):
-    """Join segments (one for each crossed triangle) into closed loops at their shared mesh edges."""
+    """Join segments (one for each crossed triangle) into closed loops at their shared mesh edges.
+
+    Each crossed mesh edge is the end of exactly two segments in a closed mesh; ``partner`` links the two ends."""
+    count = len(keys)
+    if count == 0:
+        return []
+    _, inverse, occurrences = np.unique(keys.reshape(-1), return_inverse=True, return_counts=True)
+    if np.any(occurrences != 2):
+        return _join_general(keys, points)  # a mesh edge with more than two crossings (touching solids)
+    order = np.argsort(inverse, kind="stable")
+    partner = np.empty(2 * count, np.int64)
+    partner[order[0::2]] = order[1::2]
+    partner[order[1::2]] = order[0::2]
+    partner = partner.tolist()
+    ends = points.reshape(-1, 2).tolist()
+    used = [False] * count
+    loops = []
+    for start in range(count):
+        if used[start]:
+            continue
+        loop, segment, enter = [], start, 0
+        while not used[segment]:
+            used[segment] = True
+            loop.append(tuple(ends[2 * segment + enter]))
+            position = partner[2 * segment + 1 - enter]
+            segment, enter = position >> 1, position & 1
+        if segment != start or enter != 0:
+            raise ValueError("The material mesh is not closed. The layer check cannot read its sections.")
+        loops.append(loop)
+    return loops
+
+
+def _join_general(keys: np.ndarray, points: np.ndarray):
+    """Join segments at their shared mesh edges when an edge has more than two segments."""
     point_of, neighbours = {}, defaultdict(list)
     for index in range(len(keys)):
         k0, k1 = int(keys[index, 0]), int(keys[index, 1])

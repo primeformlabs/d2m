@@ -598,6 +598,139 @@ class CutterReach:
         return result
 
 
+class DrillReach:
+    """A drill makes holes (axial plunges). Each hole is a spot of free tool centres, at most
+    ``DRILL_HOLE_RATIO`` larger than the drill, under the shadow of a layer: the drill fits down to there.
+    For each hole the deepest tip ``t*`` follows from the distance d(z) of the hole axis to the part section of
+    each layer below: the point reaches down while ρ(z - t) ≤ d(z) for every layer. The reach of the hole at the
+    height z is the disk of radius ρ(z - t*) (the full radius above the point). This is the opening for the
+    drill's own profile along one axis: 1D per hole, with one clipped offset per straight hole stretch."""
+
+    def __init__(self, layers: SetupLayers, cutter: Cutter):
+        self.layers, self.cutter = layers, cutter
+        self.holes: dict[tuple, float] = {}   # (x, y) in nm -> deepest tip height
+        self._spots: dict[tuple, list] = {}
+        self._clips: dict[tuple, list] = {}
+
+    def _clip(self, paths, clip):
+        if not paths:
+            return paths
+        key = (_signature(paths), _signature(clip))
+        if key not in self._clips:
+            self._clips[key] = L.intersection(paths, clip)
+        return self._clips[key]
+
+    def _find(self, index: int, piece) -> None:
+        """Holes of the drill in one small piece of a layer: the small spots of free centres under its shadow."""
+        layers, r = self.layers, self.cutter.radius
+        x0, y0, x1, y1 = L.bounds(piece)
+        grow = int((2 * r + 0.01) * L.SCALE)
+        clip = [[(x0 - grow, y0 - grow), (x1 + grow, y0 - grow), (x1 + grow, y1 + grow), (x0 - grow, y1 + grow)]]
+        shadow = self._clip(layers.shadow[index], clip)
+        key = (_signature(shadow), _signature(clip))
+        if key not in self._spots:
+            free = L.difference(clip, shadow)
+            centres = _offset(free, -_fit(r)) if free else []
+            spot = 2 * (DRILL_HOLE_RATIO * r + FIT_MM) * L.SCALE
+            found = []
+            for part in _pieces(centres):
+                a, b, c, d = L.bounds(part)
+                if c - a <= spot and d - b <= spot and a > clip[0][0][0] + grow / 2 and b > clip[0][0][1] + grow / 2:
+                    found.append(((a + c) // 2, (b + d) // 2))
+            self._spots[key] = found
+        for centre in self._spots[key]:
+            rounded = (int(round(centre[0], -4)), int(round(centre[1], -4)))  # 10 µm
+            if rounded not in self.holes:
+                self.holes[rounded] = self._deepest_tip(centre, index)
+
+    def _distance(self, centre, paths) -> float:
+        """The distance (mm) from the point to the boundary of the region (0 inside it)."""
+        if not paths:
+            return math.inf
+        import pyclipper
+        point = (int(centre[0]), int(centre[1]))
+        best = math.inf
+        inside = 0
+        for path in paths:
+            points = np.asarray(path, float)
+            a, b = points, np.roll(points, -1, axis=0)
+            ab = b - a
+            t = np.clip(((point[0] - a[:, 0]) * ab[:, 0] + (point[1] - a[:, 1]) * ab[:, 1]) /
+                        np.maximum((ab ** 2).sum(1), 1e-9), 0, 1)
+            nearest = a + ab * t[:, None]
+            best = min(best, float(np.sqrt(((nearest - point) ** 2).sum(1)).min()))
+            inside += pyclipper.PointInPolygon(point, path) != 0 and (1 if pyclipper.Orientation(path) else -1)
+        return 0.0 if inside > 0 else best / L.SCALE
+
+    def _deepest_tip(self, centre, index: int) -> float:
+        """The lowest tip height of a plunge on the axis: every layer from the tip up keeps ρ(top - t) within the
+        distance of the axis to its part section (less the fit), and the reach depth holds."""
+        layers, cutter = self.layers, self.cutter
+        c = cutter.profile_height
+        lowest = max(layers.z_low - c, layers.face - cutter.reach_depth)
+        distances = {}
+
+        def distance(k):
+            if k not in distances:
+                distances[k] = self._distance(centre, layers.part_band[k])
+            return distances[k]
+
+        def fits(tip):
+            for k in range(layers.layer_at(tip) if tip > layers.z_low else 0, layers.count):
+                top = layers.limits[k + 1]
+                if top <= tip:
+                    continue
+                if top - tip > c + 1e-9 and layers.limits[k] >= tip + c:
+                    break  # above the point: the straight part of the drill passed the shadow test of the spot
+                if cutter.radius_at(top - tip) - FIT_MM > distance(k):
+                    return False
+            return True
+        high = layers.limits[index]
+        if not fits(high):
+            return high
+        low = lowest
+        if fits(low):
+            return low
+        for _ in range(40):
+            middle = (low + high) / 2
+            if fits(middle):
+                high = middle
+            else:
+                low = middle
+        return high
+
+    def apply(self, index: int, bands):
+        a, b = self.layers.heights(index)
+        r, c = self.cutter.radius, self.cutter.profile_height
+        size = 2 * ((1 + DRILL_HOLE_RATIO) * r + 0.01) * L.SCALE
+        for _, _, region in bands:
+            for piece in _pieces(region):
+                x0, y0, x1, y1 = L.bounds(piece)
+                if x1 - x0 <= size and y1 - y0 <= size:
+                    self._find(index, piece)
+        if not self.holes:
+            return bands
+        cuts = [a + c * step / PROFILE_SAMPLES for step in range(1, PROFILE_SAMPLES + 1)] if c > 0 else []
+        result = []
+        for low, high, region in bands:
+            inner = [low, *[cut for cut in cuts if low + L.Z_MERGE_MM < cut < high - L.Z_MERGE_MM], high]
+            for first, second in zip(inner, inner[1:]):
+                if not region:
+                    result.append((first, second, region))
+                    continue
+                z = (first + second) / 2
+                disks = []
+                box = L.bounds(region)
+                for (x, y), tip in self.holes.items():
+                    radius = min(self.cutter.radius_at(z - tip), r) - L.MESH_DEFLECTION_MM if z > tip else 0.0
+                    if radius <= 0 or not (box[0] - r * L.SCALE <= x <= box[2] + r * L.SCALE
+                                           and box[1] - r * L.SCALE <= y <= box[3] + r * L.SCALE):
+                        continue
+                    disks.extend(L.disk_sweep([(x / L.SCALE, y / L.SCALE)], radius))
+                result.append((first, second, L.difference(region, L.union(disks)) if disks else region))
+        return result
+
+
 # -- the verdict -----------------------------------------------------------------------------------
 
 def _volume(bands) -> float:
@@ -655,7 +788,8 @@ def setup_verdict(stock_mesh, part_mesh, setup, cutters: Sequence, *, layers: Se
     # Flat cutters first, the largest first: each next cutter works only on what the earlier ones leave, so the
     # profile cutters (slow) see small regions. ``by_cutter``: the left volume after each cutter, in this order.
     cutters.sort(key=lambda cutter: (cutter.profile_height > 0, -cutter.radius))
-    reaches = [CutterReach(layers, cutter) for cutter in cutters]
+    reaches = [DrillReach(layers, cutter) if cutter.kind == "drill" else CutterReach(layers, cutter)
+               for cutter in cutters]
     by_cutter = {f"{cutter.kind} D{cutter.diameter:g}" + (f" r{cutter.corner_radius:g}" if cutter.corner_radius else ""): 0.0
                  for cutter in cutters}
     left, material_volume, left_volume = [], 0.0, 0.0
