@@ -717,17 +717,20 @@ class DrillReach:
 
         def distance(k):
             if k not in distances:
-                distances[k] = self._distance(centre, layers.part_band[k])
+                distances[k] = self._distance(centre, layers.part[k])
             return distances[k]
 
         def fits(tip):
+            # Each layer at its middle: the drill radius there against the distance of the axis to the middle section
+            # (a modelled drill point of the same angle fits; the error is the layer chord bound).
             for k in range(layers.layer_at(tip) if tip > layers.z_low else 0, layers.count):
-                top = layers.limits[k + 1]
+                bottom, top = layers.limits[k], layers.limits[k + 1]
                 if top <= tip:
                     continue
-                if top - tip > c + 1e-9 and layers.limits[k] >= tip + c:
+                if bottom >= tip + c:
                     break  # above the point: the straight part of the drill passed the shadow test of the spot
-                if cutter.radius_at(top - tip) - FIT_MM > distance(k):
+                height = (bottom + top) / 2 - tip
+                if height > 0 and cutter.radius_at(height) - FIT_MM > distance(k):
                     return False
             return True
         high = layers.limits[index]
@@ -846,8 +849,9 @@ def setup_verdict(stock_mesh, part_mesh, setup, cutters: Sequence, *, layers: Se
                for cutter in cutters]
     by_cutter = {f"{cutter.kind} D{cutter.diameter:g}" + (f" r{cutter.corner_radius:g}" if cutter.corner_radius else ""): 0.0
                  for cutter in cutters}
-    left, material_volume, left_volume = [], 0.0, 0.0
-    for index in range(layers.count):
+    left, material_volume, left_volume = [None] * layers.count, 0.0, 0.0
+    # From the top down: a drill finds each hole where its full disk fits, then works down to the point.
+    for index in reversed(range(layers.count)):
         material = layers.material(index)
         a, b = layers.heights(index)
         material_volume += L.area(material) * (b - a)
@@ -858,7 +862,7 @@ def setup_verdict(stock_mesh, part_mesh, setup, cutters: Sequence, *, layers: Se
             bands = [(low, high, L.opened(paths)) for low, high, paths in reach.apply(index, bands)]
             by_cutter[name] += _volume(bands)
         bands = [(low, high, paths) for low, high, paths in bands if paths]
-        left.append(bands)
+        left[index] = bands
         left_volume += _volume(bands)
     return SetupVerdict(layers, cutters, material_volume, left_volume, by_cutter, left, time.perf_counter() - started,
                         layers.face - deepest if cutters else math.inf)
