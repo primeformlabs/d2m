@@ -993,6 +993,28 @@ class SetupVerdict:
     seconds: float
     reach_low: float = -math.inf  # below this height no cutter of the setup cuts (its left is all the material)
 
+    def all_edges(self):
+        """The edges of all left bands: start and end points (nm), the band of each edge, and the band heights."""
+        cache = self.__dict__.get("_all_edges")
+        if cache is None:
+            starts, ends, band_of, lows, highs = [], [], [], [], []
+            for bands in self.left:
+                for low, high, paths in bands:
+                    a, b = _edges(paths)
+                    if len(a):
+                        starts.append(a)
+                        ends.append(b)
+                        band_of.append(np.full(len(a), len(lows)))
+                    lows.append(low)
+                    highs.append(high)
+            if starts:
+                cache = (np.concatenate(starts), np.concatenate(ends), np.concatenate(band_of),
+                         np.asarray(lows), np.asarray(highs))
+            else:
+                cache = (np.zeros((0, 2)), np.zeros((0, 2)), np.zeros(0, int), np.asarray(lows), np.asarray(highs))
+            self.__dict__["_all_edges"] = cache
+        return cache
+
     def band_edges(self, paths):
         cache = self.__dict__.setdefault("_edges", {})
         key = id(paths)
@@ -1194,30 +1216,46 @@ def section_in(verdict: SetupVerdict, reference: Setup, z: float, within=None):
         lo_h, hi_h = sorted((height_sign * lo_h, height_sign * hi_h))  # the range of the other frame heights
         lo_a, hi_a = within[1 - height_ref], within[3 - height_ref]
         lo_a, hi_a = sorted((along_sign * lo_a, along_sign * hi_a))
-    # The same interval in consecutive bands (a wall along the other axis) becomes one taller rectangle.
-    open_rects: dict[tuple, list] = {}
-    for bands in verdict.left:
-        for low, high, paths in bands:
-            if high <= reach_low + L.Z_MERGE_MM:
-                continue
-            if within is not None and (high < lo_h - 1e-6 or low > hi_h + 1e-6):
-                continue
-            box = verdict.band_box(paths)
-            if box is None or not box[normal_axis] <= target <= box[normal_axis + 2]:
-                continue
-            for start, end in _line_intervals(paths, normal_axis, level, verdict.band_edges(paths)):
-                if within is not None and (end < lo_a - 1000 or start > hi_a + 1000):
-                    continue
+    # All edges of all left bands in one array: one numpy pass per plane finds the crossings of every band.
+    starts, ends, band_of, lows, highs = verdict.all_edges()
+    if len(band_of):
+        ca, cb = starts[:, normal_axis], ends[:, normal_axis]
+        cross = ((ca <= target) & (cb > target)) | ((cb <= target) & (ca > target))
+        band_ok = highs > reach_low + L.Z_MERGE_MM
+        if within is not None:
+            band_ok &= (highs >= lo_h - 1e-6) & (lows <= hi_h + 1e-6)
+        cross &= band_ok[band_of]
+        index = np.nonzero(cross)[0]
+        if len(index):
+            other_axis = 1 - normal_axis
+            t = (target - ca[index]) / (cb[index] - ca[index])
+            value = starts[index, other_axis] + t * (ends[index, other_axis] - starts[index, other_axis])
+            bands = band_of[index]
+            order = np.lexsort((value, bands))
+            value, bands = value[order], bands[order]
+            # Even-odd pairs inside each band (a closed region crosses a line an even number of times).
+            first = np.r_[0, np.nonzero(np.diff(bands))[0] + 1]
+            position = np.arange(len(bands)) - np.repeat(first, np.diff(np.r_[first, len(bands)]))
+            pick = position % 2 == 0
+            pair_start, pair_end, pair_band = value[pick], value[np.nonzero(pick)[0] + 1], bands[pick]
+            if within is not None:
+                inside = (pair_end >= lo_a - 1000) & (pair_start <= hi_a + 1000)
+                pair_start, pair_end, pair_band = pair_start[inside], pair_end[inside], pair_band[inside]
+            # The same interval in consecutive bands (a wall along the other axis) becomes one taller rectangle.
+            open_rects: dict[tuple, list] = {}
+            for start, end, band in sorted(zip(pair_start.tolist(), pair_end.tolist(), pair_band.tolist()),
+                                           key=lambda row: lows[row[2]]):
+                low, high = float(lows[band]), float(highs[band])
                 key = (int(round(start)), int(round(end)))
                 current = open_rects.get(key)
                 if current is not None and abs(current[1] - low) <= 1e-6:
                     current[1] = high
                 else:
                     if current is not None:
-                        rects.append(rectangle(start, end, current[0], current[1]))
+                        rects.append(rectangle(key[0], key[1], current[0], current[1]))
                     open_rects[key] = [low, high]
-    for (start, end), (low, high) in open_rects.items():
-        rects.append(rectangle(start, end, low, high))
+            for (start, end), (low, high) in open_rects.items():
+                rects.append(rectangle(start, end, low, high))
     return L.union(rects)
 
 
@@ -1231,13 +1269,15 @@ def combined_left(verdicts: list[SetupVerdict], reference: int = 0):
         combined = []
         for low, high, paths in bands:
             left = paths
+            cut = False
             for verdict in others:
                 if not left:
                     break
                 section = section_in(verdict, base.layers.setup, (low + high) / 2, L.bounds(left))
                 if section is not None:
-                    left = L.intersection(left, section)
-            left = L.opened(left)
+                    left, cut = L.intersection(left, section), True
+            if cut and left:
+                left = L.opened(left)  # the setup bands were opened already; only a new cut needs it again
             combined.append((low, high, left))
             total += L.area(left) * (high - low)
         result.append(combined)
