@@ -1,0 +1,591 @@
+"""Milling verdict by the morphological opening, one setup and one 2D layer at a time.
+
+A 3-axis setup has one fixed tool axis (+Z of the setup frame). For each layer of the setup:
+
+    R      = stock section - part section              (the material to remove)
+    shadow = the union of the part sections at and above the layer
+    left   = R minus the region that the cutter can reach
+
+A flat end mill of radius r reaches exactly the morphological opening of the free region (the plane
+less the shadow): the union of all its disks that do not touch the part. Its complement inside R is
+R intersected with the closing of the shadow:
+
+    left = R ∩ offset(offset(shadow, +r), -r)
+
+The material left is therefore the inside corners (radius r by construction), the slots narrower than
+2r and the undercuts. No pass, no toolpath and no 3D Boolean is used.
+
+A cutter with a profile (ball end mill, bull nose, drill point) has the radius rho(h) at the height h
+above its tip. With its tip at height t, its centre must stay out of
+
+    obstacle(t) = union over the layers above t of offset(part layer, rho(layer top - t))
+
+and at the height z it reaches the union over the tips t in [z - c, z] of offset(free centres(t), rho(z - t)),
+where c is the profile height (ball: r; bull nose: corner radius; drill: point length). A tip lower than
+z - c gives no more reach (its obstacle is larger, its radius is the same). So
+
+    left(z) = R ∩ intersection over t of offset(obstacle(t), -rho(z - t))
+
+Reach: a layer deeper below the setup face (the stock top) than min(flute length, stick-out, reach) is
+out of reach for that cutter. A tip does not go below the stock bottom (the table and the fixture are there).
+
+Layers: the limits are the heights of the planar (horizontal) faces of the stock and the part. A layer
+that a sloped or curved face crosses is divided so that the face section moves by at most ``CHORD_MM``
+inside one layer (chord bound). The material of a layer is its middle section; the shadow takes the
+sections at the bottom, the middle and the top of each layer.
+
+All 2D work uses ``layers.py`` (pyclipper, 1 unit = 1 nm, round joins, arc tolerance 0.25 µm). A region
+thinner than the contact tolerance (1 µm) does not count, as in the layer replay.
+"""
+from __future__ import annotations
+
+import math
+import time
+from dataclasses import dataclass, field
+from typing import Iterable, Sequence
+
+import numpy as np
+
+from . import layers as L
+
+# Largest horizontal movement of a sloped or curved face section inside one layer (mm).
+CHORD_MM = 0.01
+# Thinnest layer (mm). A face that is almost horizontal does not divide its interval below this height.
+MIN_LAYER_MM = 0.005
+# Largest number of layers of one setup; above it the chord bound grows.
+MAX_LAYERS = 800
+# Height samples in the profile height of a cutter with a profile (ball, bull nose, drill point).
+PROFILE_SAMPLES = 8
+# The setup frames of the six cardinal faces (D2O ``milling_setup_frame.FACE_AXES``): profile axes u, v and the normal.
+FACE_AXES = {
+    ">Z": ("x", "y", "z", 1), "<Z": ("x", "y", "z", -1),
+    ">X": ("y", "z", "x", 1), "<X": ("y", "z", "x", -1),
+    ">Y": ("x", "z", "y", 1), "<Y": ("x", "z", "y", -1),
+}
+
+
+# -- setups and cutters ----------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Setup:
+    """A fixed tool axis. ``matrix`` columns: the setup x, y and z directions in the part frame."""
+    name: str
+    matrix: tuple
+
+    @classmethod
+    def of(cls, value) -> "Setup":
+        if isinstance(value, Setup):
+            return value
+        if isinstance(value, str):
+            if value not in FACE_AXES:
+                raise ValueError("A setup selector must be one of the six cardinal faces.")
+            u, _, normal, sign = FACE_AXES[value]
+            unit = lambda axis, scale: np.array([scale if key == axis else 0.0 for key in "xyz"])
+            x_dir, z_dir = unit(u, 1.0), unit(normal, float(sign))
+            y_dir = np.cross(z_dir, x_dir)
+            return cls(value, tuple(map(tuple, np.column_stack([x_dir, y_dir, z_dir]))))
+        name, matrix = value
+        array = np.asarray(matrix, float)[:3, :3]
+        if abs(np.linalg.det(array) - 1.0) > 1e-6:
+            raise ValueError("A setup frame must be a rotation.")
+        return cls(str(name), tuple(map(tuple, array)))
+
+    @property
+    def rotation(self) -> np.ndarray:
+        return np.asarray(self.matrix, float)
+
+    def to_setup(self, points: np.ndarray) -> np.ndarray:
+        """Part-frame points in setup coordinates."""
+        return points @ self.rotation
+
+    def to_dict(self):
+        return {"name": self.name, "setup_to_part": [list(row) for row in self.matrix]}
+
+
+@dataclass(frozen=True)
+class Cutter:
+    """The rotational profile of a milling cutter, its reach and its shank."""
+    kind: str
+    diameter: float
+    corner_radius: float = 0.0
+    flute_length: float = 50.0
+    stickout: float = 35.0
+    reach: float = 0.0
+    shank_diameter: float = 0.0
+    tip_angle: float = 0.0
+    name: str = ""
+
+    @classmethod
+    def of(cls, tool) -> "Cutter":
+        """From a ``ToolSpec``, a ``ToolSpec.to_dict()`` row or a ``Cutter``."""
+        if isinstance(tool, Cutter):
+            return tool
+        if isinstance(tool, dict):
+            get = lambda *keys, default=0.0: next((float(tool[key]) for key in keys if tool.get(key) is not None), default)
+            return cls(str(tool.get("tool_type") or "flat_endmill"), get("diameter_mm", "diameter"),
+                       get("corner_radius_mm", "corner_radius"), get("flute_length_mm", "flute_length", default=50.0),
+                       get("stickout_mm", default=35.0), get("reach_mm"), get("shank_diameter_mm", "shank_diameter"),
+                       get("tip_angle_deg", "tip_angle"), str(tool.get("catalog_id") or tool.get("label") or ""))
+        return cls(tool.tool_type, float(tool.diameter), float(tool.corner_radius or 0.0), float(tool.flute_length),
+                   float(tool.stickout_mm), float(tool.reach_mm or 0.0), float(tool.shank_diameter or 0.0),
+                   float(tool.tip_angle or 0.0), tool.catalog_id or "")
+
+    @property
+    def radius(self) -> float:
+        return self.diameter / 2
+
+    @property
+    def shank_radius(self) -> float:
+        return (self.shank_diameter or self.diameter) / 2
+
+    @property
+    def reach_depth(self) -> float:
+        """The deepest layer below the setup face that the cutter cuts (``milling_replay.validate_cutter``)."""
+        return min(self.flute_length, self.stickout, self.reach or self.flute_length)
+
+    @property
+    def profile_height(self) -> float:
+        """The height above the tip where the cutter has its full radius."""
+        r = self.radius
+        if self.kind == "ball_endmill":
+            return r
+        if self.kind == "bull_nose" or (self.kind == "flat_endmill" and self.corner_radius > 0):
+            return min(self.corner_radius, r)
+        if self.kind == "drill" and 0 < self.tip_angle < 180:
+            return r / math.tan(math.radians(self.tip_angle) / 2)
+        return 0.0
+
+    def radius_at(self, height: float) -> float:
+        """The cutter radius at the height above its tip (the shank above the flutes)."""
+        if height < 0:
+            return 0.0
+        if height > self.flute_length:
+            return max(self.radius, self.shank_radius)
+        r, c = self.radius, self.profile_height
+        if height >= c or c <= 0:
+            return r
+        if self.kind == "drill":
+            return height * r / c
+        # Ball end mill and bull nose: a corner arc of radius c.
+        return (r - c) + math.sqrt(max(c * c - (c - height) ** 2, 0.0))
+
+    def to_dict(self):
+        return {"kind": self.kind, "diameter_mm": self.diameter, "corner_radius_mm": self.corner_radius,
+                "flute_length_mm": self.flute_length, "reach_depth_mm": self.reach_depth,
+                "profile_height_mm": round(self.profile_height, 6), "name": self.name}
+
+
+# -- layers of one setup ---------------------------------------------------------------------------
+
+@dataclass
+class SetupLayers:
+    setup: Setup
+    z_low: float
+    z_high: float
+    limits: list
+    stock: list = field(default_factory=list)        # middle section of each layer
+    part: list = field(default_factory=list)         # middle section of each layer
+    part_band: list = field(default_factory=list)    # bottom ∪ middle ∪ top sections (shadow input)
+    shadow: list = field(default_factory=list)       # union of part_band of this layer and all layers above
+    chord_mm: float = CHORD_MM
+
+    @property
+    def count(self) -> int:
+        return len(self.limits) - 1
+
+    def heights(self, index):
+        return self.limits[index], self.limits[index + 1]
+
+    def layer_at(self, z: float) -> int:
+        """The index of the layer that holds the height (the last layer for the top)."""
+        import bisect
+        return min(max(bisect.bisect_right(self.limits, z + L.Z_MERGE_MM) - 1, 0), self.count - 1)
+
+    def material(self, index):
+        return L.difference(self.stock[index], self.part[index])
+
+
+def rotated_mesh(mesh: L.SolidMesh, setup: Setup) -> L.SolidMesh:
+    return L.SolidMesh(setup.to_setup(mesh.vertices), mesh.triangles)
+
+
+def _horizontal_heights(mesh: L.SolidMesh) -> np.ndarray:
+    flat = np.abs(mesh.normal_z) >= 1 - 1e-9
+    return np.unique(np.round(mesh.vertices[mesh.triangles[flat]][..., 2].ravel(), 7))
+
+
+def _slope_rates(mesh: L.SolidMesh):
+    """(low, high, rate) of each sloped triangle: the horizontal movement of its section per mm of height."""
+    nz = np.abs(mesh.normal_z)
+    sloped = (nz > 1e-9) & (nz < 1 - 1e-9) & (mesh.high - mesh.low > L.Z_MERGE_MM)
+    rate = nz[sloped] / np.sqrt(1 - nz[sloped] ** 2)
+    return mesh.low[sloped], mesh.high[sloped], rate
+
+
+def _divide(first: float, second: float, low, high, rate, chord: float) -> list[float]:
+    """The heights inside (first, second) so that no sloped section moves more than ``chord`` in one layer."""
+    inside = (low < second - L.Z_MERGE_MM) & (high > first + L.Z_MERGE_MM)
+    if not np.any(inside):
+        return []
+    low, high, rate = low[inside], high[inside], rate[inside]
+    result, z = [], first
+    while second - z > L.Z_MERGE_MM:
+        step = second - z
+        for _ in range(3):
+            near = (low < z + step) & (high > z)
+            if not np.any(near):
+                break
+            step = min(step, max(chord / float(rate[near].max()), MIN_LAYER_MM))
+        z = min(z + step, second)
+        if second - z > L.Z_MERGE_MM:
+            result.append(z)
+        if len(result) > MAX_LAYERS * 4:
+            break
+    return result
+
+
+def setup_layers(stock_mesh: L.SolidMesh, part_mesh: L.SolidMesh, setup, chord: float = CHORD_MM) -> SetupLayers:
+    """The 2D layers of the stock and the part in the setup frame."""
+    setup = Setup.of(setup)
+    stock, part = rotated_mesh(stock_mesh, setup), rotated_mesh(part_mesh, setup)
+    z_low, z_high = float(stock.vertices[:, 2].min()), float(stock.vertices[:, 2].max())
+    planar = [z for z in np.concatenate([_horizontal_heights(stock), _horizontal_heights(part)]) if z_low < z < z_high]
+    base = L._merged([z_low, z_high, *planar])
+    rates = [np.concatenate(values) for values in zip(_slope_rates(stock), _slope_rates(part))]
+    while True:
+        limits = [base[0]]
+        for first, second in zip(base, base[1:]):
+            limits.extend(_divide(first, second, *rates, chord))
+            limits.append(second)
+            if len(limits) > MAX_LAYERS * 4:
+                break
+        if len(limits) - 1 <= MAX_LAYERS:
+            break
+        chord *= 1.5
+    result = SetupLayers(setup, z_low, z_high, limits, chord_mm=chord)
+    for a, b in zip(limits, limits[1:]):
+        middle = (a + b) / 2
+        edge = min(1e-6, (b - a) / 4)
+        result.stock.append(stock.section(middle))
+        mid = part.section(middle)
+        result.part.append(mid)
+        result.part_band.append(L.union(mid, L.union(part.section(a + edge), part.section(b - edge))))
+    shadow: list = []
+    for band in reversed(result.part_band):
+        shadow = L.union(shadow, band) if band else shadow
+        result.shadow.append(shadow)
+    result.shadow.reverse()
+    return result
+
+
+# -- the reach of one cutter -----------------------------------------------------------------------
+
+class CutterReach:
+    """The material left by one cutter in each layer of one setup."""
+
+    def __init__(self, layers: SetupLayers, cutter: Cutter):
+        self.layers, self.cutter = layers, cutter
+        self._obstacles: dict[float, list] = {}
+        self._eroded: dict[tuple, list] = {}
+
+    def _first_layer_from(self, z: float) -> int:
+        """The first layer whose bottom is at or above the height (count if none)."""
+        import bisect
+        return bisect.bisect_left(self.layers.limits, z - L.Z_MERGE_MM, hi=self.layers.count)
+
+    def obstacle(self, tip: float) -> list:
+        """The tool-centre positions where the cutter with its tip at the height touches the part."""
+        key = round(tip, 7)
+        if key in self._obstacles:
+            return self._obstacles[key]
+        layers, cutter = self.layers, self.cutter
+        c, r, rs = cutter.profile_height, cutter.radius, cutter.shank_radius
+        parts = []
+        full = self._first_layer_from(tip + c)  # every layer from here sees the full radius
+        start = layers.layer_at(tip) if tip > layers.z_low else 0
+        for index in range(start, min(full, layers.count)):
+            top = layers.limits[index + 1]
+            if top <= tip + L.Z_MERGE_MM or not layers.part_band[index]:
+                continue
+            radius = cutter.radius_at(top - tip)
+            parts.append(L.offset(layers.part_band[index], radius) if radius > 0 else layers.part_band[index])
+        if full < layers.count and layers.shadow[full]:
+            parts.append(L.offset(layers.shadow[full], r))
+        if rs > r:
+            shank = self._first_layer_from(tip + cutter.flute_length)
+            if shank < layers.count and layers.shadow[shank]:
+                parts.append(L.offset(layers.shadow[shank], rs))
+        result = L.union([path for item in parts for path in item]) if parts else []
+        self._obstacles[key] = result
+        return result
+
+    def _erode(self, tip: float, radius: float) -> list:
+        key = (round(tip, 7), round(radius, 7))
+        if key not in self._eroded:
+            obstacle = self.obstacle(tip)
+            self._eroded[key] = L.offset(obstacle, -radius) if radius > 0 and obstacle else obstacle
+        return self._eroded[key]
+
+    def left_at(self, index: int, z: float, material) -> list:
+        """The material of the layer that the cutter does not reach at the height z."""
+        layers, cutter = self.layers, self.cutter
+        if not material:
+            return []
+        if layers.z_high - z > cutter.reach_depth + 1e-9:
+            return material
+        c = cutter.profile_height
+        if c <= 0:
+            tips = [(z, cutter.radius)]
+        else:
+            # The tip heights: even steps in the profile height, and every layer limit (a floor) in it.
+            import bisect
+            heights = {z - c * step / PROFILE_SAMPLES for step in range(PROFILE_SAMPLES + 1)}
+            first = bisect.bisect_left(layers.limits, z - c - L.Z_MERGE_MM)
+            last = bisect.bisect_right(layers.limits, z + L.Z_MERGE_MM)
+            heights.update(layers.limits[first:last])
+            tips = [(tip, cutter.radius_at(z - tip)) for tip in sorted(heights, reverse=True)
+                    if tip >= layers.z_low - L.Z_MERGE_MM]
+        left = material
+        for tip, radius in tips:
+            if layers.z_high - tip > cutter.reach_depth + 1e-9:
+                continue
+            left = L.intersection(left, self._erode(tip, radius))
+            if not left:
+                break
+        return left
+
+    def left(self, index: int, material) -> list[tuple[float, float, list]]:
+        """(z low, z high, left region) bands of the layer: one band for a flat cutter, the profile height
+        divided into ``PROFILE_SAMPLES`` bands for a cutter with a profile (each evaluated at its middle)."""
+        a, b = self.layers.heights(index)
+        c = self.cutter.profile_height
+        if c <= 0:
+            return [(a, b, self.left_at(index, a, material))]
+        cuts = [a + c * step / PROFILE_SAMPLES for step in range(PROFILE_SAMPLES + 1) if a + c * step / PROFILE_SAMPLES < b]
+        cuts.append(b)
+        return [(low, high, self.left_at(index, (low + high) / 2, material)) for low, high in zip(cuts, cuts[1:])]
+
+
+# -- the verdict -----------------------------------------------------------------------------------
+
+def _volume(bands) -> float:
+    return sum(L.area(paths) * (high - low) for low, high, paths in bands)
+
+
+def _bands_by_layer(per_cutter: list[list], material):
+    """Intersect the left bands of several cutters of one layer (common band limits)."""
+    limits = sorted({value for bands in per_cutter for low, high, _ in bands for value in (low, high)})
+    result = []
+    for low, high in zip(limits, limits[1:]):
+        if high - low <= L.Z_MERGE_MM:
+            continue
+        middle = (low + high) / 2
+        left = material
+        for bands in per_cutter:
+            region = next(paths for a, b, paths in bands if a - L.Z_MERGE_MM <= middle <= b + L.Z_MERGE_MM)
+            left = L.intersection(left, region)
+            if not left:
+                break
+        result.append((low, high, left))
+    return result
+
+
+@dataclass
+class SetupVerdict:
+    layers: SetupLayers
+    cutters: list
+    material_mm3: float
+    left_mm3: float
+    by_cutter: dict
+    left: list            # one list of (z low, z high, paths) bands for each layer, all cutters together
+    seconds: float
+
+    def to_dict(self, *, regions: int = 10):
+        return {"setup": self.layers.setup.to_dict(), "layer_count": self.layers.count,
+                "z_range_mm": [self.layers.z_low, self.layers.z_high], "chord_mm": self.layers.chord_mm,
+                "material_to_remove_mm3": self.material_mm3, "left_mm3": self.left_mm3,
+                "cutters": [cutter.to_dict() for cutter in self.cutters], "left_by_cutter_mm3": self.by_cutter,
+                "left_regions": left_regions(self, limit=regions), "seconds": round(self.seconds, 3)}
+
+
+def setup_verdict(stock_mesh, part_mesh, setup, cutters: Sequence, *, layers: SetupLayers | None = None) -> SetupVerdict:
+    """The material that the cutters do not reach from one setup (each layer, all cutters together)."""
+    started = time.perf_counter()
+    layers = layers or setup_layers(stock_mesh, part_mesh, setup)
+    cutters = [Cutter.of(cutter) for cutter in cutters]
+    reaches = [CutterReach(layers, cutter) for cutter in cutters]
+    by_cutter = {f"{cutter.kind} D{cutter.diameter:g}" + (f" r{cutter.corner_radius:g}" if cutter.corner_radius else ""): 0.0
+                 for cutter in cutters}
+    left, material_volume, left_volume = [], 0.0, 0.0
+    for index in range(layers.count):
+        material = layers.material(index)
+        a, b = layers.heights(index)
+        material_volume += L.area(material) * (b - a)
+        if not material:
+            left.append([])
+            continue
+        per_cutter = []
+        for name, reach in zip(by_cutter, reaches):
+            bands = [(low, high, L.opened(paths)) for low, high, paths in reach.left(index, material)]
+            by_cutter[name] += _volume(bands)
+            per_cutter.append(bands)
+        bands = _bands_by_layer(per_cutter, material) if per_cutter else [(a, b, material)]
+        bands = [(low, high, L.opened(paths)) for low, high, paths in bands]
+        left.append(bands)
+        left_volume += _volume(bands)
+    return SetupVerdict(layers, cutters, material_volume, left_volume, by_cutter, left, time.perf_counter() - started)
+
+
+def left_regions(verdict: SetupVerdict, limit: int = 10):
+    """The left material as regions (connected in 2D and in adjacent layers), largest first."""
+    rows = []
+    for index, bands in enumerate(verdict.left):
+        for low, high, paths in bands:
+            for piece in _pieces(paths):
+                box = L.bounds(piece)
+                rows.append([low, high, box, L.area(piece) * (high - low)])
+    rows.sort(key=lambda row: row[0])
+    regions = []
+    for low, high, box, volume in rows:
+        for region in regions:
+            if abs(region["z"][1] - low) <= 1e-6 and L._overlap(region["box"], box):
+                region["z"][1] = high
+                region["box"] = (min(region["box"][0], box[0]), min(region["box"][1], box[1]),
+                                 max(region["box"][2], box[2]), max(region["box"][3], box[3]))
+                region["volume"] += volume
+                break
+        else:
+            regions.append({"z": [low, high], "box": box, "volume": volume})
+    regions.sort(key=lambda region: -region["volume"])
+    return [{"z_mm": [round(region["z"][0], 4), round(region["z"][1], 4)],
+             "xy_box_mm": [round(value / L.SCALE, 4) for value in region["box"]],
+             "volume_mm3": region["volume"]} for region in regions[:limit]]
+
+
+def _pieces(paths):
+    """The outer loops of a region, each with its holes."""
+    import pyclipper
+    if not paths:
+        return []
+    clipper = pyclipper.Pyclipper()
+    clipper.AddPaths(paths, pyclipper.PT_SUBJECT, True)
+    tree = clipper.Execute2(pyclipper.CT_UNION, pyclipper.PFT_NONZERO, pyclipper.PFT_NONZERO)
+    pieces = []
+
+    def visit(node):
+        for child in node.Childs:
+            if child.IsHole:
+                visit(child)
+                continue
+            pieces.append([child.Contour, *[hole.Contour for hole in child.Childs]])
+            for hole in child.Childs:
+                visit(hole)
+    visit(tree)
+    return pieces
+
+
+# -- several setups --------------------------------------------------------------------------------
+
+def _axis_of(vector) -> tuple[int, float]:
+    vector = np.asarray(vector, float)
+    axis = int(np.argmax(np.abs(vector)))
+    if abs(abs(vector[axis]) - 1.0) > 1e-9:
+        raise ValueError("The setup combination requires setups along the part axes.")
+    return axis, float(np.sign(vector[axis]))
+
+
+def _line_intervals(paths, coordinate: int, value: float):
+    """The intervals of the region on the line (x or y of the paths) = value (even-odd crossings)."""
+    other = 1 - coordinate
+    crossings = []
+    target = value * L.SCALE
+    for path in paths:
+        points = np.asarray(path, float)
+        a, b = points, np.roll(points, -1, axis=0)
+        ca, cb = a[:, coordinate], b[:, coordinate]
+        cross = ((ca <= target) & (cb > target)) | ((cb <= target) & (ca > target))
+        if not np.any(cross):
+            continue
+        t = (target - ca[cross]) / (cb[cross] - ca[cross])
+        crossings.extend((a[cross, other] + t * (b[cross, other] - a[cross, other])).tolist())
+    crossings.sort()
+    return list(zip(crossings[0::2], crossings[1::2]))
+
+
+def section_in(verdict: SetupVerdict, reference: Setup, z: float):
+    """The left material of another setup on the plane z (reference setup frame), in reference xy paths."""
+    other = verdict.layers.setup
+    # Reference axes in the other frame: column k of (other^T reference).
+    relation = other.rotation.T @ reference.rotation
+    normal_axis, normal_sign = _axis_of(relation[:, 2])
+    x_axis, x_sign = _axis_of(relation[:, 0])
+    y_axis, y_sign = _axis_of(relation[:, 1])
+    # A point of the other frame (p0, p1, p2) has reference coordinates x = x_sign*p[x_axis], y = y_sign*p[y_axis].
+    level = normal_sign * z  # the plane: p[normal_axis] = level
+    pieces = []
+    if normal_axis == 2:
+        index = verdict.layers.layer_at(level)
+        for low, high, paths in verdict.left[index]:
+            if low - 1e-9 <= level <= high + 1e-9:
+                for path in paths:
+                    mapped = []
+                    for point in path:
+                        p = (point[0], point[1])
+                        mapped.append((int(x_sign * p[x_axis]), int(y_sign * p[y_axis])))
+                    pieces.append(mapped)
+        return L.union(pieces)
+    rects = []
+    for bands in verdict.left:
+        for low, high, paths in bands:
+            for start, end in _line_intervals(paths, normal_axis, level):
+                # The rectangle: the in-plane coordinate of the other frame from start to end, z from low to high.
+                in_plane = 1 - normal_axis
+                corners = []
+                for along, height in ((start, low), (end, low), (end, high), (start, high)):
+                    p = [0.0, 0.0, 0.0]
+                    p[in_plane] = along / L.SCALE
+                    p[2] = height
+                    corners.append((int(round(x_sign * p[x_axis] * L.SCALE)), int(round(y_sign * p[y_axis] * L.SCALE))))
+                rects.append(corners)
+    return L.union(rects)
+
+
+def combined_left(verdicts: list[SetupVerdict], reference: int = 0):
+    """The material that no setup reaches: the left material of the reference setup that every other setup
+    also leaves (2D, in the reference layers). Returns (volume, bands for each reference layer)."""
+    base = verdicts[reference]
+    others = [verdict for position, verdict in enumerate(verdicts) if position != reference]
+    total, result = 0.0, []
+    for bands in base.left:
+        combined = []
+        for low, high, paths in bands:
+            left = paths
+            for verdict in others:
+                if not left:
+                    break
+                left = L.intersection(left, section_in(verdict, base.layers.setup, (low + high) / 2))
+            left = L.opened(left)
+            combined.append((low, high, left))
+            total += L.area(left) * (high - low)
+        result.append(combined)
+    return total, result
+
+
+def part_verdict(stock_shape, part_shape, setups: Iterable, cutters, *, reference: int = 0) -> dict:
+    """The milling verdict of a part: for each setup the material its cutters leave, and the material that no
+    setup reaches. ``cutters``: one list for all setups, or a dict {setup name: list}."""
+    started = time.perf_counter()
+    stock_mesh = L.SolidMesh.of(stock_shape)
+    part_mesh = L.SolidMesh.of(part_shape)
+    mesh_seconds = time.perf_counter() - started
+    verdicts = []
+    for setup in setups:
+        setup = Setup.of(setup)
+        tools = cutters.get(setup.name, []) if isinstance(cutters, dict) else cutters
+        verdicts.append(setup_verdict(stock_mesh, part_mesh, setup, tools))
+    total, bands = combined_left(verdicts, reference) if verdicts else (None, [])
+    return {"schema": "subcad.milling_opening.v1", "method": "morphological_opening_by_layer",
+            "contact_tolerance_mm": L.CONTACT_MM, "arc_tolerance_mm": L.ARC_TOLERANCE_MM,
+            "setups": [verdict.to_dict() for verdict in verdicts], "left_after_all_setups_mm3": total,
+            "can_make": total is not None and total <= 1e-6, "mesh_seconds": round(mesh_seconds, 3),
+            "seconds": round(time.perf_counter() - started, 3), "_verdicts": verdicts, "_combined": bands}
