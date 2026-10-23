@@ -55,11 +55,11 @@ CHORD_MM = 0.01
 MIN_LAYER_MM = 0.005
 # Largest number of layers of one setup; above it the chord bound grows.
 MAX_LAYERS = 400
-# A cutter fits where the gap is this much smaller than its size (mm): the mesh chords (1 µm) and the polygon
-# chords of the offsets (2 µm) are inside the true surfaces, so a hole of the cutter size must still fit.
-FIT_MM = 0.004
+# A cutter centre fits where the gap is this much smaller than the cutter (mm): the mesh chords (1 µm) and the
+# polygon chords of the obstacle offsets (1 µm) lie inside the true surfaces, so a hole of the cutter size fits.
+FIT_MM = 0.002
 # Arc tolerance of the obstacle offsets (mm). Its chords lie inside the true offset; ``FIT_MM`` covers them.
-OBSTACLE_ARC_MM = 0.002
+OBSTACLE_ARC_MM = 0.001
 # Height samples in the profile height of a cutter with a profile (ball, bull nose, drill point).
 PROFILE_SAMPLES = 8
 # The setup frames of the six cardinal faces (D2O ``milling_setup_frame.FACE_AXES``): profile axes u, v and the normal.
@@ -254,15 +254,18 @@ def _divide(first: float, second: float, low, high, rate, chord: float) -> list[
 
 
 def setup_layers(stock_mesh: L.SolidMesh, part_mesh: L.SolidMesh, setup, chord: float = CHORD_MM,
-                 extra_meshes: Sequence = ()) -> SetupLayers:
+                 extra_meshes: Sequence = (), reach_depths: Sequence = ()) -> SetupLayers:
     """The 2D layers of the stock and the part in the setup frame.
 
-    ``extra_meshes``: more solids whose faces add layer limits (a comparison with another material state)."""
+    ``extra_meshes``: more solids whose faces add layer limits (a comparison with another material state).
+    ``reach_depths``: cutter reach depths below the setup face; each one adds a layer limit."""
     setup = Setup.of(setup)
     stock, part = rotated_mesh(stock_mesh, setup), rotated_mesh(part_mesh, setup)
     extra = [rotated_mesh(mesh, setup) for mesh in extra_meshes]
     z_low, z_high = float(stock.vertices[:, 2].min()), float(stock.vertices[:, 2].max())
+    face = min(float(part.vertices[:, 2].max()), z_high)
     planar = [z for z in np.concatenate([_horizontal_heights(mesh) for mesh in (stock, part, *extra)]) if z_low < z < z_high]
+    planar += [face - depth for depth in reach_depths if z_low < face - depth < z_high]
     base = L._merged([z_low, z_high, *planar])
     rates = [np.concatenate(values) for values in zip(*[_slope_rates(mesh) for mesh in (stock, part, *extra)])]
     while True:
@@ -275,7 +278,6 @@ def setup_layers(stock_mesh: L.SolidMesh, part_mesh: L.SolidMesh, setup, chord: 
         if len(limits) - 1 <= MAX_LAYERS:
             break
         chord *= 1.5
-    face = min(float(part.vertices[:, 2].max()), z_high)
     result = SetupLayers(setup, z_low, z_high, limits, chord_mm=chord, face=face, planar=base)
     for a, b in zip(limits, limits[1:]):
         middle = (a + b) / 2
@@ -414,7 +416,9 @@ class CutterReach:
         """The obstacle shrunk by the radius, near the region only: the erosion at a point depends only on the
         obstacle within the radius, so the obstacle is clipped to the region box grown by twice the radius."""
         obstacle = self.obstacle(tip, box)
-        radius = _fit(radius)
+        # The cutter disk reaches up to the mesh chord (1 µm) into the part polygon: the polygon lies that much
+        # inside the true part surface, so the disk does not pass the true surface.
+        radius = max(radius - L.MESH_DEFLECTION_MM, 0.0)
         if radius <= 0 or not obstacle:
             return obstacle
         box = L.bounds(near)
@@ -537,8 +541,8 @@ class SetupVerdict:
 def setup_verdict(stock_mesh, part_mesh, setup, cutters: Sequence, *, layers: SetupLayers | None = None) -> SetupVerdict:
     """The material that the cutters do not reach from one setup (each layer, all cutters together)."""
     started = time.perf_counter()
-    layers = layers or setup_layers(stock_mesh, part_mesh, setup)
     cutters = [Cutter.of(cutter) for cutter in cutters]
+    layers = layers or setup_layers(stock_mesh, part_mesh, setup, reach_depths=[cutter.reach_depth for cutter in cutters])
     # Flat cutters first, the largest first: each next cutter works only on what the earlier ones leave, so the
     # profile cutters (slow) see small regions. ``by_cutter``: the left volume after each cutter, in this order.
     cutters.sort(key=lambda cutter: (cutter.profile_height > 0, -cutter.radius))
@@ -709,7 +713,8 @@ def part_verdict(stock_shape, part_shape, setups: Iterable, cutters, *, referenc
     for setup in setups:
         setup = Setup.of(setup)
         tools = cutters.get(setup.name, []) if isinstance(cutters, dict) else cutters
-        layers = setup_layers(stock_mesh, part_mesh, setup, extra_meshes=extra) if extra else None
+        layers = setup_layers(stock_mesh, part_mesh, setup, extra_meshes=extra,
+                              reach_depths=[Cutter.of(tool).reach_depth for tool in tools]) if extra else None
         verdicts.append(setup_verdict(stock_mesh, part_mesh, setup, tools, layers=layers))
     total, bands = combined_left(verdicts, reference) if verdicts else (None, [])
     return {"schema": "subcad.milling_opening.v1", "method": "morphological_opening_by_layer",
