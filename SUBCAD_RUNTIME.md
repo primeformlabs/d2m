@@ -13,7 +13,7 @@ python -m pip wheel --no-deps . --wheel-dir dist
 Install the wheel in the CAD environment:
 
 ```text
-python -m pip install --no-deps dist/d2o_subcad-0.2.24-py3-none-any.whl
+python -m pip install --no-deps dist/d2o_subcad-0.2.25-py3-none-any.whl
 ```
 
 Use `from subcad import Stock` from an installed package.
@@ -28,6 +28,11 @@ These checks use no 3D Boolean and no point-in-solid test.
 The operation result uses one Boolean for each cutting level that adds material removal.
 The old replay used one Boolean for each pass and four Booleans for the region check.
 The B-Rep replay remains for material that the layer model cannot represent.
+
+Version 0.2.25 gives the milling verdict with the morphological opening of each layer (`docs/MILLING_OPENING_VERDICT.md`).
+`milling_opening.part_verdict` finds the material that the cutters of each setup cannot reach, with no pass replay.
+Each layer pass also gets its removed 2D region for the operation player (`layer_player.py`).
+With `milling_layers.PLAYER_BREP_STATES = False`, SubCAD makes no B-Rep state for each pass.
 
 Version 0.2.22 applies ruled loft Milling on all six cardinal setup faces.
 Section `cx` and `cy` use the existing face-profile convention.
