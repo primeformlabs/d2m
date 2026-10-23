@@ -477,6 +477,20 @@ class CutterReach:
         cuts.append(b)
         return [(low, high, self.left_at(index, (low + high) / 2, material)) for low, high in zip(cuts, cuts[1:])]
 
+    def apply(self, index: int, bands) -> list[tuple[float, float, list]]:
+        """The left bands after this cutter, from the bands that the earlier cutters left in the layer."""
+        a, b = self.layers.heights(index)
+        c = self.cutter.profile_height
+        if c <= 0:
+            return [(low, high, self.left_at(index, a, region)) for low, high, region in bands]
+        cuts = [a + c * step / PROFILE_SAMPLES for step in range(1, PROFILE_SAMPLES + 1)]
+        result = []
+        for low, high, region in bands:
+            inner = [low, *[cut for cut in cuts if low + L.Z_MERGE_MM < cut < high - L.Z_MERGE_MM], high]
+            for first, second in zip(inner, inner[1:]):
+                result.append((first, second, self.left_at(index, (first + second) / 2, region) if region else []))
+        return result
+
 
 # -- the verdict -----------------------------------------------------------------------------------
 
@@ -525,6 +539,9 @@ def setup_verdict(stock_mesh, part_mesh, setup, cutters: Sequence, *, layers: Se
     started = time.perf_counter()
     layers = layers or setup_layers(stock_mesh, part_mesh, setup)
     cutters = [Cutter.of(cutter) for cutter in cutters]
+    # Flat cutters first, the largest first: each next cutter works only on what the earlier ones leave, so the
+    # profile cutters (slow) see small regions. ``by_cutter``: the left volume after each cutter, in this order.
+    cutters.sort(key=lambda cutter: (cutter.profile_height > 0, -cutter.radius))
     reaches = [CutterReach(layers, cutter) for cutter in cutters]
     by_cutter = {f"{cutter.kind} D{cutter.diameter:g}" + (f" r{cutter.corner_radius:g}" if cutter.corner_radius else ""): 0.0
                  for cutter in cutters}
@@ -533,16 +550,13 @@ def setup_verdict(stock_mesh, part_mesh, setup, cutters: Sequence, *, layers: Se
         material = layers.material(index)
         a, b = layers.heights(index)
         material_volume += L.area(material) * (b - a)
-        if not material:
-            left.append([])
-            continue
-        per_cutter = []
+        bands = [(a, b, material)] if material else []
         for name, reach in zip(by_cutter, reaches):
-            bands = [(low, high, L.opened(paths)) for low, high, paths in reach.left(index, material)]
+            if not any(region for _, _, region in bands):
+                break
+            bands = [(low, high, L.opened(paths)) for low, high, paths in reach.apply(index, bands)]
             by_cutter[name] += _volume(bands)
-            per_cutter.append(bands)
-        bands = _bands_by_layer(per_cutter, material) if per_cutter else [(a, b, material)]
-        bands = [(low, high, L.opened(paths)) for low, high, paths in bands]
+        bands = [(low, high, paths) for low, high, paths in bands if paths]
         left.append(bands)
         left_volume += _volume(bands)
     return SetupVerdict(layers, cutters, material_volume, left_volume, by_cutter, left, time.perf_counter() - started)
