@@ -41,6 +41,7 @@ thinner than the contact tolerance (1 µm) does not count, as in the layer repla
 from __future__ import annotations
 
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
@@ -70,7 +71,7 @@ REACH_INSET_MM = 0.0015
 OBSTACLE_ARC_MM = 0.001
 # Flat cutters: the closing of the shadow built layer by layer from the top (``CutterReach._closing``). False: each
 # layer on its own (the reference for the proof of the incremental closing).
-INCREMENTAL_CLOSING = True
+INCREMENTAL_CLOSING = os.environ.get("SUBCAD_INCREMENTAL_CLOSING", "1") != "0"
 # A part mesh with this many triangles or more gets one process for each setup.
 PARALLEL_TRIANGLES = 50_000
 # Before an offset of 1 mm or more, vertices within this distance of the line of their neighbours are removed (mm).
@@ -405,7 +406,7 @@ def _offset(paths, distance_mm: float):
         kept.append(path)
     if not kept:
         return []
-    if -distance_mm >= CLEAN_FROM_MM:
+    if abs(distance_mm) >= CLEAN_FROM_MM:
         # Vertices within CLEAN_MM of the line of their neighbours go first: the arcs of an earlier offset and the
         # mesh chords carry many such vertices, and they make a large offset slow (an outline moves by at most
         # CLEAN_MM, half the contact tolerance).
@@ -564,9 +565,10 @@ class CutterReach:
     def _closing(self, index: int) -> list:
         """The closing of the shadow of the layer for the full cutter radius: erode(dilate(shadow, r − fit), r − mesh
         chord). Built from the top layer down. The shadow of a layer is the shadow above it plus its new strip dS,
-        and a dilation distributes over a union: the dilated shadow only gains the dilated strip. A layer without a
-        new strip keeps the closing of the layer above. The erosion of the dilated shadow is then fast (its outline
-        is cleaned to ``CLEAN_MM``), so it is done for the whole layer; a window around dS gives no gain."""
+        and a dilation distributes over a union. A layer without a new strip keeps the closing of the layer above.
+        A layer with a new strip dilates and erodes its whole shadow: with the outlines cleaned to ``CLEAN_MM`` and
+        the closed holes dropped, this takes milliseconds, less than the dilation of the many small pieces of a
+        sloped strip or a window around it (measured on NIST CTC 05)."""
         layers = self.layers
         if index >= layers.count:
             return []
@@ -575,13 +577,13 @@ class CutterReach:
             top = min((k for k in self._closings if k > index), default=layers.count)
             dilated, closing = self._closings.get(top, ([], []))
             for k in range(top - 1, index - 1, -1):
-                above = layers.shadow[k + 1] if k + 1 < layers.count else []
-                band = layers.part_band[k]
-                strip = L.difference(band, above) if above else band
-                strip = [path for path in strip if abs(L.pyclipper.Area(path)) > 1.0]  # below 1e-12 mm²: noise
-                if strip:
-                    # The strip is thin (a sloped wall) and has many mesh vertices: clean it, dilate it, add it.
-                    dilated = L.union(dilated, _offset(_clean(strip), grow))
+                # The new strip is empty when the shadow keeps its area (the shadow only grows downward).
+                same = k + 1 < layers.count and abs(layers.shadow_area(k) - layers.shadow_area(k + 1)) <= 1e-9
+                if not same and layers.shadow[k]:
+                    # The dilation of the new strip alone is slow: a sloped wall gives hundreds of small pieces, each
+                    # grown by the radius. The shadow as one region is fast (the holes that the growth fills are
+                    # dropped first, and the outline is cleaned), so the layer dilates its whole shadow.
+                    dilated = self._offset(layers.shadow[k], grow)
                     closing = _offset(dilated, -shrink)
                 self._closings[k] = (dilated, closing)
         return self._closings[index][1]
