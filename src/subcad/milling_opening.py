@@ -59,13 +59,24 @@ MIN_LAYER_MM = 0.1
 # count grows instead: a side setup across round holes needs about 2 R / chord layers for each hole).
 MAX_LAYERS = 400
 MAX_CHORD_MM = 0.05
-# A cutter centre fits where the gap is this much smaller than the cutter (mm): the mesh chords (1 µm) and the
-# polygon chords of the obstacle offsets (1 µm) lie inside the true surfaces, so a hole of the cutter size fits.
-FIT_MM = 0.002
+# A cutter centre fits where the gap is this much smaller than the cutter (mm): the mesh chords (1 µm), the
+# polygon chords of the obstacle offsets (1 µm) and the outline cleaning (0.5 µm) lie inside the true surfaces, so
+# a hole of the cutter size fits.
+FIT_MM = 0.0025
+# The cutter disk reaches this much less than its radius (mm): the mesh chord (1 µm) and the outline cleaning
+# (0.5 µm, ``CLEAN_MM``). With the fit, the disk reaches at most the mesh chord into the part polygon.
+REACH_INSET_MM = 0.0015
 # Arc tolerance of the obstacle offsets (mm). Its chords lie inside the true offset; ``FIT_MM`` covers them.
 OBSTACLE_ARC_MM = 0.001
+# Flat cutters: the closing of the shadow built layer by layer from the top (``CutterReach._closing``). False: each
+# layer on its own (the reference for the proof of the incremental closing).
+INCREMENTAL_CLOSING = True
 # A part mesh with this many triangles or more gets one process for each setup.
 PARALLEL_TRIANGLES = 50_000
+# Before an offset of 1 mm or more, vertices within this distance of the line of their neighbours are removed (mm).
+CLEAN_MM = 0.0005
+CLEAN_FROM_MM = 1.0
+CLEAN_LOOP_MM = 0.5  # loops smaller than this are not cleaned
 # Arc tolerance of the neighbourhood of a region (its outline grown by the cutter radius) (mm).
 NEAR_ARC_MM = 0.01
 # A drill makes a hole up to this fraction of its radius larger than itself (a spot of free centres).
@@ -336,12 +347,22 @@ def setup_layers(stock_mesh: L.SolidMesh, part_mesh: L.SolidMesh, setup, chord: 
             break
         chord = min(chord * 1.5, MAX_CHORD_MM)
     result = SetupLayers(setup, z_low, z_high, limits, chord_mm=chord, face=face, planar=base)
+    planar_set = set(round(value, 7) for value in base)
+    at_limit = {}  # a limit that is no planar face height: one section serves the layers below and above it
+
+    def near_limit(height, side, edge):
+        if round(height, 7) in planar_set:
+            return _section(part, height + side * edge, edge)
+        key = round(height, 9)
+        if key not in at_limit:
+            at_limit[key] = _section(part, height, edge)
+        return at_limit[key]
     for a, b in zip(limits, limits[1:]):
         middle = (a + b) / 2
         edge = min(1e-6, (b - a) / 4)
         result.stock.append(_section(stock, middle, b - a))
         mid = _section(part, middle, b - a)
-        low, high = _section(part, a + edge, edge), _section(part, b - edge, edge)
+        low, high = near_limit(a, 1, edge), near_limit(b, -1, edge)
         result.part.append(mid)
         result.part_low.append(low)
         result.part_high.append(high)
@@ -384,9 +405,31 @@ def _offset(paths, distance_mm: float):
         kept.append(path)
     if not kept:
         return []
+    if -distance_mm >= CLEAN_FROM_MM:
+        # Vertices within CLEAN_MM of the line of their neighbours go first: the arcs of an earlier offset and the
+        # mesh chords carry many such vertices, and they make a large offset slow (an outline moves by at most
+        # CLEAN_MM, half the contact tolerance).
+        kept = _clean(kept)
+        if not kept:
+            return []
     job = pyclipper.PyclipperOffset(2.0, OBSTACLE_ARC_MM * L.SCALE)
     job.AddPaths(kept, pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
     return job.Execute(distance_mm * L.SCALE)
+
+
+def _clean(paths):
+    """The loops without the vertices within ``CLEAN_MM`` of the line of their neighbours (the outline moves by at
+    most that much). A small loop (a spot of free centres, a hole of the cutter size) stays as it is."""
+    import pyclipper
+    cleaned = []
+    for path in paths:
+        xs = [x for x, _ in path]
+        ys = [y for _, y in path]
+        small = min(max(xs) - min(xs), max(ys) - min(ys)) < CLEAN_LOOP_MM * L.SCALE
+        path = path if small else pyclipper.CleanPolygon(path, CLEAN_MM * L.SCALE)
+        if len(path) >= 3:
+            cleaned.append(path)
+    return cleaned
 
 
 def _near(paths, distance_mm: float):
@@ -422,6 +465,7 @@ class CutterReach:
         self._unions: dict[tuple, list] = {}
         self._clips: dict[tuple, list] = {}
         self._flat: dict[int, list] = {}
+        self._closings: dict[int, tuple] = {}
         self._eroded: dict[tuple, list] = {}
 
     def _first_layer_from(self, z: float) -> int:
@@ -517,6 +561,31 @@ class CutterReach:
             self._offsets[key] = _offset(paths, radius)
         return self._offsets[key]
 
+    def _closing(self, index: int) -> list:
+        """The closing of the shadow of the layer for the full cutter radius: erode(dilate(shadow, r − fit), r − mesh
+        chord). Built from the top layer down. The shadow of a layer is the shadow above it plus its new strip dS,
+        and a dilation distributes over a union: the dilated shadow only gains the dilated strip. A layer without a
+        new strip keeps the closing of the layer above. The erosion of the dilated shadow is then fast (its outline
+        is cleaned to ``CLEAN_MM``), so it is done for the whole layer; a window around dS gives no gain."""
+        layers = self.layers
+        if index >= layers.count:
+            return []
+        if index not in self._closings:
+            grow, shrink = _fit(self.cutter.radius), max(self.cutter.radius - REACH_INSET_MM, 0.0)
+            top = min((k for k in self._closings if k > index), default=layers.count)
+            dilated, closing = self._closings.get(top, ([], []))
+            for k in range(top - 1, index - 1, -1):
+                above = layers.shadow[k + 1] if k + 1 < layers.count else []
+                band = layers.part_band[k]
+                strip = L.difference(band, above) if above else band
+                strip = [path for path in strip if abs(L.pyclipper.Area(path)) > 1.0]  # below 1e-12 mm²: noise
+                if strip:
+                    # The strip is thin (a sloped wall) and has many mesh vertices: clean it, dilate it, add it.
+                    dilated = L.union(dilated, _offset(_clean(strip), grow))
+                    closing = _offset(dilated, -shrink)
+                self._closings[k] = (dilated, closing)
+        return self._closings[index][1]
+
     def _flat_obstacle(self, index: int) -> list:
         layers = self.layers
         if index >= layers.count:
@@ -555,10 +624,17 @@ class CutterReach:
         The reach is the free centres grown by the radius. Only the centres within the radius of the region matter,
         so the free centres are taken inside the region grown by the radius and a margin (no offset of the whole
         obstacle). The result is the region inside the eroded obstacle, exactly."""
+        cutter, layers = self.cutter, self.layers
+        if INCREMENTAL_CLOSING and (cutter.profile_height <= 0 or flat) and cutter.shank_radius <= cutter.radius                 and radius >= cutter.radius:
+            index = layers.layer_at(tip) if tip > layers.z_low else 0
+            if cutter.profile_height <= 0 and abs(layers.limits[index] - tip) > L.Z_MERGE_MM and tip > layers.z_low:
+                index = self._first_layer_from(tip)
+            closing = self._closing(index)
+            return L.intersection(region, closing) if closing else []
         obstacle = self.obstacle(tip, box, flat)
         # The cutter disk reaches up to the mesh chord (1 µm) into the part polygon: the polygon lies that much
         # inside the true part surface, so the disk does not pass the true surface.
-        radius = max(radius - L.MESH_DEFLECTION_MM, 0.0)
+        radius = max(radius - REACH_INSET_MM, 0.0)
         if not obstacle:
             return []
         if radius <= 0:
@@ -684,7 +760,7 @@ class CutterReach:
             x0, y0, x1, y1 = L.bounds(piece)
             if x1 - x0 <= spot and y1 - y0 <= spot and x0 > clip[0][0][0] and y0 > clip[0][0][1]                     and x1 < clip[0][2][0] and y1 < clip[0][2][1]:
                 kept.extend(piece)
-        radius = max(radius - L.MESH_DEFLECTION_MM, 0.0)
+        radius = max(radius - REACH_INSET_MM, 0.0)
         return _offset(kept, radius) if kept and radius > 0 else []
 
     def left(self, index: int, material) -> list[tuple[float, float, list]]:
@@ -860,7 +936,7 @@ class DrillReach:
                 disks = []
                 box = L.bounds(region)
                 for (x, y), tip in self.holes.items():
-                    radius = min(self.cutter.radius_at(z - tip), r) - L.MESH_DEFLECTION_MM if z > tip else 0.0
+                    radius = min(self.cutter.radius_at(z - tip), r) - REACH_INSET_MM if z > tip else 0.0
                     if radius <= 0 or not (box[0] - r * L.SCALE <= x <= box[2] + r * L.SCALE
                                            and box[1] - r * L.SCALE <= y <= box[3] + r * L.SCALE):
                         continue
@@ -955,8 +1031,11 @@ def setup_verdict(stock_mesh, part_mesh, setup, cutters: Sequence, *, layers: Se
         for name, reach in zip(by_cutter, reaches):
             if not any(region for _, _, region in bands):
                 break
-            bands = [(low, high, L.opened(paths)) for low, high, paths in reach.apply(index, bands)]
+            # The contact opening comes once, after the last cutter (a sliver only passes to the next cutter).
+            bands = reach.apply(index, bands)
             by_cutter[name] += _volume(bands)
+        # Material that no cutter touched stays as it is; a cut region drops its parts thinner than the contact.
+        bands = [(low, high, paths if paths is material else L.opened(paths)) for low, high, paths in bands if paths]
         bands = [(low, high, paths) for low, high, paths in bands if paths]
         left[index] = bands
         left_volume += _volume(bands)
