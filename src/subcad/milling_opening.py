@@ -64,6 +64,10 @@ MAX_CHORD_MM = 0.05
 FIT_MM = 0.002
 # Arc tolerance of the obstacle offsets (mm). Its chords lie inside the true offset; ``FIT_MM`` covers them.
 OBSTACLE_ARC_MM = 0.001
+# A part mesh with this many triangles or more gets one process for each setup.
+PARALLEL_TRIANGLES = 50_000
+# Arc tolerance of the neighbourhood of a region (its outline grown by the cutter radius) (mm).
+NEAR_ARC_MM = 0.01
 # A drill makes a hole up to this fraction of its radius larger than itself (a spot of free centres).
 DRILL_HOLE_RATIO = 0.1
 # Height samples in the profile height of a cutter with a profile (ball, bull nose, drill point).
@@ -218,6 +222,12 @@ class SetupLayers:
         import bisect
         return min(max(bisect.bisect_right(self.limits, z + L.Z_MERGE_MM) - 1, 0), self.count - 1)
 
+    def shadow_area(self, index: int) -> float:
+        cache = self.__dict__.setdefault("_shadow_areas", {})
+        if index not in cache:
+            cache[index] = L.area(self.shadow[index])
+        return cache[index]
+
     def material(self, index):
         return L.difference(self.stock[index], self.part[index])
 
@@ -280,13 +290,16 @@ def _divide(first: float, second: float, low, high, rate, chord: float) -> list[
 
 
 def setup_layers(stock_mesh: L.SolidMesh, part_mesh: L.SolidMesh, setup, chord: float = CHORD_MM,
-                 extra_meshes: Sequence = (), reach_depths: Sequence = (), divide_depth: float | None = None) -> SetupLayers:
+                 extra_meshes: Sequence = (), reach_depths: Sequence = (), divide_depth: float | None = None,
+                 divide_ranges: Sequence | None = None) -> SetupLayers:
     """The 2D layers of the stock and the part in the setup frame.
 
     ``extra_meshes``: more solids whose faces add layer limits (a comparison with another material state).
     ``reach_depths``: cutter reach depths below the setup face; each one adds a layer limit.
     ``divide_depth``: divide the sloped intervals only down to this depth below the setup face (the deepest cutter
-    reach). Deeper, no cutter of the setup cuts, and the layers of the planar faces are enough."""
+    reach). Deeper, no cutter of the setup cuts, and the layers of the planar faces are enough.
+    ``divide_ranges``: (low, high) height ranges of the setup frame where the sloped intervals are divided (the reach
+    of every setup of a combination, seen from the reference setup); it replaces ``divide_depth``."""
     setup = Setup.of(setup)
     stock, part = rotated_mesh(stock_mesh, setup), rotated_mesh(part_mesh, setup)
     extra = [rotated_mesh(mesh, setup) for mesh in extra_meshes]
@@ -296,15 +309,23 @@ def setup_layers(stock_mesh: L.SolidMesh, part_mesh: L.SolidMesh, setup, chord: 
     planar += [face - depth for depth in reach_depths if z_low < face - depth < z_high]
     base = L._merged([z_low, z_high, *planar])
     rates = [np.concatenate(values) for values in zip(*[_slope_rates(mesh, chord) for mesh in (stock, part, *extra)])]
+    if divide_ranges is None:
+        divide_ranges = [(-math.inf, math.inf)] if divide_depth is None else [(face - divide_depth, math.inf)]
+    ranges = sorted((low, high) for low, high in divide_ranges if high > low)
     while True:
         limits = [base[0]]
-        cut = -math.inf if divide_depth is None else face - divide_depth
         for first, second in zip(base, base[1:]):
-            if second > cut + L.Z_MERGE_MM:
-                if first < cut - L.Z_MERGE_MM:
-                    limits.append(cut)
-                limits.extend(_divide(max(first, cut), second, *rates, chord))
-            limits.append(second)
+            for low, high in ranges:
+                a, b = max(first, low), min(second, high)
+                if b - a <= L.Z_MERGE_MM:
+                    continue
+                if a > limits[-1] + L.Z_MERGE_MM:
+                    limits.append(a)
+                limits.extend(_divide(a, b, *rates, chord))
+                if b < second - L.Z_MERGE_MM:
+                    limits.append(b)
+            if second > limits[-1] + L.Z_MERGE_MM:
+                limits.append(second)
             if len(limits) > MAX_LAYERS * 4 and chord < MAX_CHORD_MM:
                 break
         if len(limits) - 1 <= MAX_LAYERS or chord >= MAX_CHORD_MM:
@@ -339,12 +360,48 @@ def _signature(paths) -> int:
 
 
 def _offset(paths, distance_mm: float):
+    """The region grown (distance > 0) or shrunk (distance < 0) with round joins.
+
+    A loop that the offset closes is dropped first: a hole narrower than twice the growth fills up, and an outer
+    loop narrower than twice the shrink disappears (its inradius is less than the distance). This is exact, and
+    it keeps the many small holes of a large part section out of the offset."""
     import pyclipper
     if not paths:
         return []
+    limit = 2 * abs(distance_mm) * L.SCALE
+    closing_kind = distance_mm < 0  # True: outer loops vanish; False: holes vanish
+    kept = []
+    for path in paths:
+        if pyclipper.Orientation(path) == closing_kind:
+            xs = [x for x, _ in path]
+            ys = [y for _, y in path]
+            if min(max(xs) - min(xs), max(ys) - min(ys)) < limit:
+                continue
+        kept.append(path)
+    if not kept:
+        return []
     job = pyclipper.PyclipperOffset(2.0, OBSTACLE_ARC_MM * L.SCALE)
-    job.AddPaths(paths, pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
+    job.AddPaths(kept, pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
     return job.Execute(distance_mm * L.SCALE)
+
+
+def _near(paths, distance_mm: float):
+    """The region grown by the distance with a coarse outline (``NEAR_ARC_MM``); a superset of the true offset when
+    the distance holds a margin of the arc tolerance."""
+    if not paths:
+        return []
+    job = pyclipper_module().PyclipperOffset(2.0, NEAR_ARC_MM * L.SCALE)
+    job.AddPaths(paths, pyclipper_module().JT_ROUND, pyclipper_module().ET_CLOSEDPOLYGON)
+    return job.Execute(distance_mm * L.SCALE)
+
+
+def pyclipper_module():
+    import pyclipper
+    return pyclipper
+
+
+def _vertices(paths) -> int:
+    return sum(len(path) for path in paths)
 
 
 def _fit(radius: float) -> float:
@@ -389,7 +446,8 @@ class CutterReach:
             index = layers.layer_at(tip) if tip > layers.z_low else 0
             if c <= 0 and abs(layers.limits[index] - tip) > L.Z_MERGE_MM and tip > layers.z_low:
                 index = self._first_layer_from(tip)
-            result = self._clip(self._flat_obstacle(index), clip) if clip is not None else self._flat_obstacle(index)
+            # No clip: the caller takes the free centres only near its region (``_unreached``).
+            result = self._flat_obstacle(index)
             self._obstacles[key] = result
             return result
         parts = []
@@ -461,11 +519,14 @@ class CutterReach:
             return []
         if index not in self._flat:
             radius = _fit(self.cutter.radius)
-            top = max((k for k in self._flat if k > index), default=layers.count)
+            top = min((k for k in self._flat if k > index), default=layers.count)
             current = self._flat.get(top, [])
             for k in range(top - 1, index - 1, -1):
                 band = layers.part_band[k]
-                if band and not (k + 1 < layers.count and layers.run[k + 1] == layers.run[k]):
+                # A band inside the shadow above (the same shadow area) adds nothing to the obstacle.
+                same = k + 1 < layers.count and (layers.run[k + 1] == layers.run[k] or
+                                                 abs(layers.shadow_area(k) - layers.shadow_area(k + 1)) <= 1e-6)
+                if band and not same:
                     current = L.union(current, self._offset(band, radius))
                 self._flat[k] = current
         return self._flat[index]
@@ -484,22 +545,38 @@ class CutterReach:
             self._unions[key] = L.union([path for item in regions for path in item])
         return self._unions[key]
 
-    def _erode(self, tip: float, radius: float, near, box, flat: bool = False) -> list:
-        """The obstacle shrunk by the radius, near the region only: the erosion at a point depends only on the
-        obstacle within the radius, so the obstacle is clipped to the region box grown by twice the radius."""
+    def _unreached(self, tip: float, radius: float, region, box, flat: bool = False) -> list:
+        """The part of the region that the cutter with its tip at the height does not reach.
+
+        The reach is the free centres grown by the radius. Only the centres within the radius of the region matter,
+        so the free centres are taken inside the region grown by the radius and a margin (no offset of the whole
+        obstacle). The result is the region inside the eroded obstacle, exactly."""
         obstacle = self.obstacle(tip, box, flat)
         # The cutter disk reaches up to the mesh chord (1 µm) into the part polygon: the polygon lies that much
         # inside the true part surface, so the disk does not pass the true surface.
         radius = max(radius - L.MESH_DEFLECTION_MM, 0.0)
-        if radius <= 0 or not obstacle:
-            return obstacle
-        box = L.bounds(near)
-        grow = int((2 * radius + 0.01) * L.SCALE)
-        clip = [[(box[0] - grow, box[1] - grow), (box[2] + grow, box[1] - grow),
-                 (box[2] + grow, box[3] + grow), (box[0] - grow, box[3] + grow)]]
-        key = (_signature(obstacle), round(radius, 7), _signature(clip))
+        if not obstacle:
+            return []
+        if radius <= 0:
+            return L.intersection(region, obstacle)
+        key = (_signature(region), _signature(obstacle), round(radius, 7))
         if key not in self._eroded:
-            self._eroded[key] = _offset(L.intersection(obstacle, clip), -radius)
+            # A coarse outline is enough for the neighbourhood: its chords stay outside the radius by the margin.
+            job = L.pyclipper.PyclipperOffset(2.0, NEAR_ARC_MM * L.SCALE)
+            job.AddPaths(region, L.pyclipper.JT_ROUND, L.pyclipper.ET_CLOSEDPOLYGON)
+            near = job.Execute((radius + 2 * NEAR_ARC_MM) * L.SCALE)
+            local = L.intersection(obstacle, near)
+            free = L.difference(near, local)
+            # The same set two ways: the region less the free centres grown by the radius, or the region inside the
+            # local obstacle shrunk by the radius (its clip edges are farther than the radius from the region).
+            # The offset of the smaller outline is the cheaper one.
+            if not free:
+                result = region
+            elif _vertices(local) < _vertices(free):
+                result = L.intersection(region, _offset(local, -radius))
+            else:
+                result = L.difference(region, _offset(free, radius))
+            self._eroded[key] = result
         return self._eroded[key]
 
     def left_at(self, index: int, z: float, material) -> list:
@@ -583,7 +660,7 @@ class CutterReach:
             if cutter.kind == "drill":
                 left = L.difference(left, self._drill_reach(tip, radius, left, box, straight))
             else:
-                left = L.intersection(left, self._erode(tip, radius, left, box, straight))
+                left = self._unreached(tip, radius, left, box, straight)
             if not left:
                 break
         return left
@@ -647,20 +724,33 @@ class DrillReach:
         self._clips: dict[tuple, list] = {}
         self._flat: dict[int, list] = {}
 
-    def _flat_obstacle(self, index: int) -> list:
+    def _unreached_flat(self, tip: float, radius: float, region) -> list:
+        """A flat cutter (or a profile cutter on a straight stretch) with its tip at the height: the region inside the
+        closing of the shadow, all near the region. A centre within the radius of the region matters, and the
+        obstacle there depends only on the shadow within twice the radius: the shadow is clipped to the region grown
+        by twice the radius and a margin, then grown by the radius less the fit."""
         layers = self.layers
-        if index >= layers.count:
+        index = layers.layer_at(tip) if tip > layers.z_low else 0
+        if self.cutter.profile_height <= 0 and abs(layers.limits[index] - tip) > L.Z_MERGE_MM and tip > layers.z_low:
+            index = self._first_layer_from(tip)
+        shadow = layers.shadow[index] if index < layers.count else []
+        reach = max(radius - L.MESH_DEFLECTION_MM, 0.0)
+        if not shadow:
             return []
-        if index not in self._flat:
-            radius = _fit(self.cutter.radius)
-            top = max((k for k in self._flat if k > index), default=layers.count)
-            current = self._flat.get(top, [])
-            for k in range(top - 1, index - 1, -1):
-                band = layers.part_band[k]
-                if band and not (k + 1 < layers.count and layers.run[k + 1] == layers.run[k]):
-                    current = L.union(current, self._offset(band, radius))
-                self._flat[k] = current
-        return self._flat[index]
+        key = (_signature(region), _signature(shadow), round(radius, 7))
+        if key in self._eroded:
+            return self._eroded[key]
+        far = _near(region, 2 * radius + 4 * NEAR_ARC_MM)
+        local = L.intersection(shadow, far)
+        if not local:
+            result = []
+        else:
+            obstacle = _offset(local, _fit(radius))
+            free = L.difference(_near(region, reach + 2 * NEAR_ARC_MM), obstacle)
+            result = L.difference(region, _offset(free, reach)) if free else region
+        self._eroded[key] = result
+        return result
+
 
     def _clip(self, paths, clip):
         if not paths:
@@ -856,7 +946,7 @@ class SetupVerdict:
 
 
 def setup_verdict(stock_mesh, part_mesh, setup, cutters: Sequence, *, layers: SetupLayers | None = None,
-                  full: bool = True) -> SetupVerdict:
+                  full: bool = True, divide_ranges: Sequence | None = None) -> SetupVerdict:
     """The material that the cutters do not reach from one setup (each layer, all cutters together).
 
     ``full``: divide the sloped layers over the whole height (the reference setup of a combination: its left
@@ -865,7 +955,7 @@ def setup_verdict(stock_mesh, part_mesh, setup, cutters: Sequence, *, layers: Se
     cutters = [Cutter.of(cutter) for cutter in cutters]
     deepest = max((cutter.reach_depth for cutter in cutters), default=0.0)
     layers = layers or setup_layers(stock_mesh, part_mesh, setup, reach_depths=[cutter.reach_depth for cutter in cutters],
-                                    divide_depth=None if full else deepest)
+                                    divide_depth=None if full else deepest, divide_ranges=divide_ranges)
     # Flat cutters first, the largest first: each next cutter works only on what the earlier ones leave, so the
     # profile cutters (slow) see small regions. ``by_cutter``: the left volume after each cutter, in this order.
     cutters.sort(key=lambda cutter: (cutter.profile_height > 0, -cutter.radius))
@@ -902,16 +992,21 @@ def left_regions(verdict: SetupVerdict, limit: int = 10):
                 rows.append([low, high, box, L.area(piece) * (high - low)])
     rows.sort(key=lambda row: row[0])
     regions = []
+    open_at: dict[int, list] = {}  # the regions whose top is at this height (rounded to 1 nm)
     for low, high, box, volume in rows:
-        for region in regions:
-            if abs(region["z"][1] - low) <= 1e-6 and L._overlap(region["box"], box):
+        candidates = open_at.get(round(low * 1e6), [])
+        for region in candidates:
+            if L._overlap(region["box"], box):
+                candidates.remove(region)
                 region["z"][1] = high
                 region["box"] = (min(region["box"][0], box[0]), min(region["box"][1], box[1]),
                                  max(region["box"][2], box[2]), max(region["box"][3], box[3]))
                 region["volume"] += volume
                 break
         else:
-            regions.append({"z": [low, high], "box": box, "volume": volume})
+            region = {"z": [low, high], "box": box, "volume": volume}
+            regions.append(region)
+        open_at.setdefault(round(high * 1e6), []).append(region)
     regions.sort(key=lambda region: -region["volume"])
     return [{"z_mm": [round(region["z"][0], 4), round(region["z"][1], 4)],
              "xy_box_mm": [round(value / L.SCALE, 4) for value in region["box"]],
@@ -1049,6 +1144,32 @@ def combined_left(verdicts: list[SetupVerdict], reference: int = 0):
     return total, result
 
 
+def reach_ranges(part_mesh, setups: list, tools_of: list, reference: int) -> list:
+    """The height ranges of the reference setup where some setup cuts: there the reference layers need the chord
+    bound. A setup on the same axis cuts from its face down to its deepest reach; a setup across the axis cuts at
+    every height of the reference."""
+    base = setups[reference]
+    ranges = []
+    for setup, tools in zip(setups, tools_of):
+        depth = max((Cutter.of(tool).reach_depth for tool in tools), default=0.0)
+        if depth <= 0:
+            continue
+        relation = setup.rotation.T @ base.rotation
+        axis, sign = _axis_of(relation[:, 2])
+        if axis != 2:
+            return [(-math.inf, math.inf)]
+        face = float((part_mesh.vertices @ setup.rotation[:, 2]).max())
+        low, high = sign * (face - depth), sign * (face + 1e3)
+        ranges.append((min(low, high), max(low, high)))
+    return ranges
+
+
+def _setup_job(arguments):
+    (stock_vertices, stock_triangles, part_vertices, part_triangles), setup, tools, full, divide = arguments
+    stock_mesh, part_mesh = L.SolidMesh(stock_vertices, stock_triangles), L.SolidMesh(part_vertices, part_triangles)
+    return setup_verdict(stock_mesh, part_mesh, setup, tools, full=full, divide_ranges=divide)
+
+
 def part_verdict(stock_shape, part_shape, setups: Iterable, cutters, *, reference: int = 0, extra_shapes=()) -> dict:
     """The milling verdict of a part: for each setup the material its cutters leave, and the material that no
     setup reaches. ``cutters``: one list for all setups, or a dict {setup name: list}."""
@@ -1058,12 +1179,25 @@ def part_verdict(stock_shape, part_shape, setups: Iterable, cutters, *, referenc
     extra = [L.SolidMesh.of(shape) for shape in extra_shapes]
     mesh_seconds = time.perf_counter() - started
     verdicts = []
-    for position, setup in enumerate(setups):
-        setup = Setup.of(setup)
-        tools = cutters.get(setup.name, []) if isinstance(cutters, dict) else cutters
-        layers = setup_layers(stock_mesh, part_mesh, setup, extra_meshes=extra,
-                              reach_depths=[Cutter.of(tool).reach_depth for tool in tools]) if extra else None
-        verdicts.append(setup_verdict(stock_mesh, part_mesh, setup, tools, layers=layers, full=position == reference))
+    setups = [Setup.of(setup) for setup in setups]
+    tools_of = [cutters.get(setup.name, []) if isinstance(cutters, dict) else cutters for setup in setups]
+    ranges = reach_ranges(part_mesh, setups, tools_of, reference) if setups else None
+    jobs = [(setup, [Cutter.of(tool) for tool in tools], position == reference,
+             ranges if position == reference else None) for position, (setup, tools) in enumerate(zip(setups, tools_of))]
+    if not extra and len(jobs) > 1 and len(part_mesh.triangles) >= PARALLEL_TRIANGLES:
+        # A large part: one process for each setup (the setups are independent; the start of a process costs a few
+        # seconds, so a small part stays in this process).
+        import os
+        from concurrent.futures import ProcessPoolExecutor
+        meshes = (stock_mesh.vertices, stock_mesh.triangles, part_mesh.vertices, part_mesh.triangles)
+        with ProcessPoolExecutor(max_workers=min(len(jobs), os.cpu_count() or 1)) as pool:
+            verdicts = list(pool.map(_setup_job, [(meshes, *job) for job in jobs]))
+    else:
+        for setup, tools, full, divide in jobs:
+            layers = setup_layers(stock_mesh, part_mesh, setup, extra_meshes=extra,
+                                  reach_depths=[tool.reach_depth for tool in tools]) if extra else None
+            verdicts.append(setup_verdict(stock_mesh, part_mesh, setup, tools, layers=layers, full=full,
+                                          divide_ranges=divide))
     total, bands = combined_left(verdicts, reference) if verdicts else (None, [])
     return {"schema": "subcad.milling_opening.v1", "method": "morphological_opening_by_layer",
             "contact_tolerance_mm": L.CONTACT_MM, "arc_tolerance_mm": L.ARC_TOLERANCE_MM,

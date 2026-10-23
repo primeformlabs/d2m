@@ -388,8 +388,9 @@ class SolidMesh:
         from OCP.TopoDS import TopoDS
 
         # Mesh a copy: OCCT keeps a triangulation on the faces, and the process material shares its faces.
+        # The faces mesh in parallel (each face on its own; the result is the same as one by one).
         native = shape.copy().wrapped
-        BRepMesh_IncrementalMesh(native, deflection, False, angle, False)
+        BRepMesh_IncrementalMesh(native, deflection, False, angle, True)
         points, triangles, offset_index = [], [], 0
         explorer = TopExp_Explorer(native, TopAbs_FACE)
         while explorer.More():
