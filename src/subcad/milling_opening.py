@@ -358,22 +358,31 @@ def setup_layers(stock_mesh: L.SolidMesh, part_mesh: L.SolidMesh, setup, chord: 
         if key not in at_limit:
             at_limit[key] = _section(part, height, edge)
         return at_limit[key]
+    # Below the deepest reach no cutter of the setup works: those layers need only their middle sections (for the
+    # material and the setup combination), no edge sections and no shadow.
+    deep = face - max(reach_depths) if reach_depths else -math.inf
     for a, b in zip(limits, limits[1:]):
         middle = (a + b) / 2
         edge = min(1e-6, (b - a) / 4)
         result.stock.append(_section(stock, middle, b - a))
         mid = _section(part, middle, b - a)
-        low, high = near_limit(a, 1, edge), near_limit(b, -1, edge)
+        if b <= deep + L.Z_MERGE_MM:
+            low = high = band = mid
+        else:
+            low, high = near_limit(a, 1, edge), near_limit(b, -1, edge)
+            band = L.union(mid, L.union(low, high))
         result.part.append(mid)
         result.part_low.append(low)
         result.part_high.append(high)
-        result.part_band.append(L.union(mid, L.union(low, high)))
+        result.part_band.append(band)
     for index, band in enumerate(result.part_band):
         same = index and band == result.part_band[index - 1]
         result.run.append(result.run[-1] if same else index)
     shadow: list = []
-    for band in reversed(result.part_band):
-        shadow = L.union(shadow, band) if band else shadow
+    for index in reversed(range(len(result.part_band))):
+        band = result.part_band[index]
+        if limits[index + 1] > deep + L.Z_MERGE_MM and band:
+            shadow = L.union(shadow, band)
         result.shadow.append(shadow)
     result.shadow.reverse()
     return result
@@ -1130,8 +1139,11 @@ def _line_intervals(paths, coordinate: int, value: float, edges=None):
     return list(zip(crossings[0::2], crossings[1::2]))
 
 
-def section_in(verdict: SetupVerdict, reference: Setup, z: float):
-    """The left material of another setup on the plane z (reference setup frame), in reference xy paths."""
+def section_in(verdict: SetupVerdict, reference: Setup, z: float, within=None):
+    """The left material of another setup on the plane z (reference setup frame), in reference xy paths.
+
+    ``within``: the bounds (reference xy, nm) of the region that the section will cut; the parts of the other
+    setup outside them are not built (the result is the same inside them)."""
     other = verdict.layers.setup
     # Reference axes in the other frame: column k of (other^T reference).
     relation = other.rotation.T @ reference.rotation
@@ -1171,16 +1183,39 @@ def section_in(verdict: SetupVerdict, reference: Setup, z: float):
         wide = 1e5 * L.SCALE
         rects.append(rectangle(-wide, wide, verdict.layers.z_low - 1.0, min(reach_low, verdict.layers.z_high + 1.0)))
     target = level * L.SCALE
+    # The height of the other frame is one reference coordinate; its in-plane coordinate is the other.
+    height_ref = 0 if x_axis == 2 else 1
+    height_sign = x_sign if x_axis == 2 else y_sign
+    along_sign = y_sign if x_axis == 2 else x_sign
+    if within is not None:
+        lo_h, hi_h = within[height_ref] / L.SCALE, within[height_ref + 2] / L.SCALE
+        lo_h, hi_h = sorted((height_sign * lo_h, height_sign * hi_h))  # the range of the other frame heights
+        lo_a, hi_a = within[1 - height_ref], within[3 - height_ref]
+        lo_a, hi_a = sorted((along_sign * lo_a, along_sign * hi_a))
+    # The same interval in consecutive bands (a wall along the other axis) becomes one taller rectangle.
+    open_rects: dict[tuple, list] = {}
     for bands in verdict.left:
         for low, high, paths in bands:
             if high <= reach_low + L.Z_MERGE_MM:
+                continue
+            if within is not None and (high < lo_h - 1e-6 or low > hi_h + 1e-6):
                 continue
             box = verdict.band_box(paths)
             if box is None or not box[normal_axis] <= target <= box[normal_axis + 2]:
                 continue
             for start, end in _line_intervals(paths, normal_axis, level, verdict.band_edges(paths)):
-                # The rectangle: the in-plane coordinate of the other frame from start to end, z from low to high.
-                rects.append(rectangle(start, end, low, high))
+                if within is not None and (end < lo_a - 1000 or start > hi_a + 1000):
+                    continue
+                key = (int(round(start)), int(round(end)))
+                current = open_rects.get(key)
+                if current is not None and abs(current[1] - low) <= 1e-6:
+                    current[1] = high
+                else:
+                    if current is not None:
+                        rects.append(rectangle(start, end, current[0], current[1]))
+                    open_rects[key] = [low, high]
+    for (start, end), (low, high) in open_rects.items():
+        rects.append(rectangle(start, end, low, high))
     return L.union(rects)
 
 
@@ -1197,7 +1232,7 @@ def combined_left(verdicts: list[SetupVerdict], reference: int = 0):
             for verdict in others:
                 if not left:
                     break
-                section = section_in(verdict, base.layers.setup, (low + high) / 2)
+                section = section_in(verdict, base.layers.setup, (low + high) / 2, L.bounds(left))
                 if section is not None:
                     left = L.intersection(left, section)
             left = L.opened(left)
@@ -1230,7 +1265,11 @@ def reach_ranges(part_mesh, setups: list, tools_of: list, reference: int) -> lis
 def _setup_job(arguments):
     (stock_vertices, stock_triangles, part_vertices, part_triangles), setup, tools, full, divide = arguments
     stock_mesh, part_mesh = L.SolidMesh(stock_vertices, stock_triangles), L.SolidMesh(part_vertices, part_triangles)
-    return setup_verdict(stock_mesh, part_mesh, setup, tools, full=full, divide_ranges=divide)
+    verdict = setup_verdict(stock_mesh, part_mesh, setup, tools, full=full, divide_ranges=divide)
+    # The parent needs the left bands and the layer limits only: the sections stay here (less to send back).
+    layers = verdict.layers
+    layers.stock = layers.part = layers.part_low = layers.part_high = layers.part_band = layers.shadow = []
+    return verdict
 
 
 def part_verdict(stock_shape, part_shape, setups: Iterable, cutters, *, reference: int = 0, extra_shapes=()) -> dict:
