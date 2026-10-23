@@ -26,8 +26,9 @@ z - c gives no more reach (its obstacle is larger, its radius is the same). So
 
     left(z) = R ∩ intersection over t of offset(obstacle(t), -rho(z - t))
 
-Reach: a layer deeper below the setup face (the stock top) than min(flute length, stick-out, reach) is
-out of reach for that cutter. A tip does not go below the stock bottom (the table and the fixture are there).
+Reach: a layer deeper below the setup face than min(flute length, stick-out, reach) is out of reach for
+that cutter. The setup face is the part top in the setup frame: the plan faces it first (D2O "Face and
+square first datums"), and the old replay measures the cutting depth from the incoming material top. A tip does not go below the stock bottom (the table and the fixture are there).
 
 Layers: the limits are the heights of the planar (horizontal) faces of the stock and the part. A layer
 that a sloped or curved face crosses is divided so that the face section moves by at most ``CHORD_MM``
@@ -53,7 +54,12 @@ CHORD_MM = 0.01
 # Thinnest layer (mm). A face that is almost horizontal does not divide its interval below this height.
 MIN_LAYER_MM = 0.005
 # Largest number of layers of one setup; above it the chord bound grows.
-MAX_LAYERS = 800
+MAX_LAYERS = 400
+# A cutter fits where the gap is this much smaller than its size (mm): the mesh chords (1 µm) and the polygon
+# chords of the offsets (2 µm) are inside the true surfaces, so a hole of the cutter size must still fit.
+FIT_MM = 0.004
+# Arc tolerance of the obstacle offsets (mm). Its chords lie inside the true offset; ``FIT_MM`` covers them.
+OBSTACLE_ARC_MM = 0.002
 # Height samples in the profile height of a cutter with a profile (ball, bull nose, drill point).
 PROFILE_SAMPLES = 8
 # The setup frames of the six cardinal faces (D2O ``milling_setup_frame.FACE_AXES``): profile axes u, v and the normal.
@@ -188,6 +194,9 @@ class SetupLayers:
     part_band: list = field(default_factory=list)    # bottom ∪ middle ∪ top sections (shadow input)
     shadow: list = field(default_factory=list)       # union of part_band of this layer and all layers above
     chord_mm: float = CHORD_MM
+    face: float = 0.0  # the setup face: the part top in the setup frame (the plan faces it first)
+    planar: list = field(default_factory=list)  # the heights of the horizontal faces (floors)
+    run: list = field(default_factory=list)     # the first layer of the run of equal part sections of each layer
 
     @property
     def count(self) -> int:
@@ -244,14 +253,18 @@ def _divide(first: float, second: float, low, high, rate, chord: float) -> list[
     return result
 
 
-def setup_layers(stock_mesh: L.SolidMesh, part_mesh: L.SolidMesh, setup, chord: float = CHORD_MM) -> SetupLayers:
-    """The 2D layers of the stock and the part in the setup frame."""
+def setup_layers(stock_mesh: L.SolidMesh, part_mesh: L.SolidMesh, setup, chord: float = CHORD_MM,
+                 extra_meshes: Sequence = ()) -> SetupLayers:
+    """The 2D layers of the stock and the part in the setup frame.
+
+    ``extra_meshes``: more solids whose faces add layer limits (a comparison with another material state)."""
     setup = Setup.of(setup)
     stock, part = rotated_mesh(stock_mesh, setup), rotated_mesh(part_mesh, setup)
+    extra = [rotated_mesh(mesh, setup) for mesh in extra_meshes]
     z_low, z_high = float(stock.vertices[:, 2].min()), float(stock.vertices[:, 2].max())
-    planar = [z for z in np.concatenate([_horizontal_heights(stock), _horizontal_heights(part)]) if z_low < z < z_high]
+    planar = [z for z in np.concatenate([_horizontal_heights(mesh) for mesh in (stock, part, *extra)]) if z_low < z < z_high]
     base = L._merged([z_low, z_high, *planar])
-    rates = [np.concatenate(values) for values in zip(_slope_rates(stock), _slope_rates(part))]
+    rates = [np.concatenate(values) for values in zip(*[_slope_rates(mesh) for mesh in (stock, part, *extra)])]
     while True:
         limits = [base[0]]
         for first, second in zip(base, base[1:]):
@@ -262,7 +275,8 @@ def setup_layers(stock_mesh: L.SolidMesh, part_mesh: L.SolidMesh, setup, chord: 
         if len(limits) - 1 <= MAX_LAYERS:
             break
         chord *= 1.5
-    result = SetupLayers(setup, z_low, z_high, limits, chord_mm=chord)
+    face = min(float(part.vertices[:, 2].max()), z_high)
+    result = SetupLayers(setup, z_low, z_high, limits, chord_mm=chord, face=face, planar=base)
     for a, b in zip(limits, limits[1:]):
         middle = (a + b) / 2
         edge = min(1e-6, (b - a) / 4)
@@ -270,6 +284,9 @@ def setup_layers(stock_mesh: L.SolidMesh, part_mesh: L.SolidMesh, setup, chord: 
         mid = part.section(middle)
         result.part.append(mid)
         result.part_band.append(L.union(mid, L.union(part.section(a + edge), part.section(b - edge))))
+    for index, band in enumerate(result.part_band):
+        same = index and band == result.part_band[index - 1]
+        result.run.append(result.run[-1] if same else index)
     shadow: list = []
     for band in reversed(result.part_band):
         shadow = L.union(shadow, band) if band else shadow
@@ -280,76 +297,171 @@ def setup_layers(stock_mesh: L.SolidMesh, part_mesh: L.SolidMesh, setup, chord: 
 
 # -- the reach of one cutter -----------------------------------------------------------------------
 
+def _signature(paths) -> int:
+    return hash(tuple(tuple(map(tuple, path)) for path in paths))
+
+
+def _offset(paths, distance_mm: float):
+    import pyclipper
+    if not paths:
+        return []
+    job = pyclipper.PyclipperOffset(2.0, OBSTACLE_ARC_MM * L.SCALE)
+    job.AddPaths(paths, pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
+    return job.Execute(distance_mm * L.SCALE)
+
+
+def _fit(radius: float) -> float:
+    return max(radius - FIT_MM, 0.0)
+
+
 class CutterReach:
     """The material left by one cutter in each layer of one setup."""
 
     def __init__(self, layers: SetupLayers, cutter: Cutter):
         self.layers, self.cutter = layers, cutter
         self._obstacles: dict[float, list] = {}
-        self._eroded: dict[tuple, list] = {}
+        self._offsets: dict[tuple, list] = {}
+        self._unions: dict[tuple, list] = {}
+        self._clips: dict[tuple, list] = {}
 
     def _first_layer_from(self, z: float) -> int:
         """The first layer whose bottom is at or above the height (count if none)."""
         import bisect
         return bisect.bisect_left(self.layers.limits, z - L.Z_MERGE_MM, hi=self.layers.count)
 
-    def obstacle(self, tip: float) -> list:
-        """The tool-centre positions where the cutter with its tip at the height touches the part."""
-        key = round(tip, 7)
+    def obstacle(self, tip: float, box=None) -> list:
+        """The tool-centre positions where the cutter with its tip at the height touches the part.
+
+        ``box``: only the obstacle near this box is needed. The part sections are clipped to the box grown by three
+        times the largest cutter radius: a clip edge changes the obstacle only within that radius of the edge."""
+        key = (round(tip, 7), box)
         if key in self._obstacles:
             return self._obstacles[key]
+        clip = None
+        if box is not None:
+            grow = int((3 * max(self.cutter.radius, self.cutter.shank_radius) + 0.01) * L.SCALE)
+            clip = [[(box[0] - grow, box[1] - grow), (box[2] + grow, box[1] - grow),
+                     (box[2] + grow, box[3] + grow), (box[0] - grow, box[3] + grow)]]
         layers, cutter = self.layers, self.cutter
         c, r, rs = cutter.profile_height, cutter.radius, cutter.shank_radius
         parts = []
         full = self._first_layer_from(tip + c)  # every layer from here sees the full radius
         start = layers.layer_at(tip) if tip > layers.z_low else 0
-        for index in range(start, min(full, layers.count)):
-            top = layers.limits[index + 1]
-            if top <= tip + L.Z_MERGE_MM or not layers.part_band[index]:
+        end = min(full, layers.count)
+        if end - start <= 3 * PROFILE_SAMPLES:
+            groups = []
+            index = start
+            while index < end:
+                # A run of layers with the same part section: one offset with the radius at the run top.
+                last = index
+                while last + 1 < end and layers.run[last + 1] == layers.run[index]:
+                    last += 1
+                groups.append((layers.limits[last + 1], [layers.part_band[index]]))
+                index = last + 1
+        else:
+            # Many thin layers in the profile height: 2 * PROFILE_SAMPLES height bins, each the union of its
+            # layers with the radius at the bin top (the radius is at most one bin step too large).
+            bins = 2 * PROFILE_SAMPLES
+            groups = [(tip + c * (step + 1) / bins, []) for step in range(bins)]
+            for index in range(start, end):
+                low, high = layers.heights(index)
+                first = max(int((low - tip) / c * bins), 0)
+                last = min(int(math.ceil((high - tip) / c * bins)), bins)
+                for step in range(first, max(last, first + 1)):
+                    groups[min(step, bins - 1)][1].append(layers.part_band[index])
+            groups = [(min(top, layers.limits[end]), bands) for top, bands in groups]
+        for top, bands in groups:
+            if top <= tip + L.Z_MERGE_MM:
                 continue
-            radius = cutter.radius_at(top - tip)
-            parts.append(L.offset(layers.part_band[index], radius) if radius > 0 else layers.part_band[index])
+            band = bands[0] if len(bands) == 1 else self._union(bands)
+            band = self._clip(band, clip)
+            if not band:
+                continue
+            radius = _fit(cutter.radius_at(top - tip))
+            parts.append(self._offset(band, radius) if radius > 0 else band)
         if full < layers.count and layers.shadow[full]:
-            parts.append(L.offset(layers.shadow[full], r))
+            parts.append(self._offset(self._clip(layers.shadow[full], clip), _fit(r)))
         if rs > r:
             shank = self._first_layer_from(tip + cutter.flute_length)
             if shank < layers.count and layers.shadow[shank]:
-                parts.append(L.offset(layers.shadow[shank], rs))
+                parts.append(self._offset(self._clip(layers.shadow[shank], clip), _fit(rs)))
         result = L.union([path for item in parts for path in item]) if parts else []
         self._obstacles[key] = result
         return result
 
-    def _erode(self, tip: float, radius: float) -> list:
-        key = (round(tip, 7), round(radius, 7))
-        if key not in self._eroded:
-            obstacle = self.obstacle(tip)
-            self._eroded[key] = L.offset(obstacle, -radius) if radius > 0 and obstacle else obstacle
-        return self._eroded[key]
+    def _offset(self, paths, radius: float) -> list:
+        """An offset, kept for equal regions (the equal sections of the layers along vertical walls)."""
+        key = (_signature(paths), round(radius, 7))
+        if key not in self._offsets:
+            self._offsets[key] = _offset(paths, radius)
+        return self._offsets[key]
+
+    def _clip(self, paths, clip):
+        if clip is None or not paths:
+            return paths
+        key = (_signature(paths), _signature(clip))
+        if key not in self._clips:
+            self._clips[key] = L.intersection(paths, clip)
+        return self._clips[key]
+
+    def _union(self, regions) -> list:
+        key = tuple(_signature(paths) for paths in regions)
+        if key not in self._unions:
+            self._unions[key] = L.union([path for item in regions for path in item])
+        return self._unions[key]
+
+    def _erode(self, tip: float, radius: float, near, box) -> list:
+        """The obstacle shrunk by the radius, near the region only: the erosion at a point depends only on the
+        obstacle within the radius, so the obstacle is clipped to the region box grown by twice the radius."""
+        obstacle = self.obstacle(tip, box)
+        radius = _fit(radius)
+        if radius <= 0 or not obstacle:
+            return obstacle
+        box = L.bounds(near)
+        grow = int((2 * radius + 0.01) * L.SCALE)
+        clip = [[(box[0] - grow, box[1] - grow), (box[2] + grow, box[1] - grow),
+                 (box[2] + grow, box[3] + grow), (box[0] - grow, box[3] + grow)]]
+        return _offset(L.intersection(obstacle, clip), -radius)
 
     def left_at(self, index: int, z: float, material) -> list:
         """The material of the layer that the cutter does not reach at the height z."""
         layers, cutter = self.layers, self.cutter
         if not material:
             return []
-        if layers.z_high - z > cutter.reach_depth + 1e-9:
+        if layers.face - z > cutter.reach_depth + 1e-9:
             return material
+        box = L.bounds(material)
         c = cutter.profile_height
         if c <= 0:
             tips = [(z, cutter.radius)]
         else:
-            # The tip heights: even steps in the profile height, and every layer limit (a floor) in it.
+            # The tip heights: even steps in the profile height, and every horizontal face (a floor) in it.
             import bisect
             heights = {z - c * step / PROFILE_SAMPLES for step in range(PROFILE_SAMPLES + 1)}
-            first = bisect.bisect_left(layers.limits, z - c - L.Z_MERGE_MM)
-            last = bisect.bisect_right(layers.limits, z + L.Z_MERGE_MM)
-            heights.update(layers.limits[first:last])
-            tips = [(tip, cutter.radius_at(z - tip)) for tip in sorted(heights, reverse=True)
-                    if tip >= layers.z_low - L.Z_MERGE_MM]
+            first = bisect.bisect_left(layers.planar, z - c - L.Z_MERGE_MM)
+            last = bisect.bisect_right(layers.planar, z + L.Z_MERGE_MM)
+            heights.update(layers.planar[first:last])
+            # A tip moves to the nearest floor within half a step, else down to a grid of step c / (2 samples) from
+            # the stock bottom: the layers share their tip heights and obstacles (a lower tip reaches less, so the
+            # grid never claims more reach).
+            snap = c / (2 * PROFILE_SAMPLES)
+            snapped = set()
+            for tip in heights:
+                near = bisect.bisect_left(layers.planar, tip)
+                options = [layers.planar[k] for k in (near - 1, near) if 0 <= k < len(layers.planar)]
+                best = min(options, key=lambda value: abs(value - tip)) if options else None
+                if best is not None and abs(best - tip) <= snap / 2 and best <= z + L.Z_MERGE_MM:
+                    snapped.add(best)
+                else:
+                    snapped.add(layers.z_low + math.floor((tip - layers.z_low) / snap + 1e-9) * snap)
+            # The lowest tip first: it has the full radius at z and removes most of the region.
+            tips = [(tip, cutter.radius_at(z - tip)) for tip in sorted(snapped)
+                    if tip >= layers.z_low - c - L.Z_MERGE_MM]
         left = material
         for tip, radius in tips:
-            if layers.z_high - tip > cutter.reach_depth + 1e-9:
+            if layers.face - tip > cutter.reach_depth + 1e-9:
                 continue
-            left = L.intersection(left, self._erode(tip, radius))
+            left = L.intersection(left, self._erode(tip, radius, left, box))
             if not left:
                 break
         return left
@@ -402,7 +514,7 @@ class SetupVerdict:
 
     def to_dict(self, *, regions: int = 10):
         return {"setup": self.layers.setup.to_dict(), "layer_count": self.layers.count,
-                "z_range_mm": [self.layers.z_low, self.layers.z_high], "chord_mm": self.layers.chord_mm,
+                "z_range_mm": [self.layers.z_low, self.layers.z_high], "setup_face_mm": self.layers.face, "chord_mm": self.layers.chord_mm,
                 "material_to_remove_mm3": self.material_mm3, "left_mm3": self.left_mm3,
                 "cutters": [cutter.to_dict() for cutter in self.cutters], "left_by_cutter_mm3": self.by_cutter,
                 "left_regions": left_regions(self, limit=regions), "seconds": round(self.seconds, 3)}
@@ -571,18 +683,20 @@ def combined_left(verdicts: list[SetupVerdict], reference: int = 0):
     return total, result
 
 
-def part_verdict(stock_shape, part_shape, setups: Iterable, cutters, *, reference: int = 0) -> dict:
+def part_verdict(stock_shape, part_shape, setups: Iterable, cutters, *, reference: int = 0, extra_shapes=()) -> dict:
     """The milling verdict of a part: for each setup the material its cutters leave, and the material that no
     setup reaches. ``cutters``: one list for all setups, or a dict {setup name: list}."""
     started = time.perf_counter()
     stock_mesh = L.SolidMesh.of(stock_shape)
     part_mesh = L.SolidMesh.of(part_shape)
+    extra = [L.SolidMesh.of(shape) for shape in extra_shapes]
     mesh_seconds = time.perf_counter() - started
     verdicts = []
     for setup in setups:
         setup = Setup.of(setup)
         tools = cutters.get(setup.name, []) if isinstance(cutters, dict) else cutters
-        verdicts.append(setup_verdict(stock_mesh, part_mesh, setup, tools))
+        layers = setup_layers(stock_mesh, part_mesh, setup, extra_meshes=extra) if extra else None
+        verdicts.append(setup_verdict(stock_mesh, part_mesh, setup, tools, layers=layers))
     total, bands = combined_left(verdicts, reference) if verdicts else (None, [])
     return {"schema": "subcad.milling_opening.v1", "method": "morphological_opening_by_layer",
             "contact_tolerance_mm": L.CONTACT_MM, "arc_tolerance_mm": L.ARC_TOLERANCE_MM,
