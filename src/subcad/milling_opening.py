@@ -355,6 +355,8 @@ class CutterReach:
         self._offsets: dict[tuple, list] = {}
         self._unions: dict[tuple, list] = {}
         self._clips: dict[tuple, list] = {}
+        self._flat: dict[int, list] = {}
+        self._eroded: dict[tuple, list] = {}
 
     def _first_layer_from(self, z: float) -> int:
         """The first layer whose bottom is at or above the height (count if none)."""
@@ -376,6 +378,15 @@ class CutterReach:
                      (box[2] + grow, box[3] + grow), (box[0] - grow, box[3] + grow)]]
         layers, cutter = self.layers, self.cutter
         c, r, rs = cutter.profile_height, cutter.radius, cutter.shank_radius
+        if (c <= 0 or flat) and rs <= r:
+            # Flat: the offset of the shadow, built from the top down one layer band at a time (the offset of a
+            # union is the union of the offsets), then clipped near the region.
+            index = layers.layer_at(tip) if tip > layers.z_low else 0
+            if c <= 0 and abs(layers.limits[index] - tip) > L.Z_MERGE_MM and tip > layers.z_low:
+                index = self._first_layer_from(tip)
+            result = self._clip(self._flat_obstacle(index), clip) if clip is not None else self._flat_obstacle(index)
+            self._obstacles[key] = result
+            return result
         parts = []
         full = self._first_layer_from(tip + c)  # every layer from here sees the full radius
         if flat:
@@ -439,6 +450,21 @@ class CutterReach:
             self._offsets[key] = _offset(paths, radius)
         return self._offsets[key]
 
+    def _flat_obstacle(self, index: int) -> list:
+        layers = self.layers
+        if index >= layers.count:
+            return []
+        if index not in self._flat:
+            radius = _fit(self.cutter.radius)
+            top = max((k for k in self._flat if k > index), default=layers.count)
+            current = self._flat.get(top, [])
+            for k in range(top - 1, index - 1, -1):
+                band = layers.part_band[k]
+                if band and not (k + 1 < layers.count and layers.run[k + 1] == layers.run[k]):
+                    current = L.union(current, self._offset(band, radius))
+                self._flat[k] = current
+        return self._flat[index]
+
     def _clip(self, paths, clip):
         if clip is None or not paths:
             return paths
@@ -466,7 +492,10 @@ class CutterReach:
         grow = int((2 * radius + 0.01) * L.SCALE)
         clip = [[(box[0] - grow, box[1] - grow), (box[2] + grow, box[1] - grow),
                  (box[2] + grow, box[3] + grow), (box[0] - grow, box[3] + grow)]]
-        return _offset(L.intersection(obstacle, clip), -radius)
+        key = (_signature(obstacle), round(radius, 7), _signature(clip))
+        if key not in self._eroded:
+            self._eroded[key] = _offset(L.intersection(obstacle, clip), -radius)
+        return self._eroded[key]
 
     def left_at(self, index: int, z: float, material) -> list:
         """The material of the layer that the cutter does not reach at the height z."""
@@ -611,6 +640,22 @@ class DrillReach:
         self.holes: dict[tuple, float] = {}   # (x, y) in nm -> deepest tip height
         self._spots: dict[tuple, list] = {}
         self._clips: dict[tuple, list] = {}
+        self._flat: dict[int, list] = {}
+
+    def _flat_obstacle(self, index: int) -> list:
+        layers = self.layers
+        if index >= layers.count:
+            return []
+        if index not in self._flat:
+            radius = _fit(self.cutter.radius)
+            top = max((k for k in self._flat if k > index), default=layers.count)
+            current = self._flat.get(top, [])
+            for k in range(top - 1, index - 1, -1):
+                band = layers.part_band[k]
+                if band and not (k + 1 < layers.count and layers.run[k + 1] == layers.run[k]):
+                    current = L.union(current, self._offset(band, radius))
+                self._flat[k] = current
+        return self._flat[index]
 
     def _clip(self, paths, clip):
         if not paths:
@@ -703,11 +748,20 @@ class DrillReach:
         a, b = self.layers.heights(index)
         r, c = self.cutter.radius, self.cutter.profile_height
         size = 2 * ((1 + DRILL_HOLE_RATIO) * r + 0.01) * L.SCALE
+        # A hole shows as a piece that holds the drill disk (area at least π r², box at most the hole size).
+        # Each hole needs one such layer; a piece around a known hole axis is not searched again.
+        least = 0.98 * math.pi * r * r
+        seen = set()
         for _, _, region in bands:
             for piece in _pieces(region):
                 x0, y0, x1, y1 = L.bounds(piece)
-                if x1 - x0 <= size and y1 - y0 <= size:
-                    self._find(index, piece)
+                if x1 - x0 > size or y1 - y0 > size or L.area(piece) < least:
+                    continue
+                key = _signature(piece)
+                if key in seen or any(x0 <= x <= x1 and y0 <= y <= y1 for x, y in self.holes):
+                    continue
+                seen.add(key)
+                self._find(index, piece)
         if not self.holes:
             return bands
         cuts = [a + c * step / PROFILE_SAMPLES for step in range(1, PROFILE_SAMPLES + 1)] if c > 0 else []
