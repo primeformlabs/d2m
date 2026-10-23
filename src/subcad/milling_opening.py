@@ -72,8 +72,10 @@ OBSTACLE_ARC_MM = 0.001
 # Flat cutters: the closing of the shadow built layer by layer from the top (``CutterReach._closing``). False: each
 # layer on its own (the reference for the proof of the incremental closing).
 INCREMENTAL_CLOSING = os.environ.get("SUBCAD_INCREMENTAL_CLOSING", "1") != "0"
-# A part mesh with this many triangles or more gets one process for each setup.
-PARALLEL_TRIANGLES = 50_000
+# A part mesh with this many triangles or more gets one process for each setup. The start of a process (imports,
+# the meshes sent over) costs more than it saves on NIST CTC 05 (553,000 triangles: 41 s with processes, 32 s
+# without), so only a much larger mesh uses them.
+PARALLEL_TRIANGLES = 3_000_000
 # Before an offset of 1 mm or more, vertices within this distance of the line of their neighbours are removed (mm).
 CLEAN_MM = 0.0005
 CLEAN_FROM_MM = 1.0

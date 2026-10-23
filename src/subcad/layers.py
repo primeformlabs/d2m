@@ -460,23 +460,35 @@ def _join(keys: np.ndarray, points: np.ndarray):
     partner = np.empty(2 * count, np.int64)
     partner[order[0::2]] = order[1::2]
     partner[order[1::2]] = order[0::2]
-    partner = partner.tolist()
-    ends = points.reshape(-1, 2).tolist()
-    used = [False] * count
-    loops = []
-    for start in range(count):
-        if used[start]:
-            continue
-        loop, segment, enter = [], start, 0
-        while not used[segment]:
-            used[segment] = True
-            loop.append(tuple(ends[2 * segment + enter]))
-            position = partner[2 * segment + 1 - enter]
-            segment, enter = position >> 1, position & 1
-        if segment != start or enter != 0:
-            raise ValueError("The material mesh is not closed. The layer check cannot read its sections.")
-        loops.append(loop)
-    return loops
+    # A state 2 s + e: segment s entered at its end e. The next state leaves s at its other end and enters the
+    # segment that shares that mesh edge. The states form cycles; each loop is two cycles (both directions), and the
+    # cycle that holds its first segment entered at end 0 (an even smallest state) is kept. Pointer jumping gives
+    # each state its cycle (smallest state) and its step from there, all in numpy.
+    states = 2 * count
+    following = partner[np.arange(states) ^ 1]
+    label = np.arange(states)
+    jump = following.copy()
+    span = 1
+    while span < states:
+        label = np.minimum(label, label[jump])
+        jump = jump[jump]
+        span *= 2
+    keep = (label % 2 == 0)
+    previous = np.empty(states, np.int64)
+    previous[following] = np.arange(states)
+    leader = label == np.arange(states)
+    rank = np.where(leader, 0, 1)
+    jump = np.where(leader, np.arange(states), previous)
+    span = 1
+    while span < states:
+        rank = rank + rank[jump]
+        jump = jump[jump]
+        span *= 2
+    chosen = np.nonzero(keep)[0]
+    chosen = chosen[np.lexsort((rank[chosen], label[chosen]))]
+    ends = points.reshape(-1, 2)[chosen]
+    cuts = np.nonzero(np.diff(label[chosen]))[0] + 1
+    return [list(map(tuple, part.tolist())) for part in np.split(ends, cuts)]
 
 
 def _join_general(keys: np.ndarray, points: np.ndarray):
