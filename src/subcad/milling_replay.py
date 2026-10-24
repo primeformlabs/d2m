@@ -35,6 +35,31 @@ def _boolean(first, others, operation: str, *, tolerance: float | None = None):
     return cq.Shape.cast(job.Shape())
 
 
+# A cutter face that touches a face of the material within this distance (mm) is the same face for the cut.
+CUT_FUZZY_MM = 1e-3
+
+
+def cut_material(material, cutter):
+    """The material minus one cutter solid (D2O TP-0127: the D22 hole after the 6 mm corner rest pass).
+
+    1. The plain cut.
+    2. A raster pass before can leave a floor split into coplanar faces at the cutter's end level; the cut then gives
+       no solid. The same material with its coplanar faces unified cuts correctly. The join can move sampled
+       boundaries by far less than a micrometre: at most a 0.1 mm cube of volume.
+    3. A cutter that runs along a channel cut before touches its walls within a micrometre; the cut gives an
+       invalid solid. A fuzzy cut (``CUT_FUZZY_MM``) treats those faces as one."""
+    result = _boolean(material, [cutter], "cut")
+    if result.Solids() and result.isValid():
+        return result
+    cleaned = material.clean()
+    if cleaned.isValid() and abs(cleaned.Volume() - material.Volume()) <= 1e-3:
+        retried = _boolean(cleaned, [cutter], "cut")
+        if retried.Solids() and retried.isValid():
+            return retried
+    fuzzy = _boolean(material, [cutter], "cut", tolerance=CUT_FUZZY_MM)
+    return fuzzy if fuzzy.Solids() and fuzzy.isValid() else result
+
+
 def clean_flat_result(result):
     """Unify coplanar Boolean faces only when valid geometry and volume remain."""
     previous = result.val()

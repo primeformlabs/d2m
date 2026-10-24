@@ -223,3 +223,33 @@ def test_independent_replay_rejects_invalid_or_noncardinal_axes(axis):
     with pytest.raises(ValueError, match="cardinal cutter axis"):
         replay_milling_independently(Stock.rectangular(8, 8, 8),
             Toolpath("profile_contour", metadata={"coordinate_system": "part_mm", "tool_axis": axis}), ToolSpec("flat_endmill", 2))
+
+
+def test_a_contour_cut_on_a_split_floor_keeps_the_material():
+    """TP-0127 (D2O): after a 6 mm corner rest pass the pocket floor is split into coplanar faces at the end level
+    of the D22 contour channel; the plain cut gave no solid. cut_material unifies the faces and cuts again."""
+    from pathlib import Path
+    from src.subcad.milling_replay import _boolean, cut_material
+    folder = Path(__file__).parent / "test_fixtures" / "contour_coplanar_floor"
+    material = cq.Shape.importBrep(str(folder / "material.brep"))
+    cutter = cq.Shape.importBrep(str(folder / "cutter.brep"))
+    assert not _boolean(material, [cutter], "cut").Solids()
+    result = cut_material(material, cutter)
+    assert len(result.Solids()) == 1 and result.isValid()
+    removed = material.Volume() - result.Volume()
+    assert 0 < removed < cutter.Volume() + 1e-6
+
+
+def test_a_raster_cut_along_a_channel_cut_before_keeps_valid_material():
+    """TP-0127 (D2O): the D22 raster capsule touches the walls of its contour channel within a micrometre; the plain
+    cut gave an invalid solid. cut_material cuts with a 1 micrometre fuzzy value."""
+    from pathlib import Path
+    from src.subcad.milling_replay import _boolean, cut_material
+    folder = Path(__file__).parent / "test_fixtures" / "raster_touching_channel"
+    material = cq.Shape.importBrep(str(folder / "material.brep"))
+    cutter = cq.Shape.importBrep(str(folder / "cutter.brep"))
+    assert not _boolean(material, [cutter], "cut").isValid()
+    result = cut_material(material, cutter)
+    assert len(result.Solids()) == 1 and result.isValid()
+    removed = material.Volume() - result.Volume()
+    assert 0 < removed < cutter.Volume() + 1e-6

@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import replace
 import math
 
-from .milling_replay import _boolean, finite, replay_pass, validate_cutter, _horizontal_sweep, _cutter, clean_flat_result
+from .milling_replay import _boolean, cut_material, finite, replay_pass, validate_cutter, _horizontal_sweep, _cutter, clean_flat_result
 from .profile_milling import _profile_wire, _linearized_wire, _setup_plane, _replay_closed_contour
 from .toolpath import Toolpath, ToolpathMove
 from .program_mode import is_program_mode
@@ -90,7 +90,7 @@ def _replay_raster(shape, path, tool):
         raise ValueError("The pocket raster requires one horizontal cutting segment or one plunge.")
     start = cutting[0].position
     cutter = _horizontal_sweep(tool, start, cutting[-1].position) if len(cutting) == 2 else _cutter(tool).translate(start)
-    result = shape.newObject([_boolean(shape.val(), [cutter], "cut")])
+    result = shape.newObject([cut_material(shape.val(), cutter)])
     if not result.solids().vals() or not result.val().isValid():
         raise ValueError("The pocket raster did not produce valid remaining material.")
     result, cleaned = clean_flat_result(result)

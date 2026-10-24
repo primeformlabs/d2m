@@ -9,7 +9,7 @@ import math
 from dataclasses import replace
 from typing import Any
 
-from .milling_replay import finite, _boolean, validate_cutter, clean_flat_result
+from .milling_replay import finite, _boolean, cut_material, validate_cutter, clean_flat_result
 from .pocket_geometry import rounded_rectangle
 from .profiles import normalize_profile_points
 from .toolpath import Toolpath, ToolpathMove
@@ -180,7 +180,7 @@ def _replay_closed_contour(shape, path, tool):
         raise ValueError("The selected cutter channel cannot produce a valid native contour sweep.") from error
     if not region.isValid() or not cutter.isValid():
         raise ValueError("The selected cutter channel cannot produce a valid native contour sweep.")
-    result = shape.newObject([_boolean(shape.val(), [cutter], "cut")])
+    result = shape.newObject([cut_material(shape.val(), cutter)])
     if not result.solids().vals() or not result.val().isValid():
         raise ValueError("The contour cutter path did not produce valid remaining material.")
     result, cleaned = clean_flat_result(result)
