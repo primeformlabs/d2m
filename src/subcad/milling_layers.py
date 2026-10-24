@@ -52,13 +52,27 @@ def _report(method, segments):
 class LayerReplay:
     """The replay of the horizontal passes of one operation in its setup frame."""
 
-    def __init__(self, local_shape, z_top: float, levels, tool):
+    def __init__(self, local_shape, z_top: float, levels, tool, *, ledger=None, plane=None, layer_brep=False):
+        """``ledger`` (``material_ledger.MaterialLedger``) and ``plane`` (the setup plane of ``local_shape``): the
+        layers come from the ledger, not from a mesh of ``local_shape``, and the operation adds its cuts to it.
+        ``layer_brep``: ``local_shape`` is the layer solid of the ledger; the result is the layer solid too."""
         self.local = local_shape
+        self.layer_brep = layer_brep and ledger is not None
         self.tool = tool
         self.z_top = z_top
         self.levels = sorted(set(levels))
+        self.ledger, self.plane = ledger, plane
+        self.frame = None
+        self._after = None
+        # The source of the B-Rep result: the chained Boolean, or the ledger when that Boolean fails.
+        self.brep_source = None
         try:
-            self.material = L.LayeredMaterial.of_solid(local_shape.val(), self.levels[0], z_top, self.levels)
+            if ledger is not None:
+                from .material_ledger import plane_frame
+                self.frame = plane_frame(plane)
+                self.material = ledger.layered(self.frame, self.levels[0], z_top, self.levels)
+            else:
+                self.material = L.LayeredMaterial.of_solid(local_shape.val(), self.levels[0], z_top, self.levels)
         except ValueError as error:
             raise LayerCheckUnavailable(str(error)) from error
         self.before = self.material.copy_material()
@@ -122,7 +136,7 @@ class LayerReplay:
         incoming = self.local.val().Volume()
         expected = incoming - self.material_removed()
         # Exact cutter arcs first; plain polygon prisms (chords within the arc tolerance) if the arcs fail.
-        for exact in (True, False):
+        for exact in (() if self.layer_brep else (True, False)):
             result = self.local.val()
             try:
                 for z, added, arcs in levels:
@@ -133,8 +147,35 @@ class LayerReplay:
             # The B-Rep result and the layer removal must agree (mesh chords and layer midpoints: 0.5 %).
             if result.Solids() and result.isValid() and abs(result.Volume() - expected) <= max(
                     1e-3, 0.005 * max(incoming - expected, 0.0)):
+                self.brep_source = "chained_brep"
                 return result
-        raise LayerCheckUnavailable("The B-Rep result and the layer removal do not agree.")
+        if self.ledger is None:
+            raise LayerCheckUnavailable("The B-Rep result and the layer removal do not agree.")
+        # The incoming B-Rep cannot take this cut (for example coincident walls of two cutter sweeps). The layers
+        # are the material; the B-Rep comes from the ledger (material_ledger.MaterialLedger.solid).
+        try:
+            result = self.ledger_after().solid(self.plane)
+        except ValueError as error:
+            raise LayerCheckUnavailable(str(error)) from error
+        self.brep_source = "layer_prisms"
+        self.ledger_after().brep_from_layers = True
+        return result
+
+    def ledger_after(self):
+        """The ledger with the cuts of this operation: each cutting level's sweep region from the tip to the flute top
+        (the layers that ``LayeredMaterial.remove`` changes)."""
+        if self._after is None:
+            from .material_ledger import Cut
+            cuts = [Cut(self.frame, z, z + self.tool.flute_length, L.union(loops))
+                    for z, (loops, _) in sorted(self.sweeps_by_level.items())]
+            self._after = self.ledger.with_cuts(cuts)
+        return self._after
+
+    def attach_ledger(self, workplane):
+        """Attach the ledger after this operation to its result workplane (no ledger: nothing)."""
+        if self.ledger is not None:
+            self.ledger_after().attach(workplane)
+        return workplane
 
     def material_removed(self) -> float:
         return sum((L.area(first) - L.area(second)) * layer.height

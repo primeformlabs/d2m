@@ -141,6 +141,12 @@ def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z"
     if local.val().Volume() - result.val().Volume() <= 1e-8:
         raise ValueError(f"The {tool.tool_type} path removes no material from the incoming stock. Review the hole position and existing geometry.")
     path.metadata.update(material_passes=reports, pass_plan={"strategy": operation, "total_passes": count})
+    # The material ledger gets the deepest plunge (it holds the others): the point bands and the full diameter up to
+    # the flute top at the start height (material_ledger.py).
+    from .material_ledger import MaterialLedger, drill_cuts, plane_frame
+    tip_z = bounds.zmax - travel
+    MaterialLedger.of(shape).with_cuts(drill_cuts(plane_frame(plane), cx, cy * mirror, tip_z, radius, tip,
+        point_height, tool.flute_length + safe - tip_z)).attach(states[-1]["shape"])
     return states[-1]["shape"], path, states, reports
 
 

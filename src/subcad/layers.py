@@ -560,17 +560,24 @@ class LayeredMaterial:
 
     @classmethod
     def of_solid(cls, shape, z_low: float, z_high: float, levels: Iterable[float] = (),
-                 mesh: SolidMesh | None = None) -> "LayeredMaterial":
-        """Layers of the solid between z_low and z_high, with a layer limit at each cutting level."""
+                 mesh: SolidMesh | None = None, *, limits: Iterable[float] = (), sloped=(),
+                 section=None) -> "LayeredMaterial":
+        """Layers of the solid between z_low and z_high, with a layer limit at each cutting level.
+
+        The material ledger (``material_ledger.py``) adds ``limits`` (the heights of its cuts), ``sloped`` (height
+        ranges that get the thinner layers, as a sloped face does) and ``section(height, mesh section)``, the layer
+        material at a height (the mesh section less its cuts)."""
         mesh = mesh or SolidMesh.of(shape)
         if z_high - z_low <= Z_MERGE_MM:
             return cls([], z_low, z_high, SLOPED_LAYER_MM)
         heights = mesh.vertices[:, 2]
         inside = heights[(heights > z_low + Z_MERGE_MM) & (heights < z_high - Z_MERGE_MM)]
-        limits = _merged([z_low, z_high, *[level for level in levels if z_low < level < z_high], *inside.tolist()])
-        sloped = np.abs(mesh.normal_z) > 1e-9
-        sloped &= np.abs(mesh.normal_z) < 1 - 1e-12
-        low, high = mesh.low[sloped], mesh.high[sloped]
+        extra = [value for value in limits if z_low < value < z_high]
+        limits = _merged([z_low, z_high, *[level for level in levels if z_low < level < z_high], *inside.tolist(), *extra])
+        faces = np.abs(mesh.normal_z) > 1e-9
+        faces &= np.abs(mesh.normal_z) < 1 - 1e-12
+        low = np.concatenate([mesh.low[faces], np.array([a for a, _ in sloped], float)])
+        high = np.concatenate([mesh.high[faces], np.array([b for _, b in sloped], float)])
         intervals = []
         for first, second in zip(limits, limits[1:]):
             crossed = bool(np.any((low < second - Z_MERGE_MM) & (high > first + Z_MERGE_MM)))
@@ -587,7 +594,9 @@ class LayeredMaterial:
             for index in range(parts):
                 a = first + (second - first) * index / parts
                 b = first + (second - first) * (index + 1) / parts
-                layers.append(Layer(a, b, mesh.section((a + b) / 2), group))
+                middle = (a + b) / 2
+                paths = mesh.section(middle)
+                layers.append(Layer(a, b, section(middle, paths) if section is not None else paths, group))
         return cls(layers, z_low, z_high, step)
 
     def copy_material(self) -> list[Paths]:

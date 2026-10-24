@@ -291,7 +291,10 @@ def _layer_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, de
     The pass order, the pass reports, the repeated-path reuse and the retained states are the same
     as in the B-Rep replay. The removed volumes and the comparison are 2D areas times layer heights."""
     from .layers import face_paths
-    replay = LayerReplay(local, bounds.zmax, [path.moves[1].position[2] for path in paths], tool)
+    from .material_ledger import MaterialLedger
+    replay = LayerReplay(local, bounds.zmax, [path.moves[1].position[2] for path in paths], tool,
+                         ledger=MaterialLedger.of(shape), plane=plane,
+                         layer_brep=MaterialLedger.layer_brep(shape))
     states, reports, completed_paths = [], [], {}
     for index, path in enumerate(paths, 1):
         geometry_key = tuple((move.move_type, tuple(move.position)) for move in path.moves)
@@ -320,7 +323,8 @@ def _layer_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, de
     if sum(report["removed_volume_mm3"] for report in reports) <= 1e-8:
         raise ValueError("The pocket path does not remove material from the incoming stock.")
     result = local.newObject([replay.result_shape()])
-    result, cleaned = clean_flat_result(result)
+    # The layer solid has only planar prism faces from the layers: nothing to unify, and its check is slow.
+    result, cleaned = (result, False) if replay.brep_source == "layer_prisms" else clean_flat_result(result)
     final = result.val()
     from .layer_player import plane_frame
     frame = plane_frame(face_selector, plane)
@@ -332,6 +336,8 @@ def _layer_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, de
             "label": f"After profile pocket {path.metadata['pass_role']} pass {index + 1}", "geometry_replay": report,
             "player_layers": layers})
     reports[-1]["topology_cleaned"] = cleaned
+    reports[-1]["material_brep"] = replay.brep_source
+    replay.attach_ledger(states[-1]["shape"])
     comparison = replay.comparison(face_paths(target_region), bounds.zmax - depth, bounds.zmax)
     aggregate.metadata.update(material_passes=reports, operation_target_comparison=comparison)
     return states[-1]["shape"], aggregate, states, reports, comparison

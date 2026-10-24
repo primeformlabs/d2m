@@ -13,7 +13,7 @@ python -m pip wheel --no-deps . --wheel-dir dist
 Install the wheel in the CAD environment:
 
 ```text
-python -m pip install --no-deps dist/d2o_subcad-0.2.25-py3-none-any.whl
+python -m pip install --no-deps dist/d2o_subcad-0.2.26-py3-none-any.whl
 ```
 
 Use `from subcad import Stock` from an installed package.
@@ -33,6 +33,11 @@ Version 0.2.25 gives the milling verdict with the morphological opening of each 
 `milling_opening.part_verdict` finds the material that the cutters of each setup cannot reach, with no pass replay.
 Each layer pass also gets its removed 2D region for the operation player (`layer_player.py`).
 With `milling_layers.PLAYER_BREP_STATES = False`, SubCAD makes no B-Rep state for each pass.
+
+Version 0.2.26 keeps the material of the milling chain as a ledger of 2D cuts (`material_ledger.py`).
+Each layer operation and each drill plunge adds its cuts. The layers of the next operation come from the
+ledger, not from the B-Rep result of the operation before. If the B-Rep Boolean of an operation fails, the
+operation keeps its layer result and its B-Rep comes from the ledger layers (`docs/MILLING_LAYER_REPLAY.md`).
 
 Version 0.2.22 applies ruled loft Milling on all six cardinal setup faces.
 Section `cx` and `cy` use the existing face-profile convention.
