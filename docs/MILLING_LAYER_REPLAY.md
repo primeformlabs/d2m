@@ -21,17 +21,51 @@ A 3-axis setup has one fixed tool axis. In the setup frame, each pass cuts at on
    * overcut: (removed material less the target region), less the parts thinner than 1 µm.
    The 1 µm opening removes the slivers between two polygon chords of one arc.
 
+## Material ledger (SubCAD 0.2.26)
+
+The layers of an operation do not come from the B-Rep result of the operation before.
+They come from the material ledger (`material_ledger.py`):
+
+    material = base − cut 1 − cut 2 − ...
+
+* The base is the first solid of the chain (most of the time the stock block).
+* A cut is a 2D region of one setup frame between two heights of that frame.
+  Each cutting level of a layer operation is one cut: the union of its sweeps, from the tip to the flute top.
+  Each drill plunge is one cut for the full diameter and one cut for each 0.1 mm band of its point
+  (the radius at the band middle).
+* The layer at the height h is the base mesh section less the cut sections at h (2D differences):
+  * a cut with the same tool axis (for example >Z and <Z) is its region with the axes turned;
+  * a cut with a crossing tool axis (for example >X in a >Z layer) is a set of rectangles:
+    the chords of its region on the line of h times its height range.
+* The cut heights are layer limits. A cut edge that slopes across the layer direction gets the
+  0.1 mm layers, as a sloped face of the base does.
+
+The ledger is attached to the result workplane of each operation. An operation that does not record
+its cuts returns a workplane without a ledger. The next layer operation then starts a new ledger
+with that B-Rep as its base.
+
+So a damaged B-Rep state cannot change the layers, the removed volumes or the region checks of the
+operations after it. TP-0127 (D2O): the 6 mm corner rest pass left a B-Rep that Booleans cannot cut
+(the D22 hole wall is the same circle as the boss wall that the rest pass cut). The D22 hole now
+gets its layers from the ledger and is ready.
+
 ## Material result
 
-The next operation needs a B-Rep. The operation result is the incoming solid less one prism for
-each cutting level. A level prism holds only the part of its sweep region that no deeper level
+The next operation and the display need a B-Rep. The operation result is the incoming solid less one
+prism for each cutting level. A level prism holds only the part of its sweep region that no deeper level
 covers. Most operations need one or two Booleans. The old replay needed one Boolean for each pass
 and four Booleans for the region check.
 
 The prism faces get exact arcs back: a run of polygon chords on one cutter circle becomes one
 circular edge. If the arcs fail, plain polygon prisms (chords within 0.25 µm) replace them.
 The B-Rep result volume must agree with the layer removal within 0.5 %.
-If it does not agree, or if the mesh is not closed, the operation uses the B-Rep replay.
+
+If the Booleans fail or do not agree, the layers stay the result and the B-Rep comes from the ledger
+(`MaterialLedger.solid`, no Boolean): one prism for each run of equal layers over the full height,
+with the 2 µm outline of the player. The last pass report has `material_brep`: `chained_brep` or
+`layer_prisms`. A later layer operation on a layer B-Rep makes its result from the ledger at once.
+The layer B-Rep is a compound of stacked prisms: the nominal comparison (one solid) cannot use it.
+If the layers cannot be made (an open mesh of a new ledger base), the operation uses the B-Rep replay.
 
 ## Operation player states
 

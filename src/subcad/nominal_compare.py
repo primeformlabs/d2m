@@ -19,11 +19,14 @@ def _solid(source, name):
     source = getattr(source, "native", source)
     source = getattr(source, "_shape", source)
     source = source.val() if hasattr(source, "val") else source
-    if not isinstance(source, cq.Shape) or not source.isValid():
+    if not isinstance(source, cq.Shape):
         raise ValueError(f"The {name} does not contain valid native geometry.")
+    # Count the solids first: the check of a large compound (a layer solid, material_ledger.py) is slow.
     solids = source.Solids()
     if len(solids) != 1:
         raise ValueError(f"The {name} requires one closed part solid. It contains {len(solids)} solids.")
+    if not source.isValid():
+        raise ValueError(f"The {name} does not contain valid native geometry.")
     solid = solids[0]
     finite(solid.Volume(), f"{name} volume", positive=True)
     return solid

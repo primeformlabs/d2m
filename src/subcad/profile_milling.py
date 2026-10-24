@@ -192,13 +192,19 @@ def _replay_closed_contour(shape, path, tool):
 
 def _layer_contour_replay(shape, local, plane, built, tool, bounds, finish, states, reports, face_selector=">Z"):
     """2.5D layer replay of the contour levels: removed volumes from 2D areas; one Boolean for the result."""
-    replay = LayerReplay(local, bounds.zmax, [path.moves[1].position[2] for _, _, path, _ in built], tool)
+    from .material_ledger import MaterialLedger
+    replay = LayerReplay(local, bounds.zmax, [path.moves[1].position[2] for _, _, path, _ in built], tool,
+                         ledger=MaterialLedger.of(shape), plane=plane,
+                         layer_brep=MaterialLedger.layer_brep(shape))
     for index, role, path, has_curve in built:
         reports.append(finish(index, role, path, has_curve, replay.cut(path, "selected_cutter_closed_path_sweep")))
     if sum(report["removed_volume_mm3"] for report in reports) <= 1e-8:
         raise ValueError("The compensated contour does not remove material from the incoming stock.")
-    result, cleaned = clean_flat_result(local.newObject([replay.result_shape()]))
+    result = local.newObject([replay.result_shape()])
+    # The layer solid has only planar prism faces from the layers: nothing to unify, and its check is slow.
+    result, cleaned = (result, False) if replay.brep_source == "layer_prisms" else clean_flat_result(result)
     reports[-1]["topology_cleaned"] = cleaned
+    reports[-1]["material_brep"] = replay.brep_source
     final = result.val()
     from .layer_player import plane_frame
     frame = plane_frame(face_selector, plane)
@@ -207,6 +213,7 @@ def _layer_contour_replay(shape, local, plane, built, tool, bounds, finish, stat
         states.append({"shape": None if local_state is None else shape.newObject([local_state.transformShape(plane.rG)]),
             "pass_index": index, "pass_role": role, "label": f"After profile contour {role} pass {index}",
             "geometry_replay": reports[position], "player_layers": layers})
+    replay.attach_ledger(states[-1]["shape"])
     return True
 
 
