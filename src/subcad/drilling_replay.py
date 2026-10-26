@@ -45,8 +45,12 @@ def axial_sweep(tool, start, end):
 
 
 def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z",
-                 through=False, spot=False, peck_step=None, feed=100, rpm=None, ream=False):
-    """Blind depth is the full-diameter depth; spot depth is the tip depth."""
+                 through=False, spot=False, peck_step=None, feed=100, rpm=None, ream=False, start_depth=0.0):
+    """Blind depth is the full-diameter depth; spot depth is the tip depth. Both are measured from the setup face.
+
+    ``start_depth``: where the material of the hole starts below the setup face (``feature_depth``). The tool
+    moves rapid to just above it; the flutes cut from there, and the reach covers the full depth. A through hole
+    goes to the bottom of the material at the hole, not of the stock box."""
     import cadquery as cq
     requested = finite(diameter, "hole diameter", positive=True)
     cx, cy = finite(cx, "drill X position"), finite(cy, "drill Y position")
@@ -63,7 +67,12 @@ def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z"
     plane, mirror = _setup_plane(face_selector)
     local = cq.Workplane("XY").newObject([plane.toLocalCoords(shape.val())])
     bounds = local.val().BoundingBox()
-    full_depth = bounds.zlen if through else depth
+    full_depth = depth
+    if through:
+        from .feature_depth import material_span
+        span = material_span(shape, face_selector, cx=cx, cy=cy, radius=requested / 2)
+        full_depth = span[1] if span else bounds.zlen
+    start_depth = min(max(finite(start_depth, "drill start depth"), 0.0), full_depth)
     if full_depth > bounds.zlen + 1e-8:
         raise ValueError("The drilling depth exceeds the incoming material thickness along its cutter axis.")
     travel = full_depth if spot else full_depth + point_height
@@ -77,14 +86,16 @@ def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z"
         contact = _boolean(local.val(), [pilot], "common")
         if not contact.isValid() or (contact.Solids() and contact.Volume() > 1e-8):
             raise ValueError("The reamer lead has no clear pilot hole through its complete travel. Drill a suitable pilot hole first.")
-    limit = min(finite(tool.flute_length, "drill flute length", positive=True),
-        finite(tool.stickout_mm, "drill projection", positive=True),
-        finite(tool.reach_mm or tool.flute_length, "drill reach", positive=True))
-    if travel > limit + 1e-8:
+    from .tool_selection import tool_reach
+    finite(tool.stickout_mm, "drill projection", positive=True)
+    finite(tool.reach_mm or tool.flute_length, "drill reach", positive=True)
+    flute = finite(tool.flute_length, "drill flute length", positive=True)
+    if travel - start_depth > flute + 1e-8 or travel > tool_reach(tool) + 1e-8:
         raise ValueError("The selected reamer cannot reach the required lead depth. Include its lead length in the reach check." if ream
             else "The selected drill cannot reach the required tip depth. Include its point length in the reach check.")
-    step = travel if peck_step is None else finite(peck_step, "drill peck step", positive=True)
-    count = max(1, math.ceil(travel / step))
+    cut = travel - start_depth
+    step = cut if peck_step is None else finite(peck_step, "drill peck step", positive=True)
+    count = max(1, math.ceil(cut / step))
     if count > 100:
         raise ValueError("The drill exceeds the retained peck limit. Divide the operation into smaller depth ranges.")
     operation = "ream" if ream else "spot_drill" if spot else "peck_drill" if peck_step is not None else "drill"
@@ -94,14 +105,16 @@ def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z"
             "tool_axis": list(plane.zDir.toTuple()), "face_selector": face_selector,
             "point_angle_deg": tool.tip_angle, "tip_diameter_mm": tool.tip_diameter,
             "point_length_mm": point_height, "full_diameter_depth_mm": None if spot else full_depth,
-            "tip_depth_mm": travel, "depth_reference": "tip" if spot else "full_diameter"})
+            "tip_depth_mm": travel, "start_depth_mm": start_depth, "cut_length_mm": cut,
+            "depth_reference": "tip" if spot else "full_diameter"})
+    # The rapid approach ends a clearance above the material of the hole (the tool moves through air above it).
+    approach = bounds.zmax - start_depth + max(2, radius) if start_depth > max(2, radius) else None
     if is_program_mode():
         # The same moves for every peck, one cut to the full tip depth (program_mode.py).
         start = (cx, cy * mirror, safe)
         for index in range(1, count + 1):
-            end = (cx, cy * mirror, bounds.zmax - min(index * step, travel))
-            moves = [ToolpathMove("rapid", start), ToolpathMove("plunge", end, feed=feed, spindle_rpm=rpm),
-                ToolpathMove("retract", start)]
+            end = (cx, cy * mirror, bounds.zmax - min(start_depth + index * step, travel))
+            moves = _plunge_moves(start, end, approach, feed, rpm)
             path.moves.extend(replace(move, position=plane.toWorldCoords(move.position).toTuple()) for move in moves)
         cut = _boolean(local.val(), [axial_sweep(tool, start, (cx, cy * mirror, bounds.zmax - travel))], "cut")
         world = shape.newObject([cut.transformShape(plane.rG)])
@@ -112,7 +125,7 @@ def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z"
     result, states, reports = local, [], []
     for index in range(1, count + 1):
         start = (cx, cy * mirror, safe)
-        end = (cx, cy * mirror, bounds.zmax - min(index * step, travel))
+        end = (cx, cy * mirror, bounds.zmax - min(start_depth + index * step, travel))
         cutter = axial_sweep(tool, start, end)
         before = result.val().Volume()
         contact = _boolean(result.val(), [cutter], "common")
@@ -126,8 +139,7 @@ def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z"
                 raise ValueError("The drill pass adds material. Its geometry is invalid.")
             result, _ = clean_flat_result(result.newObject([remaining]))
         first = len(path.moves)
-        moves = [ToolpathMove("rapid", start), ToolpathMove("plunge", end, feed=feed, spindle_rpm=rpm),
-            ToolpathMove("retract", start)]
+        moves = _plunge_moves(start, end, approach, feed, rpm)
         path.moves.extend(replace(move, position=plane.toWorldCoords(move.position).toTuple()) for move in moves)
         report = {"pass_index": index, "pass_role": "reaming" if ream else "spotting" if spot else "drilling", "path_kind": "axial_plunge",
             "move_start_index": first, "move_end_index": len(path.moves), "removed_volume_mm3": before - result.val().Volume(),
@@ -150,13 +162,21 @@ def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z"
     return states[-1]["shape"], path, states, reports
 
 
+def _plunge_moves(start, end, approach, feed, rpm):
+    moves = [ToolpathMove("rapid", start)]
+    if approach is not None and approach > end[2]:
+        moves.append(ToolpathMove("rapid", (start[0], start[1], approach)))
+    return moves + [ToolpathMove("plunge", end, feed=feed, spindle_rpm=rpm), ToolpathMove("retract", start)]
+
+
 def apply_drilling(operation, shape, *, spot=False, peck_step=None):
     from .operations import _feed_rate, _spindle_rpm, _tool_dict, _tool_selection_dict
     result, operation._drill_toolpath, operation._material_pass_states, operation._pass_reports = run_drilling(
         shape, tool=operation.tool, diameter=operation.hole_diameter if spot else operation.diameter,
         depth=operation.depth, cx=operation.cx, cy=operation.cy, face_selector=operation.face_selector,
         through=not spot and operation.through, spot=spot, peck_step=peck_step,
-        feed=_feed_rate(operation.feeds_speeds), rpm=_spindle_rpm(operation.feeds_speeds))
+        feed=_feed_rate(operation.feeds_speeds), rpm=_spindle_rpm(operation.feeds_speeds),
+        start_depth=0.0 if spot else getattr(operation, "start_depth", 0.0))
     operation._drill_toolpath.metadata.update(tool=_tool_dict(operation.tool),
         tool_selection=_tool_selection_dict(operation.tool_selection))
     if not spot and operation.through:

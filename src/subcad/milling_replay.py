@@ -56,7 +56,9 @@ def finite(value: Any, name: str, *, positive: bool = False) -> float:
     return number
 
 
-def validate_cutter(tool, *, cutting_depth: float) -> None:
+def validate_cutter(tool, *, cutting_depth: float, cut_length: float | None = None) -> None:
+    """``cutting_depth``: from the setup face to the deepest cut (``tool_selection.tool_reach``); ``cut_length``:
+    the material height that the flutes cut (the default is the depth)."""
     if tool.tool_type not in {"flat_endmill", "ball_endmill"}:
         raise ValueError("Native surface replay requires a flat end mill or a ball end mill.")
     diameter = finite(tool.diameter, "cutter diameter", positive=True)
@@ -67,7 +69,8 @@ def validate_cutter(tool, *, cutting_depth: float) -> None:
     reach = finite(tool.reach_mm or flute, "cutter reach", positive=True)
     if tool.tool_type == "ball_endmill" and flute < diameter:
         raise ValueError("The ball end mill requires a flute length at least equal to its diameter.")
-    if cutting_depth > min(flute, projection, reach) + 1e-8:
+    cut = cutting_depth if cut_length is None else cut_length
+    if cut > flute + 1e-8 or cutting_depth > min(projection, reach) + 1e-8:
         raise ValueError("The selected cutter cannot reach the required surface depth.")
 
 

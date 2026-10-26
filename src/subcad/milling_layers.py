@@ -66,6 +66,9 @@ class LayerReplay:
         self._after = None
         # The source of the B-Rep result: the chained Boolean, or the ledger when that Boolean fails.
         self.brep_source = None
+        # Outline cleaning of the B-Rep prisms (mm), with no exact arcs: an operation whose checks use only the layers
+        # (level roughing of a large part) needs no Boolean of thousands of arc edges. None: exact arcs first.
+        self.prism_clean_mm = None
         try:
             if ledger is not None:
                 from .material_ledger import plane_frame
@@ -92,6 +95,32 @@ class LayerReplay:
         report = _report(method, info["exact_segments"])
         report["removed_volume_mm3"] = removed
         report["layer_count"] = len(self.material.layers)
+        return report
+
+    def cut_level(self, paths, method: str):
+        """All horizontal paths of one cutting level as one cut: the union of their sweeps, one layer removal (level
+        roughing has hundreds of raster passes at each level; one removal for each pass took minutes on a large part)."""
+        sweeps, points, segments, z = [], [], 0, None
+        for path in paths:
+            height, sweep, info = path_sweep(path, self.tool)
+            if z is not None and abs(height - z) > 1e-9:
+                raise ValueError("One cutting level requires paths at one height.")
+            z = height
+            sweeps.extend(sweep)
+            points.extend(info["points"])
+            segments += info["exact_segments"]
+        region = L.union(sweeps)
+        rows = []
+        removed = self.material.remove(region, z, z + self.tool.flute_length, collect=rows)
+        self.removed.append(rows)
+        level = self.sweeps_by_level.setdefault(z, ([], []))
+        level[0].extend(region)
+        level[1].extend(points)
+        self.snapshots.append(self.material.copy_material())
+        report = _report(method, segments)
+        report["removed_volume_mm3"] = removed
+        report["layer_count"] = len(self.material.layers)
+        report["path_count"] = len(paths)
         return report
 
     def repeat(self):
@@ -135,8 +164,13 @@ class LayerReplay:
             return self.local.val()
         incoming = self.local.val().Volume()
         expected = incoming - self.material_removed()
+        if self.prism_clean_mm:
+            import pyclipper
+            levels = [(z, [path for path in pyclipper.CleanPolygons(added, self.prism_clean_mm * L.SCALE) if len(path) >= 3], arcs)
+                      for z, added, arcs in levels]
         # Exact cutter arcs first; plain polygon prisms (chords within the arc tolerance) if the arcs fail.
-        for exact in (() if self.layer_brep else (True, False)):
+        attempts = (False,) if self.prism_clean_mm else (True, False)
+        for exact in (() if self.layer_brep else attempts):
             result = self.local.val()
             try:
                 for z, added, arcs in levels:
