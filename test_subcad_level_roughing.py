@@ -66,3 +66,13 @@ def test_no_waste_above_a_level_gives_no_operation():
     with tool_inventory([_mill(10, 25, 45, "EM10")], revision="levels", strict=True):
         stock = Stock.rectangular(60, 40, 30)
         assert stock.rough_levels(cq.Workplane("XY").box(60, 40, 30)) is stock
+
+
+def test_a_kept_profile_stays_for_its_own_operation():
+    part = _part()
+    stock = cq.Workplane("XY").box(60, 40, 30).val()
+    full = level_plan(stock, part, ">Z", radius=5, reach=40).volume()
+    kept = level_plan(stock, part, ">Z", radius=5, reach=40,
+                      keep=[{"type": "rect", "length": 10, "width": 10, "cx": 20, "cy": 0}]).volume()
+    # The 10 mm square, 15 mm from the step wall (a gap of 10 mm or less would close for the 10 mm cutter).
+    assert full - kept == pytest.approx(10 * 10 * 20, rel=1e-3)

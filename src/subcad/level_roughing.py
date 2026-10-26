@@ -64,15 +64,32 @@ class LevelPlan:
         return sum(L.area(region) * (high - low) for low, high, region, _ in self.bands)
 
 
-def level_plan(stock_shape, part_shape, face_selector: str, *, radius: float, reach: float) -> LevelPlan:
+def keep_paths(profiles, face_selector: str):
+    """The regions of the setup frame that the roughing leaves for their own operation (open pockets and slots):
+    profiles in the face coordinates of the profile pockets (``run_profile_pocket``)."""
+    import cadquery as cq
+    from .profile_milling import _profile_wire, _setup_plane
+    _, mirror = _setup_plane(face_selector)
+    paths = []
+    for profile in profiles or ():
+        wire, _ = _profile_wire(profile)
+        if mirror < 0:
+            wire = wire.mirror("XZ")
+        paths.extend(L.face_paths(cq.Face.makeFromWires(wire)))
+    return L.union(paths) if paths else []
+
+
+def level_plan(stock_shape, part_shape, face_selector: str, *, radius: float, reach: float, keep=()) -> LevelPlan:
     """The bands that a flat cutter of the radius roughs from the setup face down to the reach.
 
-    ``stock_shape`` and ``part_shape``: CadQuery shapes in the part frame (the incoming material and the finished part)."""
+    ``stock_shape`` and ``part_shape``: CadQuery shapes in the part frame (the incoming material and the finished part).
+    ``keep``: profiles that the roughing leaves for their own operations (``keep_paths``); they count as part."""
     setup = Setup.of(face_selector)
     stock_mesh, part_mesh = L.SolidMesh.of(stock_shape), L.SolidMesh.of(part_shape)
     layers = setup_layers(stock_mesh, part_mesh, setup, reach_depths=[reach], divide_depth=reach)
     # All part sections, also those below the reach (the shadow skips them).
     silhouette = filled(L.union([path for section in layers.part for path in section])) if layers.count else []
+    kept = keep_paths(keep, face_selector)
     floor = layers.face - reach
     planar = sorted(set(round(value, 7) for value in layers.planar))
     bands = []
@@ -81,7 +98,7 @@ def level_plan(stock_shape, part_shape, face_selector: str, *, radius: float, re
             continue
         low, high = max(low, floor), min(high, layers.face)
         index = layers.layer_at(low + L.Z_MERGE_MM * 10)
-        shadow = filled(layers.shadow[index])
+        shadow = filled(L.union(layers.shadow[index], kept) if kept else layers.shadow[index])
         region = L.difference(L.intersection(layers.stock[index], silhouette), closing(shadow, radius))
         region = L.opened(region, MIN_WIDTH_MM)
         if region and L.area(region) > MIN_WIDTH_MM ** 2:
@@ -166,7 +183,8 @@ def level_paths(plan: LevelPlan, tool, *, stepdown: float, stepover: float, feed
     return paths
 
 
-def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=None, stepdown=None, feed=100, rpm=None):
+def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=None, stepdown=None, feed=100, rpm=None,
+                       keep=()):
     """Rough the waste above each planar level of the setup. Return (result, toolpath, states, reports, plan).
 
     ``reach``: the deepest level below the setup face (default: the reach of the tool)."""
@@ -189,7 +207,7 @@ def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=Non
     plane, mirror = _setup_plane(face_selector)
     local = cq.Workplane("XY").newObject([plane.toLocalCoords(shape.val())])
     bounds = local.val().BoundingBox()
-    plan = level_plan(shape.val(), part_shape, face_selector, radius=radius, reach=reach)
+    plan = level_plan(shape.val(), part_shape, face_selector, radius=radius, reach=reach, keep=keep)
     safe = bounds.zmax + max(2, radius)
     paths = level_paths(plan, tool, stepdown=stepdown, stepover=stepover, feed=feed, rpm=rpm, safe=safe)
     normal = list(plane.zDir.toTuple())
@@ -255,6 +273,8 @@ class LevelRoughOp(MachiningOperation):
     """Rough the waste above each planar level of one setup (``run_level_roughing``)."""
 
     part_shape: Any = field(default=None, repr=False)
+    keep: tuple = ()
+    """Profiles that the roughing leaves for their own operations (open pockets and slots)."""
     reach: float = 0.0
     """The deepest level below the setup face that this operation roughs (mm)."""
     stepdown: Optional[float] = None
@@ -272,7 +292,8 @@ class LevelRoughOp(MachiningOperation):
     def apply(self, shape):
         result, self._level_toolpath, self._material_pass_states, self._pass_reports, plan = run_level_roughing(
             shape, self.part_shape, tool=self.tool, face_selector=self.face_selector, reach=self.reach or None,
-            stepdown=self.stepdown, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds))
+            stepdown=self.stepdown, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds),
+            keep=self.keep)
         self._bands = [{"z_low_mm": round(low, 6), "z_high_mm": round(high, 6), "area_mm2": round(L.area(region), 3)}
                        for low, high, region, _ in plan.bands]
         self._level_toolpath.metadata.update(tool=_tool_dict(self.tool), tool_selection=_tool_selection_dict(self.tool_selection))
@@ -307,22 +328,28 @@ class LevelRoughOp(MachiningOperation):
         return self._level_toolpath
 
 
-def select_roughing_tool(shape, part_shape, face_selector: str, *, max_depth: Optional[float] = None):
+def select_roughing_tool(shape, part_shape, face_selector: str, *, max_depth: Optional[float] = None, keep=()):
     """(tool, selection, depth): the largest available flat end mill that reaches the deepest level with waste, else the
     one that reaches the deepest band it can; depth 0 when the setup has no waste above a level."""
     from .tool_selection import ToolRequirement, ToolUnavailableError, select_tool
     bounds = shape.val().BoundingBox()
     full = max_depth or max(bounds.xlen, bounds.ylen, bounds.zlen)
-    probe = level_plan(shape.val(), part_shape, face_selector, radius=0.5, reach=full)
+    probe = level_plan(shape.val(), part_shape, face_selector, radius=0.5, reach=full, keep=keep)
     depths = sorted({round(probe.face - band[0], 6) for band in probe.bands}, reverse=True)
     if not depths:
         return None, None, 0.0
     last = None
     for depth in depths:
-        selection = select_tool(ToolRequirement("flat_endmill", min_reach_mm=depth, prefer_largest=True,
-                                                feature="level_rough",
-                                                reason="the end mill must reach the deepest level with waste above it"))
+        try:
+            selection = select_tool(ToolRequirement("flat_endmill", min_reach_mm=depth, prefer_largest=True,
+                                                    feature="level_rough",
+                                                    reason="the end mill must reach the deepest level with waste above it"))
+        except ValueError:
+            # A caller selection policy that refuses every candidate (a reach it does not trust): a higher level.
+            continue
         if selection.ok:
             return selection.selected_tool, selection, depth
         last = selection
+    if last is None:
+        raise ValueError("No available end mill reaches a level with waste above it.")
     raise ToolUnavailableError(last)

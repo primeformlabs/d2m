@@ -166,12 +166,13 @@ class Stock:
         return obj
 
     def rough_levels(self, part, *, face_selector: str = ">Z", max_depth: Optional[float] = None,
-                     stepdown: Optional[float] = None, tool: Optional[ToolSpec] = None) -> "Stock":
+                     stepdown: Optional[float] = None, tool: Optional[ToolSpec] = None, keep=()) -> "Stock":
         """Rough the waste above each planar level of the setup (``level_roughing``, docs/LEVEL_ROUGHING.md).
 
         ``part``: the finished part (a CadQuery shape or workplane) in the stock frame. ``max_depth``: the deepest level
         below the setup face to rough. Without a tool, the largest available end mill that reaches the deepest level
-        with waste is selected."""
+        with waste is selected. ``keep``: profiles (face coordinates, as ``profile_pocket``) that the roughing leaves for
+        their own operations, such as open pockets and slots."""
         from .level_roughing import LevelRoughOp, select_roughing_tool
         part_shape = part.val() if hasattr(part, "val") else part
         setup = self._setups.get(self._active_setup) if self._active_setup else None
@@ -179,10 +180,11 @@ class Stock:
         selection = None
         reach = max_depth or 0.0
         if tool is None:
-            tool, selection, reach = select_roughing_tool(self._shape, part_shape, face, max_depth=max_depth)
+            tool, selection, reach = select_roughing_tool(self._shape, part_shape, face, max_depth=max_depth, keep=keep)
             if tool is None:
                 return self
-        op = LevelRoughOp(part_shape=part_shape, reach=reach, stepdown=stepdown, tool=tool, tool_selection=selection,
+        op = LevelRoughOp(part_shape=part_shape, keep=tuple(keep or ()), reach=reach, stepdown=stepdown, tool=tool,
+                          tool_selection=selection,
                           face_selector=face, material=self._material)
         return self._apply_op(op)
 
