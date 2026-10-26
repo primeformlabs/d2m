@@ -13,6 +13,31 @@ def cutter(key="MILL-6", diameter=6, **kwargs):
         stickout_mm=24, reach_mm=18, **kwargs)
 
 
+def test_caller_selection_policy_chooses_only_after_feasibility_checks():
+    def policy(requirement, feasible):
+        assert {tool.catalog_id for tool in feasible} == {"owned", "catalogue"}
+        return next(tool for tool in feasible if tool.catalog_id == "owned")
+    with tool_inventory([cutter("owned", 4), cutter("catalogue", 8), cutter("too-large", 12)], selector=policy):
+        chosen = select_tool(ToolRequirement("flat_endmill", max_diameter_mm=10, prefer_largest=True))
+        assert chosen.selected_tool.catalog_id == "owned"
+    # The caller policy never changes the policy of a later context.
+    with tool_inventory([cutter("owned", 4), cutter("catalogue", 8)]):
+        assert select_tool(ToolRequirement("flat_endmill", prefer_largest=True)).selected_tool.catalog_id == "catalogue"
+
+
+def test_a_policy_cannot_introduce_or_modify_a_tool():
+    with tool_inventory([cutter()], selector=lambda requirement, feasible: cutter("not-in-snapshot")):
+        with pytest.raises(ValueError, match="feasible inventory candidate"):
+            select_tool(ToolRequirement("flat_endmill"))
+
+
+def test_a_policy_cannot_change_reach_or_availability_checks():
+    calls = []
+    with tool_inventory([cutter()], selector=lambda requirement, feasible: calls.append(feasible)):
+        assert not select_tool(ToolRequirement("flat_endmill", min_flute_length_mm=30)).ok
+    assert calls == []
+
+
 def test_empty_owned_inventory_never_uses_standard_catalog_or_fallback():
     with tool_inventory([], revision="empty"):
         result = select_tool(ToolRequirement("flat_endmill"))
