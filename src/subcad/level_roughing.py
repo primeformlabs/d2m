@@ -1,0 +1,328 @@
+"""Level roughing: the waste above each planar level of a setup, before its features (docs/LEVEL_ROUGHING.md).
+
+A stepped part has its features on several planar levels. Before a hole in a lower section can be drilled from its
+own level, the waste above that level must go. For one setup (one fixed tool axis) and a flat end mill of radius r:
+
+    silhouette = the part outline along the tool axis (the union of all part sections, holes filled)
+    shadow(z)  = the part sections at and above the height z, holes and closed pockets filled
+    region(z)  = the incoming material ∩ silhouette − closing(shadow(z), r)
+
+The closing (``milling_opening``) is what a disk of radius r cannot reach without touching the part at or above z,
+so the cutter never gouges the part and never goes under an overhang. The silhouette keeps the outside profile for its
+own operation; the filled shadow keeps the holes and the closed pockets for theirs. The shadow grows downward, so the
+region of a lower level is inside the region of the level above: one region for each band between two planar heights
+(the region at the bottom of the band) is safe for the whole band.
+
+The passes are horizontal: a raster of the free cutter centres and their outline, at each stepdown level of each
+band, down to the reach of the cutter. ``milling_layers.LayerReplay`` removes the material (2D layers), writes the
+material ledger and makes the B-Rep result and the player states, as for the profile pockets.
+"""
+from __future__ import annotations
+
+from dataclasses import replace
+import math
+
+import pyclipper
+
+from . import layers as L
+from .milling_opening import FIT_MM, Setup, setup_layers
+from .toolpath import Toolpath, ToolpathMove
+
+# A region narrower than this is no roughing work (mm): the mesh chords and the outline cleaning.
+MIN_WIDTH_MM = 0.01
+# Largest number of passes of one level roughing operation (raster lines and outlines of every level).
+MAX_PASSES = 4000
+
+
+def filled(paths):
+    """The outer loops only: holes and closed pockets inside the outline are part of the region."""
+    outer = [path for path in paths or [] if pyclipper.Orientation(path)]
+    return L.union(outer) if outer else []
+
+
+def closing(paths, radius: float):
+    return L.offset(L.offset(paths, radius + FIT_MM), -(radius + FIT_MM)) if paths else []
+
+
+class LevelPlan:
+    """The roughing bands of one setup: (z_low, z_high, region, shadow) in the setup frame, top down."""
+
+    def __init__(self, layers, bands, silhouette):
+        self.layers = layers
+        self.bands = bands
+        self.silhouette = silhouette
+
+    @property
+    def face(self) -> float:
+        return self.layers.face
+
+    def deepest(self) -> float:
+        """The depth below the setup face of the lowest band floor with material (0: no work)."""
+        return max((self.face - band[0] for band in self.bands), default=0.0)
+
+    def volume(self) -> float:
+        return sum(L.area(region) * (high - low) for low, high, region, _ in self.bands)
+
+
+def level_plan(stock_shape, part_shape, face_selector: str, *, radius: float, reach: float) -> LevelPlan:
+    """The bands that a flat cutter of the radius roughs from the setup face down to the reach.
+
+    ``stock_shape`` and ``part_shape``: CadQuery shapes in the part frame (the incoming material and the finished part)."""
+    setup = Setup.of(face_selector)
+    stock_mesh, part_mesh = L.SolidMesh.of(stock_shape), L.SolidMesh.of(part_shape)
+    layers = setup_layers(stock_mesh, part_mesh, setup, reach_depths=[reach], divide_depth=reach)
+    # All part sections, also those below the reach (the shadow skips them).
+    silhouette = filled(L.union([path for section in layers.part for path in section])) if layers.count else []
+    floor = layers.face - reach
+    planar = sorted(set(round(value, 7) for value in layers.planar))
+    bands = []
+    for low, high in zip(planar, planar[1:]):
+        if high <= floor + L.Z_MERGE_MM or low >= layers.face - L.Z_MERGE_MM:
+            continue
+        low, high = max(low, floor), min(high, layers.face)
+        index = layers.layer_at(low + L.Z_MERGE_MM * 10)
+        shadow = filled(layers.shadow[index])
+        region = L.difference(L.intersection(layers.stock[index], silhouette), closing(shadow, radius))
+        region = L.opened(region, MIN_WIDTH_MM)
+        if region and L.area(region) > MIN_WIDTH_MM ** 2:
+            bands.append((low, high, region, shadow))
+    bands.sort(key=lambda band: -band[1])
+    merged = []
+    for band in bands:
+        if merged and abs(merged[-1][0] - band[1]) <= L.Z_MERGE_MM and _same(merged[-1][2], band[2]):
+            # The same region in two bands (another level of the part, not of this region): one band, fewer passes.
+            merged[-1] = (band[0], merged[-1][1], band[2], band[3])
+        else:
+            merged.append(band)
+    return LevelPlan(layers, merged, silhouette)
+
+
+def _same(first, second) -> bool:
+    changed = L.union(L.difference(first, second), L.difference(second, first))
+    return L.area(L.opened(changed, MIN_WIDTH_MM)) <= MIN_WIDTH_MM ** 2
+
+
+def _centres(region, shadow, radius: float):
+    """The cutter centres that cut the region without touching the part above the level."""
+    return L.difference(L.offset(region, radius), L.offset(shadow, radius + FIT_MM)) if shadow else L.offset(region, radius)
+
+
+def _raster(centres, step_mm: float):
+    """The raster lines (start, end in mm) of the centre region, one row every step."""
+    box = L.bounds(centres)
+    if box is None:
+        return []
+    x0, y0, x1, y1 = box
+    rows = max(1, math.ceil((y1 - y0) / (step_mm * L.SCALE)))
+    clipper = pyclipper.Pyclipper()
+    clipper.AddPaths(centres, pyclipper.PT_CLIP, True)
+    for row in range(rows + 1):
+        y = round(y0 + (y1 - y0) * row / rows)
+        clipper.AddPath([(x0 - L.SCALE, y), (x1 + L.SCALE, y)], pyclipper.PT_SUBJECT, False)
+    tree = clipper.Execute2(pyclipper.CT_INTERSECTION, pyclipper.PFT_NONZERO, pyclipper.PFT_NONZERO)
+    lines = []
+    for path in pyclipper.OpenPathsFromPolyTree(tree):
+        if len(path) < 2:
+            continue
+        (ax, ay), (bx, by) = path[0], path[-1]
+        lines.append(((ax / L.SCALE, ay / L.SCALE), (bx / L.SCALE, by / L.SCALE)))
+    lines.sort(key=lambda line: (line[0][1], min(line[0][0], line[1][0])))
+    # Alternate the direction of the rows (zigzag order).
+    return [line if index % 2 == 0 else (line[1], line[0]) for index, line in enumerate(lines)]
+
+
+def _path(points, z, safe, tool, feed, rpm, kind):
+    path = Toolpath("level_rough", safe_z=safe, tool_type=tool.tool_type, tool_diameter_mm=tool.diameter,
+                    feed_mm_min=feed, spindle_rpm=rpm,
+                    metadata={"coordinate_system": "part_mm", "tool_axis": [0, 0, 1], "pass_role": "roughing", "path_kind": kind})
+    x, y = points[0]
+    path.append(ToolpathMove("rapid", (x, y, safe)))
+    path.append(ToolpathMove("plunge", (x, y, z), feed=feed, spindle_rpm=rpm))
+    path.moves.extend(ToolpathMove("feed", (px, py, z), feed=feed, spindle_rpm=rpm) for px, py in points[1:])
+    x, y = points[-1]
+    path.append(ToolpathMove("retract", (x, y, safe)))
+    return path
+
+
+def level_paths(plan: LevelPlan, tool, *, stepdown: float, stepover: float, feed: float, rpm, safe: float):
+    """The horizontal passes of every band: each stepdown level from the band top to its floor, raster then outline."""
+    paths = []
+    radius = tool.diameter / 2
+    for low, high, region, shadow in plan.bands:
+        centres = _centres(region, shadow, radius)
+        if not centres:
+            continue
+        count = max(1, math.ceil((high - low) / stepdown - 1e-9))
+        outlines = [[(x / L.SCALE, y / L.SCALE) for x, y in loop] for loop in centres if len(loop) >= 3]
+        lines = _raster(centres, stepover)
+        for level in range(1, count + 1):
+            z = high - (high - low) * level / count
+            for start, end in lines:
+                paths.append(_path([start, end], z, safe, tool, feed, rpm, "raster"))
+            for loop in outlines:
+                paths.append(_path(loop + [loop[0]], z, safe, tool, feed, rpm, "outline"))
+            if len(paths) > MAX_PASSES:
+                raise ValueError("The level roughing exceeds the pass limit. Divide the setup into smaller regions.")
+    return paths
+
+
+def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=None, stepdown=None, feed=100, rpm=None):
+    """Rough the waste above each planar level of the setup. Return (result, toolpath, states, reports, plan).
+
+    ``reach``: the deepest level below the setup face (default: the reach of the tool)."""
+    from .material_ledger import MaterialLedger
+    from .milling_layers import LayerCheckUnavailable, LayerReplay
+    from .milling_replay import finite, validate_cutter
+    from .profile_milling import _setup_plane
+    from .tool_selection import tool_reach
+    import cadquery as cq
+
+    if tool is None or tool.tool_type != "flat_endmill":
+        raise ValueError("Level roughing requires a selected flat end mill.")
+    radius = finite(tool.diameter, "cutter diameter", positive=True) / 2
+    reach = min(finite(reach, "level roughing reach", positive=True), tool_reach(tool)) if reach else tool_reach(tool)
+    maximum = finite((tool.safe_limits or {}).get("max_stepdown_mm", tool.flute_length), "maximum stepdown", positive=True)
+    stepdown = min(finite(stepdown, "level roughing stepdown", positive=True) if stepdown else maximum,
+                   maximum, tool.flute_length)
+    stepover = min(tool.diameter * 0.4, finite((tool.safe_limits or {}).get("max_stepover_mm", tool.diameter * 0.4),
+                                               "maximum stepover", positive=True))
+    plane, mirror = _setup_plane(face_selector)
+    local = cq.Workplane("XY").newObject([plane.toLocalCoords(shape.val())])
+    bounds = local.val().BoundingBox()
+    plan = level_plan(shape.val(), part_shape, face_selector, radius=radius, reach=reach)
+    safe = bounds.zmax + max(2, radius)
+    paths = level_paths(plan, tool, stepdown=stepdown, stepover=stepover, feed=feed, rpm=rpm, safe=safe)
+    normal = list(plane.zDir.toTuple())
+    aggregate = Toolpath("level_rough", safe_z=safe, tool_type=tool.tool_type, tool_diameter_mm=tool.diameter,
+                         feed_mm_min=feed, spindle_rpm=rpm,
+                         metadata={"coordinate_system": "part_mm", "tool_axis": normal, "face_selector": face_selector,
+                                   "maximum_stepdown_mm": stepdown, "stepover_mm": stepover,
+                                   "deepest_level_mm": round(plan.deepest(), 6), "band_count": len(plan.bands),
+                                   "planned_volume_mm3": round(plan.volume(), 3)})
+    if not paths:
+        # No waste above a level within the reach: no moves, no time; the material stays as it is.
+        aggregate.metadata.update(material_passes=[], no_work=True)
+        state = {"shape": shape, "pass_index": 0, "pass_role": "roughing", "label": "No level roughing needed",
+                 "geometry_replay": {"no_work": True}}
+        return shape, aggregate, [state], [], plan
+    validate_cutter(tool, cutting_depth=plan.deepest(), cut_length=stepdown)
+    try:
+        replay = LayerReplay(local, bounds.zmax, [path.moves[1].position[2] for path in paths], tool,
+                             ledger=MaterialLedger.of(shape), plane=plane, layer_brep=MaterialLedger.layer_brep(shape))
+    except LayerCheckUnavailable as error:
+        raise ValueError(f"Level roughing needs the layer model of the material: {error}") from error
+    reports = []
+    for index, path in enumerate(paths, 1):
+        report = replay.cut(path, "selected_cutter_raster_sweep" if path.metadata["path_kind"] == "raster"
+                            else "selected_cutter_closed_path_sweep")
+        start = len(aggregate.moves)
+        aggregate.moves.extend(replace(move, position=plane.toWorldCoords(move.position).toTuple()) for move in path.moves)
+        report.update(pass_index=index, pass_role="roughing", path_kind=path.metadata["path_kind"],
+                      move_start_index=start, move_end_index=len(aggregate.moves), tool_axis=normal)
+        reports.append(report)
+    if sum(report["removed_volume_mm3"] for report in reports) <= 1e-8:
+        aggregate.metadata.update(material_passes=reports, no_work=True)
+        state = {"shape": shape, "pass_index": 0, "pass_role": "roughing", "label": "No level roughing needed",
+                 "geometry_replay": {"no_work": True}}
+        return shape, aggregate, [state], reports, plan
+    result = local.newObject([replay.result_shape()])
+    final = result.val()
+    from .layer_player import plane_frame
+    frame = plane_frame(face_selector, plane)
+    states = []
+    for index, path in enumerate(paths):
+        local_state, layers = replay.state(final, index, frame)
+        world = None if local_state is None else shape.newObject([local_state.transformShape(plane.rG)])
+        states.append({"shape": world, "pass_index": index + 1, "pass_role": "roughing",
+                       "label": f"After level roughing pass {index + 1}", "geometry_replay": reports[index],
+                       "player_layers": layers})
+    reports[-1]["material_brep"] = replay.brep_source
+    replay.attach_ledger(states[-1]["shape"])
+    aggregate.metadata.update(material_passes=reports, removed_volume_mm3=round(replay.material_removed(), 3))
+    return states[-1]["shape"], aggregate, states, reports, plan
+
+
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+from .operations import MachiningOperation, _feed_rate, _resolve_fs_tool_type, _spindle_rpm, _tool_dict, _tool_selection_dict
+from .material import get_feeds_speeds
+from .tool_library import ToolSpec
+
+
+@dataclass
+class LevelRoughOp(MachiningOperation):
+    """Rough the waste above each planar level of one setup (``run_level_roughing``)."""
+
+    part_shape: Any = field(default=None, repr=False)
+    reach: float = 0.0
+    """The deepest level below the setup face that this operation roughs (mm)."""
+    stepdown: Optional[float] = None
+    tool: Optional[ToolSpec] = None
+    material: str = "aluminum_6061"
+
+    def __post_init__(self):
+        if self.tool is None:
+            raise ValueError("Level roughing requires a selected flat end mill (Stock.rough_levels selects it).")
+        self.feeds_speeds = get_feeds_speeds(_resolve_fs_tool_type(self.tool.tool_type), self.tool.diameter, self.material)
+        # The inventory check of Stock._apply_op: the depth needs the reach, one stepdown needs the flutes.
+        self.depth = self.reach
+        self.start_depth = max(self.reach - min(self.stepdown or self.tool.flute_length, self.tool.flute_length), 0.0)
+
+    def apply(self, shape):
+        result, self._level_toolpath, self._material_pass_states, self._pass_reports, plan = run_level_roughing(
+            shape, self.part_shape, tool=self.tool, face_selector=self.face_selector, reach=self.reach or None,
+            stepdown=self.stepdown, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds))
+        self._bands = [{"z_low_mm": round(low, 6), "z_high_mm": round(high, 6), "area_mm2": round(L.area(region), 3)}
+                       for low, high, region, _ in plan.bands]
+        self._level_toolpath.metadata.update(tool=_tool_dict(self.tool), tool_selection=_tool_selection_dict(self.tool_selection))
+        return result
+
+    def to_dict(self) -> dict:
+        metadata = getattr(self, "_level_toolpath", None).metadata if hasattr(self, "_level_toolpath") else {}
+        return {
+            "operation": "level_rough",
+            "strategy": "level_roughing",
+            "tool_type": self.tool.tool_type,
+            "tool_diameter_mm": self.tool.diameter,
+            "tool": _tool_dict(self.tool),
+            "depth_mm": self.reach,
+            "deepest_level_mm": metadata.get("deepest_level_mm"),
+            "maximum_stepdown_mm": metadata.get("maximum_stepdown_mm"),
+            "bands": getattr(self, "_bands", []),
+            "removed_volume_mm3": metadata.get("removed_volume_mm3", 0.0),
+            "no_work": bool(metadata.get("no_work")),
+            "face_selector": self.face_selector,
+            "feeds_speeds": self.feeds_speeds if "error" not in self.feeds_speeds else None,
+            "material_passes": getattr(self, "_pass_reports", []),
+            "geometry_fidelity": "layers_2_5d", "geometry_status": "requires_review",
+            "verification_status": "not_verified", "manufacturing_ready": False,
+            "review_reasons": ["Level roughing removes the waste above each planar level with the selected end mill. "
+                               "Entry moves, chip load and fixture clearance require verification."],
+        }
+
+    def to_toolpath(self) -> Toolpath:
+        if not hasattr(self, "_level_toolpath"):
+            raise ValueError("Level roughing has no retained cutter path. Apply the operation to its incoming material first.")
+        return self._level_toolpath
+
+
+def select_roughing_tool(shape, part_shape, face_selector: str, *, max_depth: Optional[float] = None):
+    """(tool, selection, depth): the largest available flat end mill that reaches the deepest level with waste, else the
+    one that reaches the deepest band it can; depth 0 when the setup has no waste above a level."""
+    from .tool_selection import ToolRequirement, ToolUnavailableError, select_tool
+    bounds = shape.val().BoundingBox()
+    full = max_depth or max(bounds.xlen, bounds.ylen, bounds.zlen)
+    probe = level_plan(shape.val(), part_shape, face_selector, radius=0.5, reach=full)
+    depths = sorted({round(probe.face - band[0], 6) for band in probe.bands}, reverse=True)
+    if not depths:
+        return None, None, 0.0
+    last = None
+    for depth in depths:
+        selection = select_tool(ToolRequirement("flat_endmill", min_reach_mm=depth, prefer_largest=True,
+                                                feature="level_rough",
+                                                reason="the end mill must reach the deepest level with waste above it"))
+        if selection.ok:
+            return selection.selected_tool, selection, depth
+        last = selection
+    raise ToolUnavailableError(last)

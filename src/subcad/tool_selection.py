@@ -51,15 +51,25 @@ class ToolUnavailableError(ValueError):
         super().__init__("; ".join(result.errors))
 
 
-def validate_inventory_tool(tool: Optional[ToolSpec], *, depth: float = 0.0) -> None:
-    """Reject explicit or retained cutters that bypass a strict snapshot."""
+def tool_reach(tool: ToolSpec) -> float:
+    """How deep the tool tip goes below the setup face: the projection from the holder, or a shorter recorded
+    reach (a tool with no recorded reach reaches its flute length)."""
+    return min(tool.stickout_mm, tool.reach_mm or tool.flute_length)
+
+
+def validate_inventory_tool(tool: Optional[ToolSpec], *, depth: float = 0.0, cut_length: Optional[float] = None) -> None:
+    """Reject explicit or retained cutters that bypass a strict snapshot.
+
+    ``depth``: from the setup face to the deepest cut; ``cut_length``: the material height that the flutes cut
+    (the tool goes through the air above the material start). The default is the depth."""
     scope = _inventory_scope.get()
     if scope is None or not scope.strict or tool is None:
         return
     matching = next((candidate for candidate in scope.tools if candidate.catalog_id == tool.catalog_id), None)
     if matching is None or matching.inventory_count <= 0 or matching.to_dict() != tool.to_dict():
         raise ValueError(f"Tool {tool.catalog_id or tool.tool_type} does not match the owned inventory snapshot.")
-    if abs(depth) > min(tool.flute_length, tool.reach_mm or tool.flute_length, tool.stickout_mm):
+    cut = abs(depth) if cut_length is None else abs(cut_length)
+    if cut > tool.flute_length + 1e-8 or abs(depth) > tool_reach(tool) + 1e-8:
         raise ValueError(f"Tool {tool.catalog_id} cannot reach the required cutting depth.")
 
 
@@ -71,6 +81,9 @@ class ToolRequirement:
     min_diameter_mm: float = 0.0
     max_diameter_mm: Optional[float] = None
     min_flute_length_mm: float = 0.0
+    """The material height that the flutes cut in one pass."""
+    min_reach_mm: Optional[float] = None
+    """From the setup face to the deepest cut (``tool_reach``); None: the flute length (the cut starts at the face)."""
     feature: str = ""
     reason: str = ""
     prefer_largest: bool = False
@@ -78,12 +91,17 @@ class ToolRequirement:
     require_point_geometry: bool = False
     include_point_length_in_reach: bool = False
 
+    @property
+    def reach_mm(self) -> float:
+        return self.min_flute_length_mm if self.min_reach_mm is None else self.min_reach_mm
+
     def to_dict(self) -> dict:
         return {
             "tool_type": self.tool_type,
             "min_diameter_mm": self.min_diameter_mm,
             "max_diameter_mm": self.max_diameter_mm,
             "min_flute_length_mm": self.min_flute_length_mm,
+            "min_reach_mm": self.reach_mm,
             "feature": self.feature,
             "reason": self.reason,
             "prefer_largest": self.prefer_largest,
@@ -150,17 +168,17 @@ def select_tool(requirement: ToolRequirement) -> ToolSelectionResult:
             and tool.diameter > requirement.max_diameter_mm
         ):
             reasons.append("diameter_too_large")
-        if requirement.min_flute_length_mm:
-            if tool.flute_length < requirement.min_flute_length_mm:
-                reasons.append("flute_length_too_short")
-            if scope and scope.strict and min(tool.reach_mm or tool.flute_length, tool.stickout_mm) < requirement.min_flute_length_mm:
-                reasons.append("reach_too_short")
+        if requirement.min_flute_length_mm and tool.flute_length < requirement.min_flute_length_mm:
+            reasons.append("flute_length_too_short")
+        if requirement.reach_mm and scope and scope.strict and tool_reach(tool) < requirement.reach_mm:
+            reasons.append("reach_too_short")
         if requirement.require_point_geometry and tool.tool_type in allowed_types:
             try:
                 from .drilling_replay import point_geometry
                 _, _, point = point_geometry(tool)
-                required_depth = requirement.min_flute_length_mm + (point if requirement.include_point_length_in_reach else 0)
-                if required_depth > min(tool.flute_length, tool.reach_mm or tool.flute_length, tool.stickout_mm):
+                extra = point if requirement.include_point_length_in_reach else 0
+                if (requirement.min_flute_length_mm + extra > tool.flute_length
+                        or requirement.reach_mm + extra > tool_reach(tool)):
                     reasons.append("point_depth_exceeds_reach")
             except (ValueError, TypeError):
                 reasons.append("missing_or_invalid_point_geometry")
@@ -199,6 +217,8 @@ def select_tool(requirement: ToolRequirement) -> ToolSelectionResult:
         message += f"..{requirement.max_diameter_mm:g}"
     if requirement.min_flute_length_mm:
         message += f" and flute length {requirement.min_flute_length_mm:g} mm"
+    if requirement.reach_mm > requirement.min_flute_length_mm + 1e-9:
+        message += f" with reach {requirement.reach_mm:g} mm"
     result.errors.append(message)
     if requirement.require_point_geometry:
         result.errors.append("Reaming requires a recorded lead angle, a positive lead tip diameter, and complete lead reach." if requirement.tool_type == "reamer"

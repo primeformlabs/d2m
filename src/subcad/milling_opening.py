@@ -26,8 +26,8 @@ z - c gives no more reach (its obstacle is larger, its radius is the same). So
 
     left(z) = R ∩ intersection over t of offset(obstacle(t), -rho(z - t))
 
-Reach: a layer deeper below the setup face than min(flute length, stick-out, reach) is out of reach for
-that cutter. The setup face is the part top in the setup frame: the plan faces it first (D2O "Face and
+Reach: a layer deeper below the setup face than min(stick-out, reach) is out of reach for that cutter (the flutes
+cut one layer band at a time; the tool moves through the air above the material). The setup face is the part top in the setup frame: the plan faces it first (D2O "Face and
 square first datums"), and the old replay measures the cutting depth from the incoming material top. A tip does not go below the stock bottom (the table and the fixture are there).
 
 Layers: the limits are the heights of the planar (horizontal) faces of the stock and the part. A layer
@@ -175,7 +175,7 @@ class Cutter:
     @property
     def reach_depth(self) -> float:
         """The deepest layer below the setup face that the cutter cuts (``milling_replay.validate_cutter``)."""
-        return min(self.flute_length, self.stickout, self.reach or self.flute_length)
+        return min(self.stickout, self.reach or self.flute_length)
 
     @property
     def profile_height(self) -> float:

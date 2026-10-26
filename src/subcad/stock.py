@@ -165,6 +165,36 @@ class Stock:
         obj._state_history = state_history if state_history is not None else []
         return obj
 
+    def rough_levels(self, part, *, face_selector: str = ">Z", max_depth: Optional[float] = None,
+                     stepdown: Optional[float] = None, tool: Optional[ToolSpec] = None) -> "Stock":
+        """Rough the waste above each planar level of the setup (``level_roughing``, docs/LEVEL_ROUGHING.md).
+
+        ``part``: the finished part (a CadQuery shape or workplane) in the stock frame. ``max_depth``: the deepest level
+        below the setup face to rough. Without a tool, the largest available end mill that reaches the deepest level
+        with waste is selected."""
+        from .level_roughing import LevelRoughOp, select_roughing_tool
+        part_shape = part.val() if hasattr(part, "val") else part
+        setup = self._setups.get(self._active_setup) if self._active_setup else None
+        face = setup.face_selector if setup else face_selector
+        selection = None
+        reach = max_depth or 0.0
+        if tool is None:
+            tool, selection, reach = select_roughing_tool(self._shape, part_shape, face, max_depth=max_depth)
+            if tool is None:
+                return self
+        op = LevelRoughOp(part_shape=part_shape, reach=reach, stepdown=stepdown, tool=tool, tool_selection=selection,
+                          face_selector=face, material=self._material)
+        return self._apply_op(op)
+
+    def _feature_depths(self, face_selector: str, cx: float, cy: float, radius: float, depth: float,
+                        through: bool) -> tuple[float, float]:
+        """(start_depth, depth) of a round feature from the incoming material (``feature_depth``); a through
+        feature without native geometry keeps the stock box depth."""
+        if not _HAS_CADQUERY or radius <= 0:
+            return 0.0, _profile_through_depth(self, face_selector) if through else depth
+        from .feature_depth import feature_depths
+        return feature_depths(self._shape, face_selector, cx=cx, cy=cy, radius=radius, depth=depth, through=through)
+
     def _apply_op(self, op) -> "Stock":
         """Apply a machining operation: modify shape, record in plan, return new Stock."""
         if getattr(op, "spot_op", None) is not None:
@@ -172,7 +202,8 @@ class Stock:
             op.spot_op = None
             op.sequence_number = prepared._next_op_number
             return prepared._apply_op(op)
-        validate_inventory_tool(getattr(op, "tool", None), depth=getattr(op, "depth", 0.0))
+        depth = getattr(op, "depth", 0.0)
+        validate_inventory_tool(getattr(op, "tool", None), depth=depth, cut_length=depth - getattr(op, "start_depth", 0.0))
         if getattr(op, "sequence_number", 0) == 0:
             op.sequence_number = self._next_op_number
 
@@ -947,9 +978,9 @@ class Stock:
         from .operations import DrillOp, SpotDrillOp
 
         result = self
-        if through:
-            setup = self._setups.get(self._active_setup) if self._active_setup else None
-            depth = _profile_through_depth(self, setup.face_selector if setup else face_selector)
+        setup = self._setups.get(self._active_setup) if self._active_setup else None
+        start_depth, depth = self._feature_depths(setup.face_selector if setup else face_selector, cx, cy,
+                                                  diameter / 2, depth, through)
 
         # Apply spot-drill first so it's recorded in the plan
         if spot_drill:
@@ -971,6 +1002,7 @@ class Stock:
             through=through,
             spot_drill=False,
             peck=peck,
+            start_depth=start_depth,
             face_selector=face_selector,
             tool=tool,
             material=self._material,
@@ -1437,15 +1469,16 @@ class Stock:
         """Finish a pre-drilled hole with a reamer."""
         from .operations import ReamOp
 
-        if through:
-            setup = self._setups.get(self._active_setup) if self._active_setup else None
-            depth = _profile_through_depth(self, setup.face_selector if setup else face_selector)
+        setup = self._setups.get(self._active_setup) if self._active_setup else None
+        start_depth, depth = self._feature_depths(setup.face_selector if setup else face_selector, cx, cy,
+                                                  diameter / 2, depth, through)
         op = ReamOp(
             cx=cx,
             cy=cy,
             diameter=diameter,
             depth=depth,
             through=through,
+            start_depth=start_depth,
             face_selector=face_selector,
             tool=tool,
             material=self._material,
@@ -1478,15 +1511,16 @@ class Stock:
         """Circular-mill a hole with the selected cutter and retained material passes."""
         from .operations import BoreOp
 
-        if through:
-            setup = self._setups.get(self._active_setup) if self._active_setup else None
-            depth = _profile_through_depth(self, setup.face_selector if setup else face_selector)
+        setup = self._setups.get(self._active_setup) if self._active_setup else None
+        start_depth, depth = self._feature_depths(setup.face_selector if setup else face_selector, cx, cy,
+                                                  diameter / 2, depth, through)
         op = BoreOp(
             cx=cx,
             cy=cy,
             diameter=diameter,
             depth=depth,
             through=through,
+            start_depth=start_depth,
             face_selector=face_selector,
             stepdown=stepdown,
             finish_allowance=finish_allowance,

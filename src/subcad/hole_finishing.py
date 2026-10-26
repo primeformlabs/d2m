@@ -17,7 +17,10 @@ def prepare_reaming(stock, diameter, depth, *, cx, cy, through, face_selector, e
     plane, mirror = _setup_plane(face)
     local = plane.toLocalCoords(stock._shape.val())
     bounds = local.BoundingBox()
-    depth = bounds.zlen if through else finite(depth, "reaming depth", positive=True)
+    from .feature_depth import material_span
+    span = material_span(stock._shape, face, cx=finite(cx, "reaming X position"), cy=finite(cy, "reaming Y position"),
+                         radius=finite(diameter, "finished hole diameter", positive=True) / 2) if through else None
+    depth = (span[1] if span else bounds.zlen) if through else finite(depth, "reaming depth", positive=True)
     if not through and entry_plane_mm is not None:
         entry = finite(entry_plane_mm, "reaming entry plane")
         if not bounds.zmin <= entry <= bounds.zmax:
@@ -78,14 +81,20 @@ def apply_circular_milling(operation, shape):
     if operation.tool.tool_type != "flat_endmill" or operation.tool.diameter > diameter:
         raise ValueError("Circular milling requires a selected flat end mill that fits the requested hole diameter.")
     if operation.through:
-        plane, _ = _setup_plane(operation.face_selector)
-        operation.depth = plane.toLocalCoords(shape.val()).BoundingBox().zlen
+        from .feature_depth import material_span
+        span = material_span(shape, operation.face_selector, cx=operation.cx, cy=operation.cy, radius=diameter / 2)
+        if span:
+            operation.start_depth, operation.depth = span
+        else:
+            plane, _ = _setup_plane(operation.face_selector)
+            operation.depth = plane.toLocalCoords(shape.val()).BoundingBox().zlen
     profile = {"type": "circle", "diameter": diameter, "cx": operation.cx, "cy": operation.cy}
     result, operation._bore_toolpath, operation._material_pass_states, operation._pass_reports, operation._target_comparison = run_profile_pocket(
         shape, profile, tool=operation.tool, depth=operation.depth, through=operation.through,
         face_selector=operation.face_selector, stepdown=operation.stepdown,
         finish_allowance=operation.finish_allowance, chord_error=operation.chord_error,
-        feed=_feed_rate(operation.feeds_speeds), rpm=_spindle_rpm(operation.feeds_speeds))
+        feed=_feed_rate(operation.feeds_speeds), rpm=_spindle_rpm(operation.feeds_speeds),
+        start_depth=getattr(operation, "start_depth", 0.0))
     operation._bore_toolpath.operation = "bore"
     operation._bore_toolpath.metadata.update(tool=_tool_dict(operation.tool),
         tool_selection=_tool_selection_dict(operation.tool_selection), hole_diameter_mm=diameter,

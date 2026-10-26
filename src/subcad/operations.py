@@ -1215,6 +1215,8 @@ class DrillOp(MachiningOperation):
     through: bool = False
     spot_drill: bool = True
     peck: bool = False
+    start_depth: float = 0.0
+    """Where the material of the hole starts below the setup face (``feature_depth``): the flutes cut from there."""
 
     tool: Optional[ToolSpec] = None
     """Drill bit.  Auto-selected to match hole diameter when None."""
@@ -1232,7 +1234,8 @@ class DrillOp(MachiningOperation):
                     "drill",
                     min_diameter_mm=self.diameter,
                     max_diameter_mm=self.diameter,
-                    min_flute_length_mm=self.depth,
+                    min_flute_length_mm=self.depth - self.start_depth,
+                    min_reach_mm=self.depth,
                     require_point_geometry=True,
                     include_point_length_in_reach=True,
                     feature="drill",
@@ -1279,6 +1282,7 @@ class DrillOp(MachiningOperation):
             "tool_diameter_mm": self.tool.diameter,
             "tool": _tool_dict(self.tool),
             "depth_mm": self.depth,
+            "start_depth_mm": self.start_depth,
             "hole_diameter_mm": self.diameter,
             "through": self.through,
             "peck_drilling": self.peck,
@@ -1794,6 +1798,7 @@ class PeckDrillOp(MachiningOperation):
     peck_step: float = 2.0
     """Retract step increment for peck drilling (mm)."""
     through: bool = False
+    start_depth: float = 0.0
 
     tool: Optional[ToolSpec] = None
     material: str = "aluminum_6061"
@@ -1802,8 +1807,8 @@ class PeckDrillOp(MachiningOperation):
         if self.tool is None:
             self.tool, self.tool_selection = _select_inventory_tool(
                 ToolRequirement("drill", min_diameter_mm=self.diameter, max_diameter_mm=self.diameter,
-                    min_flute_length_mm=self.depth, require_point_geometry=True, include_point_length_in_reach=True,
-                    feature="peck_drill", reason="matching drill with recorded point geometry and complete tip reach"),
+                    min_flute_length_mm=self.depth - self.start_depth, min_reach_mm=self.depth,
+                    require_point_geometry=True, include_point_length_in_reach=True, feature="peck_drill", reason="matching drill with recorded point geometry and complete tip reach"),
                 ToolSpec("drill", self.diameter, tip_angle=118.0))
 
         tool_type_fs = _resolve_fs_tool_type(self.tool.tool_type)
@@ -1869,6 +1874,7 @@ class ReamOp(MachiningOperation):
     diameter: float = 6.0
     depth: float = 10.0
     through: bool = False
+    start_depth: float = 0.0
 
     tool: Optional[ToolSpec] = None
     material: str = "aluminum_6061"
@@ -1877,8 +1883,8 @@ class ReamOp(MachiningOperation):
         if self.tool is None:
             self.tool_selection = select_tool(ToolRequirement("reamer",
                 min_diameter_mm=self.diameter, max_diameter_mm=self.diameter,
-                min_flute_length_mm=self.depth, require_point_geometry=True, include_point_length_in_reach=True,
-                feature="ream", reason="reamer diameter must match the finished hole; its recorded lead must fit an existing pilot"))
+                min_flute_length_mm=self.depth - self.start_depth, min_reach_mm=self.depth,
+                require_point_geometry=True, include_point_length_in_reach=True, feature="ream", reason="reamer diameter must match the finished hole; its recorded lead must fit an existing pilot"))
             if not self.tool_selection.ok:
                 raise ToolUnavailableError(self.tool_selection)
             self.tool = self.tool_selection.selected_tool
@@ -1903,6 +1909,7 @@ class ReamOp(MachiningOperation):
             "tool_diameter_mm": self.tool.diameter,
             "tool": _tool_dict(self.tool),
             "depth_mm": self.depth,
+            "start_depth_mm": self.start_depth,
             "hole_diameter_mm": self.diameter,
             "through": self.through,
             "position": list(self.position) if self.position else None,
@@ -1933,6 +1940,7 @@ class BoreOp(MachiningOperation):
     diameter: float = 20.0
     depth: float = 10.0
     through: bool = False
+    start_depth: float = 0.0
     stepdown: float = 1.0
     finish_allowance: float = 0.0
     chord_error: float = 0.01
@@ -1943,7 +1951,8 @@ class BoreOp(MachiningOperation):
     def __post_init__(self):
         if self.tool is None:
             self.tool_selection = select_tool(ToolRequirement("flat_endmill", max_diameter_mm=self.diameter,
-                min_flute_length_mm=self.depth, prefer_largest=True, feature="bore",
+                min_flute_length_mm=self.depth - self.start_depth, min_reach_mm=self.depth, prefer_largest=True,
+                feature="bore",
                 reason="circular milling requires an available end mill that fits the hole and reaches its complete depth"))
             if not self.tool_selection.ok:
                 raise ToolUnavailableError(self.tool_selection)
@@ -1970,6 +1979,7 @@ class BoreOp(MachiningOperation):
             "tool_diameter_mm": self.tool.diameter,
             "tool": _tool_dict(self.tool),
             "depth_mm": self.depth,
+            "start_depth_mm": self.start_depth,
             "hole_diameter_mm": self.diameter,
             "through": self.through,
             "position": list(self.position) if self.position else None,

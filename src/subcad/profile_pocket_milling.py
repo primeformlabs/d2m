@@ -345,13 +345,15 @@ def _layer_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, de
 
 def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=False,
                        face_selector=">Z", stepdown=1, finish_allowance=0.1, chord_error=0.01,
-                       feed=100, rpm=None, outside=False, rest_from_diameter=None, layers=True):
+                       feed=100, rpm=None, outside=False, rest_from_diameter=None, layers=True, start_depth=0.0):
     """Return material, actual toolpath, retained pass states and target comparison.
 
     ``rest_from_diameter``: rest machining. The passes cut only near the material that a previous flat end mill
     of that diameter left; the boundary pass at the full depth makes the corners with the radius of this cutter.
     ``layers``: replay the passes on 2.5D layers (``milling_layers.py``); False keeps the B-Rep replay
-    (the loft operation compares its levels with the exact loft by B-Rep)."""
+    (the loft operation compares its levels with the exact loft by B-Rep).
+    ``start_depth``: where the material starts below the setup face (``feature_depth``): the depth passes start
+    there, the flutes cut the material height and the reach covers the full depth."""
     import cadquery as cq
     if tool is None or tool.tool_type != "flat_endmill":
         raise ValueError("Native profile pocket replay requires a selected flat end mill.")
@@ -369,7 +371,8 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
     depth = bounds.zlen if through else depth
     if depth > bounds.zlen + 1e-8:
         raise ValueError("The pocket depth exceeds the incoming material thickness along its cutter axis.")
-    validate_cutter(tool, cutting_depth=depth)
+    start = min(max(finite(start_depth, "profile pocket start depth"), 0.0), depth)
+    validate_cutter(tool, cutting_depth=depth, cut_length=depth - start)
     outer, sampled = _profile_wire(profile)
     keep = []
     for item in islands or []:
@@ -415,15 +418,15 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
             center, rough_center = rest, rest
     maximum = finite((tool.safe_limits or {}).get("max_stepdown_mm", tool.diameter / 2), "maximum pocket stepdown", positive=True)
     stepdown = min(stepdown, maximum, tool.diameter / 2)
-    count = max(1, math.ceil(depth / stepdown))
+    count = max(1, math.ceil((depth - start) / stepdown))
     if count > 100:
         raise ValueError("The pocket exceeds the depth-pass limit. Divide the operation into smaller regions.")
     safe = bounds.zmax + max(2, tool.radius)
     paths = []
-    floor_allowance = min(allowance, stepdown, depth / 2)
+    floor_allowance = min(allowance, stepdown, (depth - start) / 2)
     for level in range(1, count + 1):
         # Leave a floor allowance for the independently retained finish passes.
-        z = bounds.zmax - min(depth * level / count, depth - floor_allowance)
+        z = bounds.zmax - start - min((depth - start) * level / count, depth - start - floor_allowance)
         paths.extend(_clearing_paths(rough_center, outer, keep, z=z, safe=safe, tool=tool, feed=feed, rpm=rpm,
             role="roughing", allowance=allowance, chord=chord))
     paths.extend(_clearing_paths(center, outer, keep, z=bounds.zmax - depth, safe=safe, tool=tool, feed=feed, rpm=rpm,
@@ -435,7 +438,8 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
         tool_type=tool.tool_type, tool_diameter_mm=tool.diameter, feed_mm_min=feed, spindle_rpm=rpm,
         metadata={"coordinate_system": "part_mm", "tool_axis": normal, "face_selector": face_selector,
             "cutter_compensation": "geometry_applied", "maximum_stepdown_mm": stepdown,
-            "finish_allowance_mm": allowance, "chord_error_mm": chord, "waste_discarded": False})
+            "finish_allowance_mm": allowance, "chord_error_mm": chord, "waste_discarded": False,
+            "start_depth_mm": start})
     aggregate.metadata["floor_allowance_mm"] = floor_allowance
     aggregate.metadata["open_stock_edges"] = open_stock_edges
     if is_program_mode():

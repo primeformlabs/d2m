@@ -39,6 +39,15 @@ Each layer operation and each drill plunge adds its cuts. The layers of the next
 ledger, not from the B-Rep result of the operation before. If the B-Rep Boolean of an operation fails, the
 operation keeps its layer result and its B-Rep comes from the ledger layers (`docs/MILLING_LAYER_REPLAY.md`).
 
+Version 0.2.28 checks each cutter with two numbers (`tool_selection.tool_reach`, `docs/FEATURE_DEPTH.md`).
+The flutes must be as long as the material that one pass cuts. The reach (the projection from the holder, or a shorter
+recorded reach) must cover the depth from the setup face to the deepest cut. `ToolRequirement.min_reach_mm` is the
+reach; without it the flute length is also the reach, as before. A drill, a bore and a reamed hole start at the top of
+their material inside the hole circle (`feature_depth.py`, `start_depth`): the tool moves rapid to that height and cuts
+from there. A through hole goes to the bottom of its material column, not to the bottom of the stock box.
+`Stock.rough_levels(part, face_selector=...)` removes the waste above each planar level of a setup, inside the part
+silhouette, with no cut into the part, its holes or its closed pockets (`docs/LEVEL_ROUGHING.md`).
+
 Version 0.2.22 applies ruled loft Milling on all six cardinal setup faces.
 Section `cx` and `cy` use the existing face-profile convention.
 Section `z_mm` is the signed position along the outward cutter axis.
