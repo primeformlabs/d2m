@@ -32,6 +32,11 @@ from .toolpath import Toolpath, ToolpathMove
 MIN_WIDTH_MM = 0.01
 # Largest number of passes of one level roughing operation (raster lines and outlines of every level).
 MAX_PASSES = 4000
+# Arc tolerance of the roughing offsets and the outline cleaning before them (mm). Roughing needs no sub-micrometre
+# arcs: the offsets of large part outlines by the cutter radius took minutes at 0.25 µm (NIST CTC-01). The cutter
+# radius gets the tolerance added, so the chords never bring the cutter nearer to the part.
+ROUGH_ARC_MM = 0.005
+ROUGH_CLEAN_MM = 0.002
 
 
 def filled(paths):
@@ -40,8 +45,19 @@ def filled(paths):
     return L.union(outer) if outer else []
 
 
+def _offset(paths, distance_mm: float):
+    if not paths:
+        return []
+    clean = [path for path in pyclipper.CleanPolygons(paths, ROUGH_CLEAN_MM * L.SCALE) if len(path) >= 3]
+    job = pyclipper.PyclipperOffset(2.0, ROUGH_ARC_MM * L.SCALE)
+    job.AddPaths(clean, pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
+    return job.Execute(distance_mm * L.SCALE)
+
+
 def closing(paths, radius: float):
-    return L.offset(L.offset(paths, radius + FIT_MM), -(radius + FIT_MM)) if paths else []
+    """What a disk of the radius cannot reach outside the paths (grow, then shrink), on the safe side of the arcs."""
+    grow = radius + FIT_MM + ROUGH_ARC_MM + ROUGH_CLEAN_MM
+    return _offset(_offset(paths, grow), -radius) if paths else []
 
 
 class LevelPlan:
@@ -79,14 +95,17 @@ def keep_paths(profiles, face_selector: str):
     return L.union(paths) if paths else []
 
 
-def level_plan(stock_shape, part_shape, face_selector: str, *, radius: float, reach: float, keep=()) -> LevelPlan:
+def level_plan(stock_shape, part_shape, face_selector: str, *, radius: float, reach: float, keep=(),
+               divide: bool = True) -> LevelPlan:
     """The bands that a flat cutter of the radius roughs from the setup face down to the reach.
 
     ``stock_shape`` and ``part_shape``: CadQuery shapes in the part frame (the incoming material and the finished part).
-    ``keep``: profiles that the roughing leaves for their own operations (``keep_paths``); they count as part."""
+    ``keep``: profiles that the roughing leaves for their own operations (``keep_paths``); they count as part.
+    ``divide``: divide the layers that sloped or curved faces cross (the exact shadow); False is a quick probe of the
+    planar levels only."""
     setup = Setup.of(face_selector)
     stock_mesh, part_mesh = L.SolidMesh.of(stock_shape), L.SolidMesh.of(part_shape)
-    layers = setup_layers(stock_mesh, part_mesh, setup, reach_depths=[reach], divide_depth=reach)
+    layers = setup_layers(stock_mesh, part_mesh, setup, reach_depths=[reach], divide_depth=reach if divide else 0.0)
     # All part sections, also those below the reach (the shadow skips them).
     silhouette = filled(L.union([path for section in layers.part for path in section])) if layers.count else []
     kept = keep_paths(keep, face_selector)
@@ -121,7 +140,9 @@ def _same(first, second) -> bool:
 
 def _centres(region, shadow, radius: float):
     """The cutter centres that cut the region without touching the part above the level."""
-    return L.difference(L.offset(region, radius), L.offset(shadow, radius + FIT_MM)) if shadow else L.offset(region, radius)
+    if not shadow:
+        return _offset(region, radius)
+    return L.difference(_offset(region, radius), _offset(shadow, radius + FIT_MM + ROUGH_ARC_MM + ROUGH_CLEAN_MM))
 
 
 def _raster(centres, step_mm: float):
@@ -229,15 +250,20 @@ def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=Non
                              ledger=MaterialLedger.of(shape), plane=plane, layer_brep=MaterialLedger.layer_brep(shape))
     except LayerCheckUnavailable as error:
         raise ValueError(f"Level roughing needs the layer model of the material: {error}") from error
+    # One pass for each cutting level (top down): its raster lines and outlines are one layer removal.
+    levels: dict[float, list] = {}
+    for path in paths:
+        levels.setdefault(round(path.moves[1].position[2], 9), []).append(path)
     reports = []
-    for index, path in enumerate(paths, 1):
-        report = replay.cut(path, "selected_cutter_raster_sweep" if path.metadata["path_kind"] == "raster"
-                            else "selected_cutter_closed_path_sweep")
+    for index, (z, group) in enumerate(sorted(levels.items(), key=lambda item: -item[0]), 1):
+        report = replay.cut_level(group, "selected_cutter_level_sweeps")
         start = len(aggregate.moves)
-        aggregate.moves.extend(replace(move, position=plane.toWorldCoords(move.position).toTuple()) for move in path.moves)
-        report.update(pass_index=index, pass_role="roughing", path_kind=path.metadata["path_kind"],
+        for path in group:
+            aggregate.moves.extend(replace(move, position=plane.toWorldCoords(move.position).toTuple()) for move in path.moves)
+        report.update(pass_index=index, pass_role="roughing", path_kind="level", level_mm=z,
                       move_start_index=start, move_end_index=len(aggregate.moves), tool_axis=normal)
         reports.append(report)
+    paths = [group for _, group in sorted(levels.items(), key=lambda item: -item[0])]
     if sum(report["removed_volume_mm3"] for report in reports) <= 1e-8:
         aggregate.metadata.update(material_passes=reports, no_work=True)
         state = {"shape": shape, "pass_index": 0, "pass_role": "roughing", "label": "No level roughing needed",
@@ -248,11 +274,11 @@ def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=Non
     from .layer_player import plane_frame
     frame = plane_frame(face_selector, plane)
     states = []
-    for index, path in enumerate(paths):
+    for index, _ in enumerate(paths):
         local_state, layers = replay.state(final, index, frame)
         world = None if local_state is None else shape.newObject([local_state.transformShape(plane.rG)])
         states.append({"shape": world, "pass_index": index + 1, "pass_role": "roughing",
-                       "label": f"After level roughing pass {index + 1}", "geometry_replay": reports[index],
+                       "label": f"After level roughing level {index + 1}", "geometry_replay": reports[index],
                        "player_layers": layers})
     reports[-1]["material_brep"] = replay.brep_source
     replay.attach_ledger(states[-1]["shape"])
@@ -334,7 +360,7 @@ def select_roughing_tool(shape, part_shape, face_selector: str, *, max_depth: Op
     from .tool_selection import ToolRequirement, ToolUnavailableError, select_tool
     bounds = shape.val().BoundingBox()
     full = max_depth or max(bounds.xlen, bounds.ylen, bounds.zlen)
-    probe = level_plan(shape.val(), part_shape, face_selector, radius=0.5, reach=full, keep=keep)
+    probe = level_plan(shape.val(), part_shape, face_selector, radius=0.5, reach=full, keep=keep, divide=False)
     depths = sorted({round(probe.face - band[0], 6) for band in probe.bands}, reverse=True)
     if not depths:
         return None, None, 0.0

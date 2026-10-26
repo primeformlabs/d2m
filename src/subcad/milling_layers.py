@@ -94,6 +94,32 @@ class LayerReplay:
         report["layer_count"] = len(self.material.layers)
         return report
 
+    def cut_level(self, paths, method: str):
+        """All horizontal paths of one cutting level as one cut: the union of their sweeps, one layer removal (level
+        roughing has hundreds of raster passes at each level; one removal for each pass took minutes on a large part)."""
+        sweeps, points, segments, z = [], [], 0, None
+        for path in paths:
+            height, sweep, info = path_sweep(path, self.tool)
+            if z is not None and abs(height - z) > 1e-9:
+                raise ValueError("One cutting level requires paths at one height.")
+            z = height
+            sweeps.extend(sweep)
+            points.extend(info["points"])
+            segments += info["exact_segments"]
+        region = L.union(sweeps)
+        rows = []
+        removed = self.material.remove(region, z, z + self.tool.flute_length, collect=rows)
+        self.removed.append(rows)
+        level = self.sweeps_by_level.setdefault(z, ([], []))
+        level[0].extend(region)
+        level[1].extend(points)
+        self.snapshots.append(self.material.copy_material())
+        report = _report(method, segments)
+        report["removed_volume_mm3"] = removed
+        report["layer_count"] = len(self.material.layers)
+        report["path_count"] = len(paths)
+        return report
+
     def repeat(self):
         """A repeated path: no material change; keep the state of this pass."""
         self.snapshots.append(self.material.copy_material())
