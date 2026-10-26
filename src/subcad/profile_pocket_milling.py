@@ -290,7 +290,8 @@ PER_PASS_PATHS = 1000
 MAX_LEVEL_PATHS = 20000
 
 
-def _level_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, depth, target_region, normal, face_selector):
+def _level_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, depth, target_region, normal, sampled,
+                        face_selector):
     """The layer replay of a large path set: one removal and one state for each run of paths at one cutting level."""
     from .layers import face_paths
     from .material_ledger import MaterialLedger
@@ -310,7 +311,9 @@ def _level_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, de
         for path in group:
             aggregate.moves.extend(replace(move, position=plane.toWorldCoords(move.position).toTuple()) for move in path.moves)
         report.update(pass_index=index, pass_role=group[0].metadata["pass_role"], path_kind="level", level_mm=z,
-                      move_start_index=start, move_end_index=len(aggregate.moves), tool_axis=normal)
+                      move_start_index=start, move_end_index=len(aggregate.moves), tool_axis=normal,
+                      profile_fidelity=group[0].metadata.get("profile_fidelity", "linear_profile"),
+                      source_profile_sampled=sampled)
         reports.append(report)
     if sum(report["removed_volume_mm3"] for report in reports) <= 1e-8:
         raise ValueError("The pocket path does not remove material from the incoming stock.")
@@ -510,7 +513,7 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
         try:
             if len(paths) > PER_PASS_PATHS:
                 return _level_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, depth, target_region,
-                                            normal, face_selector)
+                                            normal, sampled, face_selector)
             return _layer_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, depth, target_region,
                                         normal, sampled, face_selector)
         except LayerCheckUnavailable:

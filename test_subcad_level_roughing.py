@@ -76,3 +76,16 @@ def test_a_kept_profile_stays_for_its_own_operation():
                       keep=[{"type": "rect", "length": 10, "width": 10, "cx": 20, "cy": 0}]).volume()
     # The 10 mm square, 15 mm from the step wall (a gap of 10 mm or less would close for the 10 mm cutter).
     assert full - kept == pytest.approx(10 * 10 * 20, rel=1e-2)
+
+
+def test_a_large_pocket_path_set_replays_by_level(monkeypatch):
+    from src.subcad import profile_pocket_milling
+    tools = [_mill(6, 20, 35, "EM6")]
+    profile = {"type": "rectangle", "length": 20, "width": 14}
+    with tool_inventory(tools, revision="levels", strict=True):
+        per_pass = Stock.rectangular(40, 30, 12).profile_pocket(profile, 4, finish_allowance=0)
+        monkeypatch.setattr(profile_pocket_milling, "PER_PASS_PATHS", 1)
+        by_level = Stock.rectangular(40, 30, 12).profile_pocket(profile, 4, finish_allowance=0)
+    passes = by_level.process_plan()["operations"][-1]["material_passes"]
+    assert all(row["path_kind"] == "level" for row in passes)
+    assert by_level._shape.val().Volume() == pytest.approx(per_pass._shape.val().Volume(), rel=1e-4)
