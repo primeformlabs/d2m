@@ -84,6 +84,40 @@ class LevelPlan:
     def volume(self) -> float:
         return sum(L.area(region) * (high - low) for low, high, region, _ in self.bands)
 
+    def band_reach(self, band, envelope_mm: float) -> float:
+        """The reach that a band needs (Rajesh, 2026-10-26): from the highest material inside the band region grown by
+        the holder radius and the clearance, down to the band floor. The bands above it are cut first (top down), so
+        their regions are gone; taller material farther away has no effect."""
+        low, high, region, _ = band
+        cache = self.__dict__.setdefault("_reach", {})
+        key = (round(low, 6), round(envelope_mm, 3))
+        if key in cache:
+            return cache[key]
+        envelope = _offset(region, envelope_mm)
+        top = high
+        layers = self.layers
+        for index in reversed(range(layers.count)):
+            z_low, z_high = layers.heights(index)
+            if z_high <= high + L.Z_MERGE_MM:
+                break
+            material = layers.stock[index]
+            cut = [path for other in self.bands if other[0] <= z_low + L.Z_MERGE_MM and other[1] >= z_high - L.Z_MERGE_MM
+                   for path in other[2]]
+            if cut:
+                material = L.difference(material, L.union(cut))
+            if material and L.area(L.intersection(material, envelope)) > MIN_WIDTH_MM ** 2:
+                top = z_high
+                break
+        cache[key] = top - low
+        return cache[key]
+
+    def reach_for(self, tool, depth: float | None = None) -> float:
+        """The reach that the tool needs for the bands down to ``depth`` below the setup face (default: all)."""
+        from .tool_selection import HOLDER_CLEARANCE_MM, holder_radius
+        envelope = holder_radius(tool) + HOLDER_CLEARANCE_MM
+        bands = [band for band in self.bands if depth is None or self.face - band[0] <= depth + 1e-6]
+        return max((self.band_reach(band, envelope) for band in bands), default=0.0)
+
 
 def keep_paths(profiles, face_selector: str):
     """The regions of the setup frame that the roughing leaves for their own operation (open pockets and slots):
@@ -235,7 +269,8 @@ def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=Non
     if tool is None or tool.tool_type != "flat_endmill":
         raise ValueError("Level roughing requires a selected flat end mill.")
     radius = finite(tool.diameter, "cutter diameter", positive=True) / 2
-    reach = min(finite(reach, "level roughing reach", positive=True), tool_reach(tool)) if reach else tool_reach(tool)
+    # ``reach``: the deepest level below the setup face; the tool reach is checked locally for each band below.
+    reach = finite(reach, "level roughing reach", positive=True) if reach else tool_reach(tool)
     maximum = finite((tool.safe_limits or {}).get("max_stepdown_mm", tool.flute_length), "maximum stepdown", positive=True)
     stepdown = min(finite(stepdown, "level roughing stepdown", positive=True) if stepdown else maximum,
                    maximum, tool.flute_length)
@@ -246,6 +281,10 @@ def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=Non
     bounds = local.val().BoundingBox()
     plan = level_plan(shape.val(), part_shape, face_selector, radius=radius, reach=reach, keep=keep, layers=layers,
                       previous=previous)
+    from .tool_selection import HOLDER_CLEARANCE_MM, holder_radius
+    envelope = holder_radius(tool) + HOLDER_CLEARANCE_MM
+    # A band whose local reach is more than the tool reach stays for another cutter.
+    plan.bands = [band for band in plan.bands if plan.band_reach(band, envelope) <= tool_reach(tool) + 1e-6]
     safe = bounds.zmax + max(2, radius)
     paths = level_paths(plan, tool, stepdown=stepdown, stepover=stepover, feed=feed, rpm=rpm, safe=safe)
     normal = list(plane.zDir.toTuple())
@@ -261,7 +300,7 @@ def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=Non
         state = {"shape": shape, "pass_index": 0, "pass_role": "roughing", "label": "No level roughing needed",
                  "geometry_replay": {"no_work": True}}
         return shape, aggregate, [state], [], plan
-    validate_cutter(tool, cutting_depth=plan.deepest(), cut_length=stepdown)
+    validate_cutter(tool, cutting_depth=plan.reach_for(tool), cut_length=stepdown)
     try:
         replay = LayerReplay(local, bounds.zmax, [path.moves[1].position[2] for path in paths], tool,
                              ledger=MaterialLedger.of(shape), plane=plane, layer_brep=MaterialLedger.layer_brep(shape))
@@ -324,6 +363,8 @@ class LevelRoughOp(MachiningOperation):
     """The setup layers of the material before the first roughing cutter (shared by the rest cutters)."""
     previous: tuple = field(default=(), repr=False)
     """The plans of the larger cutters before this one (rest roughing)."""
+    reach_depth: Optional[float] = None
+    """The local reach that the selected tool needs (``LevelPlan.reach_for``); None: the tool reach."""
     reach: float = 0.0
     """The deepest level below the setup face that this operation roughs (mm)."""
     stepdown: Optional[float] = None
@@ -334,9 +375,10 @@ class LevelRoughOp(MachiningOperation):
         if self.tool is None:
             raise ValueError("Level roughing requires a selected flat end mill (Stock.rough_levels selects it).")
         self.feeds_speeds = get_feeds_speeds(_resolve_fs_tool_type(self.tool.tool_type), self.tool.diameter, self.material)
-        # The inventory check of Stock._apply_op: the depth needs the reach, one stepdown needs the flutes.
-        self.depth = self.reach
-        self.start_depth = max(self.reach - min(self.stepdown or self.tool.flute_length, self.tool.flute_length), 0.0)
+        # The inventory check of Stock._apply_op: the local reach needs the tool reach, one stepdown needs the flutes.
+        from .tool_selection import tool_reach
+        self.depth = self.reach_depth if self.reach_depth is not None else min(self.reach or tool_reach(self.tool), tool_reach(self.tool))
+        self.start_depth = max(self.depth - min(self.stepdown or self.tool.flute_length, self.tool.flute_length), 0.0)
 
     def apply(self, shape):
         result, self._level_toolpath, self._material_pass_states, self._pass_reports, plan = run_level_roughing(
@@ -392,12 +434,14 @@ def select_roughing_tool(shape, part_shape, face_selector: str, *, max_depth: Op
     for depth in depths:
         try:
             selection = select_tool(ToolRequirement("flat_endmill", min_reach_mm=depth, prefer_largest=True,
+                                                    local_reach=lambda tool, depth=depth: probe.reach_for(tool, depth),
                                                     feature="level_rough",
                                                     reason="the end mill must reach the deepest level with waste above it"))
         except ValueError:
             # A caller selection policy that refuses every candidate (a reach it does not trust): a higher level.
             continue
         if selection.ok:
+            selection.probe = probe
             return selection.selected_tool, selection, depth
         last = selection
     if last is None:

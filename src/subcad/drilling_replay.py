@@ -45,7 +45,8 @@ def axial_sweep(tool, start, end):
 
 
 def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z",
-                 through=False, spot=False, peck_step=None, feed=100, rpm=None, ream=False, start_depth=0.0):
+                 through=False, spot=False, peck_step=None, feed=100, rpm=None, ream=False, start_depth=0.0,
+                 reach_depth=None):
     """Blind depth is the full-diameter depth; spot depth is the tip depth. Both are measured from the setup face.
 
     ``start_depth``: where the material of the hole starts below the setup face (``feature_depth``). The tool
@@ -90,7 +91,9 @@ def run_drilling(shape, *, tool, diameter, depth, cx=0, cy=0, face_selector=">Z"
     finite(tool.stickout_mm, "drill projection", positive=True)
     finite(tool.reach_mm or tool.flute_length, "drill reach", positive=True)
     flute = finite(tool.flute_length, "drill flute length", positive=True)
-    if travel - start_depth > flute + 1e-8 or travel > tool_reach(tool) + 1e-8:
+    # ``reach_depth``: the full-diameter depth below the highest material near the hole (feature_depth.LocalReach).
+    reach = (full_depth if reach_depth is None else min(finite(reach_depth, "drill reach depth"), full_depth)) + travel - full_depth
+    if travel - start_depth > flute + 1e-8 or reach > tool_reach(tool) + 1e-8:
         raise ValueError("The selected reamer cannot reach the required lead depth. Include its lead length in the reach check." if ream
             else "The selected drill cannot reach the required tip depth. Include its point length in the reach check.")
     cut = travel - start_depth
@@ -176,7 +179,8 @@ def apply_drilling(operation, shape, *, spot=False, peck_step=None):
         depth=operation.depth, cx=operation.cx, cy=operation.cy, face_selector=operation.face_selector,
         through=not spot and operation.through, spot=spot, peck_step=peck_step,
         feed=_feed_rate(operation.feeds_speeds), rpm=_spindle_rpm(operation.feeds_speeds),
-        start_depth=0.0 if spot else getattr(operation, "start_depth", 0.0))
+        start_depth=0.0 if spot else getattr(operation, "start_depth", 0.0),
+        reach_depth=None if spot else getattr(operation, "reach_depth", None))
     operation._drill_toolpath.metadata.update(tool=_tool_dict(operation.tool),
         tool_selection=_tool_selection_dict(operation.tool_selection))
     if not spot and operation.through:

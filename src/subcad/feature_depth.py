@@ -56,3 +56,34 @@ def feature_depths(shape, face_selector: str, *, cx: float, cy: float, radius: f
     if through:
         return entry, far
     return (entry if entry < depth - 1e-6 else 0.0), depth
+
+
+class LocalReach:
+    """The reach that a tool needs for a round feature (Rajesh, 2026-10-26): from the highest material inside the
+    region that the tool and its holder take above the feature (the cutter path grown by the holder radius and the
+    clearance), down to the deepest cut. Taller material farther away has no effect. The material is the incoming
+    material of the operation (after level roughing). ``path``: "axial" (drill, reamer: the path is the axis) or
+    "circle" (circular milling: the path is the hole circle less the cutter radius)."""
+
+    def __init__(self, shape, face_selector: str, *, cx: float, cy: float, hole_radius: float, depth: float,
+                 entry: float, path: str = "axial"):
+        self.shape, self.face, self.cx, self.cy = shape, face_selector, cx, cy
+        self.hole_radius, self.depth, self.entry, self.path = hole_radius, depth, entry, path
+        self._tops: dict[float, float] = {}
+
+    def envelope_radius(self, tool) -> float:
+        from .tool_selection import HOLDER_CLEARANCE_MM, holder_radius
+        if self.path == "circle":
+            return max(self.hole_radius - tool.diameter / 2, 0.0) + holder_radius(tool) + HOLDER_CLEARANCE_MM
+        return max(self.hole_radius, holder_radius(tool)) + HOLDER_CLEARANCE_MM
+
+    def top(self, radius: float) -> float:
+        """The depth below the setup face of the highest material within the radius (at most the feature entry)."""
+        key = round(radius, 3)
+        if key not in self._tops:
+            span = material_span(self.shape, self.face, cx=self.cx, cy=self.cy, radius=radius)
+            self._tops[key] = min(span[0], self.entry) if span else self.entry
+        return self._tops[key]
+
+    def __call__(self, tool) -> float:
+        return max(self.depth - self.top(self.envelope_radius(tool)), 0.0)

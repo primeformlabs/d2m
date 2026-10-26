@@ -1,6 +1,6 @@
 # Feature depth and tool reach
 
-Version 0.2.28. Module `src/subcad/feature_depth.py`, rule `tool_selection.tool_reach`.
+Version 0.2.28; local reach 0.2.29. Module `src/subcad/feature_depth.py`, rule `tool_selection.tool_reach`.
 
 ## Two numbers for each cutter
 
@@ -43,3 +43,24 @@ If the Boolean of the probe fails (a ledger layer solid can refuse it), the feat
 A block 30 mm high has a step: one half is 20 mm lower. A through hole in the low half has its material from 20 mm to
 30 mm below the setup face. Its drill needs 10 mm of flute (plus the point) and 30 mm of reach (plus the point). The
 old rule needed 30 mm of flute (`test_subcad_feature_depth.py`).
+
+## Local reach (0.2.29, Rajesh 2026-10-26)
+
+The reach is not measured from the setup face (the top-most point of the part or the stock). That point can be far
+from the feature and does not limit the tool there. The reach that a tool needs is measured locally:
+
+    reach = deepest cut depth − depth of the highest material inside the envelope
+
+The envelope is the region that the tool and its holder take above the feature: the cutter path grown by the holder
+radius and `HOLDER_CLEARANCE_MM` (2 mm). The holder is `physical_assembly.holder_diameter_mm`, else the holder that D2O
+assumes (`ASSUMED_HOLDER_DIAMETER_MM`, 50 mm), never smaller than the cutter. The material is the incoming material of
+the operation (after level roughing). Taller material farther away has no effect.
+
+- Drill and reamer: the envelope is a circle round the hole axis (`feature_depth.LocalReach`, path "axial").
+- Circular milling: the hole circle less the cutter radius, grown by the holder radius (path "circle").
+- Level roughing: each band region grown by the holder radius; the bands above it are already cut
+  (`LevelPlan.band_reach`). A band that the tool does not reach locally stays for another cutter.
+
+`ToolRequirement.local_reach(tool)` gives the reach for each candidate (its holder sets the envelope); `select_tool`,
+the inventory check (`reach_depth`) and the replay checks use it. `min_reach_mm` stays the depth from the setup face
+for the records.
