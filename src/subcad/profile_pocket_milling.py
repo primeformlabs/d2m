@@ -284,6 +284,56 @@ def _no_rest_pass(shape, plane, face_selector, tool, feed, rpm, bounds):
     return shape, aggregate, [state], [], comparison
 
 
+# Above this many paths the layer replay removes the material of each cutting level at once (one state for each level):
+# the outside profile of a large part has thousands of raster pieces. Up to it, each pass keeps its own state.
+PER_PASS_PATHS = 1000
+MAX_LEVEL_PATHS = 20000
+
+
+def _level_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, depth, target_region, normal, face_selector):
+    """The layer replay of a large path set: one removal and one state for each run of paths at one cutting level."""
+    from .layers import face_paths
+    from .material_ledger import MaterialLedger
+    replay = LayerReplay(local, bounds.zmax, [path.moves[1].position[2] for path in paths], tool,
+                         ledger=MaterialLedger.of(shape), plane=plane, layer_brep=MaterialLedger.layer_brep(shape))
+    groups = []
+    for path in paths:
+        z = round(path.moves[1].position[2], 9)
+        if groups and groups[-1][0] == z and groups[-1][1][0].metadata["pass_role"] == path.metadata["pass_role"]:
+            groups[-1][1].append(path)
+        else:
+            groups.append((z, [path]))
+    reports = []
+    for index, (z, group) in enumerate(groups, 1):
+        report = replay.cut_level(group, "selected_cutter_level_sweeps")
+        start = len(aggregate.moves)
+        for path in group:
+            aggregate.moves.extend(replace(move, position=plane.toWorldCoords(move.position).toTuple()) for move in path.moves)
+        report.update(pass_index=index, pass_role=group[0].metadata["pass_role"], path_kind="level", level_mm=z,
+                      move_start_index=start, move_end_index=len(aggregate.moves), tool_axis=normal)
+        reports.append(report)
+    if sum(report["removed_volume_mm3"] for report in reports) <= 1e-8:
+        raise ValueError("The pocket path does not remove material from the incoming stock.")
+    result = local.newObject([replay.result_shape()])
+    result, cleaned = (result, False) if replay.brep_source == "layer_prisms" else clean_flat_result(result)
+    final = result.val()
+    from .layer_player import plane_frame
+    frame = plane_frame(face_selector, plane)
+    states = []
+    for index, (z, group) in enumerate(groups):
+        local_state, layers = replay.state(final, index, frame)
+        world = None if local_state is None else shape.newObject([local_state.transformShape(plane.rG)])
+        states.append({"shape": world, "pass_index": index + 1, "pass_role": group[0].metadata["pass_role"],
+                       "label": f"After profile pocket {group[0].metadata['pass_role']} level {index + 1}",
+                       "geometry_replay": reports[index], "player_layers": layers})
+    reports[-1]["topology_cleaned"] = cleaned
+    reports[-1]["material_brep"] = replay.brep_source
+    replay.attach_ledger(states[-1]["shape"])
+    comparison = replay.comparison(face_paths(target_region), bounds.zmax - depth, bounds.zmax)
+    aggregate.metadata.update(material_passes=reports, operation_target_comparison=comparison, level_replay=True)
+    return states[-1]["shape"], aggregate, states, reports, comparison
+
+
 def _layer_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, depth, target_region, normal, sampled,
                         face_selector=">Z"):
     """The pass replay and the operation region check on 2.5D layers (``milling_layers.py``).
@@ -431,7 +481,7 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
             role="roughing", allowance=allowance, chord=chord))
     paths.extend(_clearing_paths(center, outer, keep, z=bounds.zmax - depth, safe=safe, tool=tool, feed=feed, rpm=rpm,
         role="finishing", allowance=0, chord=chord))
-    if not paths or len(paths) > 1000:
+    if not paths or len(paths) > (MAX_LEVEL_PATHS if layers else PER_PASS_PATHS):
         raise ValueError("The pocket has no complete path within the retained pass limit. Divide the operation into smaller regions.")
     normal = list(plane.zDir.toTuple())
     aggregate = Toolpath("profile_cutout" if outside else "profile_pocket", safe_z=safe,
@@ -458,10 +508,15 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
         return world, aggregate, [state], [], comparison
     if layers:
         try:
+            if len(paths) > PER_PASS_PATHS:
+                return _level_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, depth, target_region,
+                                            normal, face_selector)
             return _layer_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, depth, target_region,
                                         normal, sampled, face_selector)
         except LayerCheckUnavailable:
             aggregate.moves.clear()  # The B-Rep replay below remains for material that the layers cannot represent.
+    if len(paths) > PER_PASS_PATHS:
+        raise ValueError("The pocket has no complete path within the retained pass limit. Divide the operation into smaller regions.")
     result, states, reports = local, [], []
     completed_paths = {}
     current_volume = local.val().Volume()

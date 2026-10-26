@@ -66,6 +66,9 @@ class LayerReplay:
         self._after = None
         # The source of the B-Rep result: the chained Boolean, or the ledger when that Boolean fails.
         self.brep_source = None
+        # Outline cleaning of the B-Rep prisms (mm), with no exact arcs: an operation whose checks use only the layers
+        # (level roughing of a large part) needs no Boolean of thousands of arc edges. None: exact arcs first.
+        self.prism_clean_mm = None
         try:
             if ledger is not None:
                 from .material_ledger import plane_frame
@@ -161,8 +164,13 @@ class LayerReplay:
             return self.local.val()
         incoming = self.local.val().Volume()
         expected = incoming - self.material_removed()
+        if self.prism_clean_mm:
+            import pyclipper
+            levels = [(z, [path for path in pyclipper.CleanPolygons(added, self.prism_clean_mm * L.SCALE) if len(path) >= 3], arcs)
+                      for z, added, arcs in levels]
         # Exact cutter arcs first; plain polygon prisms (chords within the arc tolerance) if the arcs fail.
-        for exact in (() if self.layer_brep else (True, False)):
+        attempts = (False,) if self.prism_clean_mm else (True, False)
+        for exact in (() if self.layer_brep else attempts):
             result = self.local.val()
             try:
                 for z, added, arcs in levels:

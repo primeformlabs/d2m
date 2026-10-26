@@ -40,6 +40,8 @@ MAX_ROUGHING_TOOLS = 3
 # radius gets the tolerance added, so the chords never bring the cutter nearer to the part.
 ROUGH_ARC_MM = 0.005
 ROUGH_CLEAN_MM = 0.002
+# Outline cleaning of the roughing prisms of the B-Rep result (mm): one Boolean of a few hundred edges, not thousands.
+BREP_CLEAN_MM = 0.01
 
 
 def filled(paths):
@@ -98,17 +100,24 @@ def keep_paths(profiles, face_selector: str):
     return L.union(paths) if paths else []
 
 
+def roughing_layers(stock_shape, part_shape, face_selector: str, *, reach: float, divide: bool = True):
+    """The setup layers of the incoming material and the part (``milling_opening.setup_layers``), down to the reach."""
+    stock_mesh, part_mesh = L.SolidMesh.of(stock_shape), L.SolidMesh.of(part_shape)
+    return setup_layers(stock_mesh, part_mesh, Setup.of(face_selector), reach_depths=[reach],
+                        divide_depth=reach if divide else 0.0)
+
+
 def level_plan(stock_shape, part_shape, face_selector: str, *, radius: float, reach: float, keep=(),
-               divide: bool = True) -> LevelPlan:
+               divide: bool = True, layers=None, previous=()) -> LevelPlan:
     """The bands that a flat cutter of the radius roughs from the setup face down to the reach.
 
     ``stock_shape`` and ``part_shape``: CadQuery shapes in the part frame (the incoming material and the finished part).
     ``keep``: profiles that the roughing leaves for their own operations (``keep_paths``); they count as part.
     ``divide``: divide the layers that sloped or curved faces cross (the exact shadow); False is a quick probe of the
-    planar levels only."""
-    setup = Setup.of(face_selector)
-    stock_mesh, part_mesh = L.SolidMesh.of(stock_shape), L.SolidMesh.of(part_shape)
-    layers = setup_layers(stock_mesh, part_mesh, setup, reach_depths=[reach], divide_depth=reach if divide else 0.0)
+    planar levels only. ``layers``: the layers of an earlier plan of the same material (no new mesh and sections).
+    ``previous``: the plans of the larger cutters of a rest roughing; each band leaves what they cut over its heights."""
+    if layers is None:
+        layers = roughing_layers(stock_shape, part_shape, face_selector, reach=reach, divide=divide)
     # All part sections, also those below the reach (the shadow skips them).
     silhouette = filled(L.union([path for section in layers.part for path in section])) if layers.count else []
     kept = keep_paths(keep, face_selector)
@@ -122,6 +131,10 @@ def level_plan(stock_shape, part_shape, face_selector: str, *, radius: float, re
         index = layers.layer_at(low + L.Z_MERGE_MM * 10)
         shadow = filled(L.union(layers.shadow[index], kept) if kept else layers.shadow[index])
         region = L.difference(L.intersection(layers.stock[index], silhouette), closing(shadow, radius))
+        cut = [path for plan in previous for p_low, p_high, p_region, _ in plan.bands
+               if p_low <= low + L.Z_MERGE_MM and p_high >= high - L.Z_MERGE_MM for path in p_region]
+        if cut and region:
+            region = L.difference(region, L.union(cut))
         region = L.opened(region, MIN_WIDTH_MM)
         if region and L.area(region) > MIN_WIDTH_MM ** 2:
             bands.append((low, high, region, shadow))
@@ -208,7 +221,7 @@ def level_paths(plan: LevelPlan, tool, *, stepdown: float, stepover: float, feed
 
 
 def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=None, stepdown=None, feed=100, rpm=None,
-                       keep=()):
+                       keep=(), layers=None, previous=()):
     """Rough the waste above each planar level of the setup. Return (result, toolpath, states, reports, plan).
 
     ``reach``: the deepest level below the setup face (default: the reach of the tool)."""
@@ -231,7 +244,8 @@ def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=Non
     plane, mirror = _setup_plane(face_selector)
     local = cq.Workplane("XY").newObject([plane.toLocalCoords(shape.val())])
     bounds = local.val().BoundingBox()
-    plan = level_plan(shape.val(), part_shape, face_selector, radius=radius, reach=reach, keep=keep)
+    plan = level_plan(shape.val(), part_shape, face_selector, radius=radius, reach=reach, keep=keep, layers=layers,
+                      previous=previous)
     safe = bounds.zmax + max(2, radius)
     paths = level_paths(plan, tool, stepdown=stepdown, stepover=stepover, feed=feed, rpm=rpm, safe=safe)
     normal = list(plane.zDir.toTuple())
@@ -253,6 +267,8 @@ def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=Non
                              ledger=MaterialLedger.of(shape), plane=plane, layer_brep=MaterialLedger.layer_brep(shape))
     except LayerCheckUnavailable as error:
         raise ValueError(f"Level roughing needs the layer model of the material: {error}") from error
+    # The checks use the layers; the B-Rep result is for the display and the next B-Rep operations.
+    replay.prism_clean_mm = BREP_CLEAN_MM
     # One pass for each cutting level (top down): its raster lines and outlines are one layer removal.
     levels: dict[float, list] = {}
     for path in paths:
@@ -304,6 +320,10 @@ class LevelRoughOp(MachiningOperation):
     part_shape: Any = field(default=None, repr=False)
     keep: tuple = ()
     """Profiles that the roughing leaves for their own operations (open pockets and slots)."""
+    layers: Any = field(default=None, repr=False)
+    """The setup layers of the material before the first roughing cutter (shared by the rest cutters)."""
+    previous: tuple = field(default=(), repr=False)
+    """The plans of the larger cutters before this one (rest roughing)."""
     reach: float = 0.0
     """The deepest level below the setup face that this operation roughs (mm)."""
     stepdown: Optional[float] = None
@@ -322,7 +342,8 @@ class LevelRoughOp(MachiningOperation):
         result, self._level_toolpath, self._material_pass_states, self._pass_reports, plan = run_level_roughing(
             shape, self.part_shape, tool=self.tool, face_selector=self.face_selector, reach=self.reach or None,
             stepdown=self.stepdown, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds),
-            keep=self.keep)
+            keep=self.keep, layers=self.layers, previous=self.previous)
+        self._plan = plan
         self._bands = [{"z_low_mm": round(low, 6), "z_high_mm": round(high, 6), "area_mm2": round(L.area(region), 3)}
                        for low, high, region, _ in plan.bands]
         self._level_toolpath.metadata.update(tool=_tool_dict(self.tool), tool_selection=_tool_selection_dict(self.tool_selection))

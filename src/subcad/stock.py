@@ -183,12 +183,16 @@ class Stock:
             tool, selection, reach = select_roughing_tool(self._shape, part_shape, face, max_depth=max_depth, keep=keep)
             if tool is None:
                 return self
+        from .level_roughing import roughing_layers
+        # One mesh and one set of sections for every cutter of this roughing.
+        layers = roughing_layers(self._shape.val(), part_shape, face, reach=reach or tool.flute_length)
         op = LevelRoughOp(part_shape=part_shape, keep=tuple(keep or ()), reach=reach, stepdown=stepdown, tool=tool,
-                          tool_selection=selection,
+                          tool_selection=selection, layers=layers,
                           face_selector=face, material=self._material)
         result = self._apply_op(op)
         if selection is None:
             return result
+        plans = [op._plan]
         # Rest roughing: smaller end mills that reach the same depth cut what the larger one cannot enter (narrow
         # waste between part walls), each on the material that the one before left.
         from .level_roughing import MAX_ROUGHING_TOOLS
@@ -204,10 +208,12 @@ class Stock:
                 break
             tool = smaller.selected_tool
             rest = LevelRoughOp(part_shape=part_shape, keep=tuple(keep or ()), reach=reach, stepdown=stepdown, tool=tool,
-                                tool_selection=smaller, face_selector=face, material=self._material)
+                                tool_selection=smaller, layers=layers, previous=tuple(plans),
+                                face_selector=face, material=self._material)
             following = result._apply_op(rest)
             if not getattr(rest, "_pass_reports", None):
                 break  # no material left for this cutter: the operation recorded no work
+            plans.append(rest._plan)
             result = following
         return result
 
