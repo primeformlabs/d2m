@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 import math
-from typing import Optional
+from typing import Callable, Optional
 
 from .tool_library import ToolCatalog, ToolSpec
 
@@ -51,6 +51,23 @@ class ToolUnavailableError(ValueError):
         super().__init__("; ".join(result.errors))
 
 
+# The holder above the cutter: a tool with no recorded holder takes the holder that D2O assumes
+# (milling_holding_solids.TOOL_DEFAULTS), never smaller than the cutter. The clearance keeps the holder off the material.
+ASSUMED_HOLDER_DIAMETER_MM = 50.0
+HOLDER_CLEARANCE_MM = 2.0
+
+
+def holder_radius(tool: ToolSpec) -> float:
+    """The radius of the tool holder (``physical_assembly.holder_diameter_mm``, else the assumed holder)."""
+    try:
+        recorded = float((tool.physical_assembly or {}).get("holder_diameter_mm") or 0.0)
+    except (TypeError, ValueError):
+        recorded = 0.0
+    if not math.isfinite(recorded) or recorded <= 0:
+        recorded = ASSUMED_HOLDER_DIAMETER_MM
+    return max(recorded, tool.diameter, tool.shank_diameter or 0.0) / 2
+
+
 def tool_reach(tool: ToolSpec) -> float:
     """How deep the tool tip goes below the setup face: the projection from the holder, or a shorter recorded
     reach (a tool with no recorded reach reaches its flute length)."""
@@ -84,6 +101,9 @@ class ToolRequirement:
     """The material height that the flutes cut in one pass."""
     min_reach_mm: Optional[float] = None
     """From the setup face to the deepest cut (``tool_reach``); None: the flute length (the cut starts at the face)."""
+    local_reach: Optional[Callable[[ToolSpec], float]] = field(default=None, repr=False, compare=False)
+    """The reach that one candidate tool needs: from the highest material in the region that the tool and its holder
+    take above the feature, down to the deepest cut (``feature_depth.LocalReach``). None: ``min_reach_mm``."""
     feature: str = ""
     reason: str = ""
     prefer_largest: bool = False
@@ -94,6 +114,10 @@ class ToolRequirement:
     @property
     def reach_mm(self) -> float:
         return self.min_flute_length_mm if self.min_reach_mm is None else self.min_reach_mm
+
+    def reach_for(self, tool: ToolSpec) -> float:
+        """The reach that this tool needs (its holder sets the region above the feature)."""
+        return float(self.local_reach(tool)) if self.local_reach is not None else self.reach_mm
 
     def to_dict(self) -> dict:
         return {
@@ -170,7 +194,8 @@ def select_tool(requirement: ToolRequirement) -> ToolSelectionResult:
             reasons.append("diameter_too_large")
         if requirement.min_flute_length_mm and tool.flute_length < requirement.min_flute_length_mm:
             reasons.append("flute_length_too_short")
-        if requirement.reach_mm and scope and scope.strict and tool_reach(tool) < requirement.reach_mm:
+        needed_reach = requirement.reach_for(tool) if tool.tool_type in allowed_types else requirement.reach_mm
+        if needed_reach and scope and scope.strict and tool_reach(tool) < needed_reach - 1e-9:
             reasons.append("reach_too_short")
         if requirement.require_point_geometry and tool.tool_type in allowed_types:
             try:
@@ -178,7 +203,7 @@ def select_tool(requirement: ToolRequirement) -> ToolSelectionResult:
                 _, _, point = point_geometry(tool)
                 extra = point if requirement.include_point_length_in_reach else 0
                 if (requirement.min_flute_length_mm + extra > tool.flute_length
-                        or requirement.reach_mm + extra > tool_reach(tool)):
+                        or needed_reach + extra > tool_reach(tool) + 1e-9):
                     reasons.append("point_depth_exceeds_reach")
             except (ValueError, TypeError):
                 reasons.append("missing_or_invalid_point_geometry")

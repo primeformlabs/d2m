@@ -186,8 +186,10 @@ class Stock:
         from .level_roughing import roughing_layers
         # One mesh and one set of sections for every cutter of this roughing.
         layers = roughing_layers(self._shape.val(), part_shape, face, reach=reach or tool.flute_length)
+        probe = getattr(selection, "probe", None)
         op = LevelRoughOp(part_shape=part_shape, keep=tuple(keep or ()), reach=reach, stepdown=stepdown, tool=tool,
                           tool_selection=selection, layers=layers,
+                          reach_depth=probe.reach_for(tool, reach) if probe is not None else None,
                           face_selector=face, material=self._material)
         result = self._apply_op(op)
         if selection is None:
@@ -201,6 +203,8 @@ class Stock:
             try:
                 smaller = select_tool(ToolRequirement("flat_endmill", max_diameter_mm=tool.diameter - 0.01,
                                                       min_reach_mm=reach, prefer_largest=True, feature="level_rough_rest",
+                                                      local_reach=lambda candidate: probe.reach_for(candidate, reach)
+                                                      if probe is not None else reach,
                                                       reason="a smaller end mill for the waste that the larger one cannot enter"))
             except ValueError:
                 break
@@ -209,6 +213,7 @@ class Stock:
             tool = smaller.selected_tool
             rest = LevelRoughOp(part_shape=part_shape, keep=tuple(keep or ()), reach=reach, stepdown=stepdown, tool=tool,
                                 tool_selection=smaller, layers=layers, previous=tuple(plans),
+                                reach_depth=probe.reach_for(tool, reach) if probe is not None else None,
                                 face_selector=face, material=self._material)
             following = result._apply_op(rest)
             if not getattr(rest, "_pass_reports", None):
@@ -216,6 +221,15 @@ class Stock:
             plans.append(rest._plan)
             result = following
         return result
+
+    def _local_reach(self, face_selector: str, cx: float, cy: float, radius: float, depth: float, start_depth: float,
+                     path: str = "axial"):
+        """The local reach of a round feature (``feature_depth.LocalReach``); None without native geometry."""
+        if not _HAS_CADQUERY or radius <= 0:
+            return None
+        from .feature_depth import LocalReach
+        return LocalReach(self._shape, face_selector, cx=cx, cy=cy, hole_radius=radius, depth=depth,
+                          entry=start_depth, path=path)
 
     def _feature_depths(self, face_selector: str, cx: float, cy: float, radius: float, depth: float,
                         through: bool) -> tuple[float, float]:
@@ -234,7 +248,12 @@ class Stock:
             op.sequence_number = prepared._next_op_number
             return prepared._apply_op(op)
         depth = getattr(op, "depth", 0.0)
-        validate_inventory_tool(getattr(op, "tool", None), depth=depth, cut_length=depth - getattr(op, "start_depth", 0.0))
+        local = getattr(op, "local_reach", None)
+        tool = getattr(op, "tool", None)
+        # The reach of the tool from the highest material near the feature (feature_depth.LocalReach).
+        op.reach_depth = local(tool) if local is not None and tool is not None else getattr(op, "reach_depth", None)
+        validate_inventory_tool(tool, depth=depth if op.reach_depth is None else op.reach_depth,
+                                cut_length=depth - getattr(op, "start_depth", 0.0))
         if getattr(op, "sequence_number", 0) == 0:
             op.sequence_number = self._next_op_number
 
@@ -1034,6 +1053,8 @@ class Stock:
             spot_drill=False,
             peck=peck,
             start_depth=start_depth,
+            local_reach=self._local_reach(setup.face_selector if setup else face_selector, cx, cy, diameter / 2,
+                                          depth, start_depth),
             face_selector=face_selector,
             tool=tool,
             material=self._material,
@@ -1510,6 +1531,8 @@ class Stock:
             depth=depth,
             through=through,
             start_depth=start_depth,
+            local_reach=self._local_reach(setup.face_selector if setup else face_selector, cx, cy, diameter / 2,
+                                          depth, start_depth),
             face_selector=face_selector,
             tool=tool,
             material=self._material,
@@ -1552,6 +1575,8 @@ class Stock:
             depth=depth,
             through=through,
             start_depth=start_depth,
+            local_reach=self._local_reach(setup.face_selector if setup else face_selector, cx, cy, diameter / 2,
+                                          depth, start_depth, path="circle"),
             face_selector=face_selector,
             stepdown=stepdown,
             finish_allowance=finish_allowance,

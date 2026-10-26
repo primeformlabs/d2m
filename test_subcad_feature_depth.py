@@ -84,3 +84,19 @@ def test_a_bore_under_a_step_starts_at_its_material():
     assert operation["start_depth_mm"] == pytest.approx(20, abs=1e-6)
     removed = stepped._shape.val().Volume() - bored._shape.val().Volume()
     assert removed == pytest.approx(3.14159265 * 64 * 10, rel=5e-3)
+
+
+def test_the_reach_is_measured_from_the_highest_material_near_the_hole():
+    """Rajesh (2026-10-26): the reach starts at the highest material inside the region of the tool and its holder, not
+    at the setup face. A 200 mm block whose +X 180 mm are 20 mm lower: a hole at x = 80 has no tall material within the
+    holder (50 mm assumed) and the clearance, so a drill with 18 mm of projection drills its 10 mm section."""
+    with tool_inventory([_mill(10, 25, 40, "EM10")], revision="local", strict=True):
+        stepped = Stock.rectangular(200, 40, 30).profile_pocket(
+            {"type": "rectangle", "length": 190, "width": 60, "cx": 15, "cy": 0}, 20, finish_allowance=0)
+    short = _drill(6, 14, 18, "D6S")
+    with tool_inventory([short], revision="local", strict=True):
+        drilled = stepped.drill(6, through=True, cx=80, cy=0, spot_drill=False)
+    assert drilled.process_plan()["operations"][-1]["start_depth_mm"] == pytest.approx(20, abs=1e-3)
+    # Near the tall material the same drill does not reach: the holder region holds the 30 mm block end.
+    with tool_inventory([short], revision="local", strict=True), pytest.raises(ToolUnavailableError):
+        stepped.drill(6, through=True, cx=-70, cy=0, spot_drill=False)

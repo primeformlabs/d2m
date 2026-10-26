@@ -398,7 +398,8 @@ def _layer_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, de
 
 def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=False,
                        face_selector=">Z", stepdown=1, finish_allowance=0.1, chord_error=0.01,
-                       feed=100, rpm=None, outside=False, rest_from_diameter=None, layers=True, start_depth=0.0):
+                       feed=100, rpm=None, outside=False, rest_from_diameter=None, layers=True, start_depth=0.0,
+                       reach_depth=None):
     """Return material, actual toolpath, retained pass states and target comparison.
 
     ``rest_from_diameter``: rest machining. The passes cut only near the material that a previous flat end mill
@@ -425,7 +426,8 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
     if depth > bounds.zlen + 1e-8:
         raise ValueError("The pocket depth exceeds the incoming material thickness along its cutter axis.")
     start = min(max(finite(start_depth, "profile pocket start depth"), 0.0), depth)
-    validate_cutter(tool, cutting_depth=depth, cut_length=depth - start)
+    # ``reach_depth``: the depth below the highest material near the cut (feature_depth.LocalReach).
+    validate_cutter(tool, cutting_depth=depth if reach_depth is None else min(reach_depth, depth), cut_length=depth - start)
     outer, sampled = _profile_wire(profile)
     keep = []
     for item in islands or []:

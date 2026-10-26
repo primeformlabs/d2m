@@ -66,7 +66,8 @@ def apply_reaming(operation, shape):
     result, operation._ream_toolpath, operation._material_pass_states, operation._pass_reports = run_drilling(
         shape, tool=operation.tool, diameter=operation.diameter, depth=operation.depth,
         cx=operation.cx, cy=operation.cy, face_selector=operation.face_selector, through=operation.through,
-        feed=_feed_rate(operation.feeds_speeds), rpm=_spindle_rpm(operation.feeds_speeds), ream=True)
+        feed=_feed_rate(operation.feeds_speeds), rpm=_spindle_rpm(operation.feeds_speeds), ream=True,
+        reach_depth=getattr(operation, "reach_depth", None))
     operation.depth = operation._ream_toolpath.metadata["full_diameter_depth_mm"]
     operation._ream_toolpath.metadata.update(tool=_tool_dict(operation.tool),
         tool_selection=_tool_selection_dict(operation.tool_selection), pilot_clearance="native_brep_checked")
@@ -94,7 +95,7 @@ def apply_circular_milling(operation, shape):
         face_selector=operation.face_selector, stepdown=operation.stepdown,
         finish_allowance=operation.finish_allowance, chord_error=operation.chord_error,
         feed=_feed_rate(operation.feeds_speeds), rpm=_spindle_rpm(operation.feeds_speeds),
-        start_depth=getattr(operation, "start_depth", 0.0))
+        start_depth=getattr(operation, "start_depth", 0.0), reach_depth=getattr(operation, "reach_depth", None))
     operation._bore_toolpath.operation = "bore"
     operation._bore_toolpath.metadata.update(tool=_tool_dict(operation.tool),
         tool_selection=_tool_selection_dict(operation.tool_selection), hole_diameter_mm=diameter,

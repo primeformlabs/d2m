@@ -39,6 +39,9 @@ Each layer operation and each drill plunge adds its cuts. The layers of the next
 ledger, not from the B-Rep result of the operation before. If the B-Rep Boolean of an operation fails, the
 operation keeps its layer result and its B-Rep comes from the ledger layers (`docs/MILLING_LAYER_REPLAY.md`).
 
+Version 0.2.29 measures the reach locally: from the highest material inside the region of the tool and its holder
+above the feature, down to the deepest cut, not from the setup face (`docs/FEATURE_DEPTH.md`, "Local reach").
+
 Version 0.2.28 checks each cutter with two numbers (`tool_selection.tool_reach`, `docs/FEATURE_DEPTH.md`).
 The flutes must be as long as the material that one pass cuts. The reach (the projection from the holder, or a shorter
 recorded reach) must cover the depth from the setup face to the deepest cut. `ToolRequirement.min_reach_mm` is the
