@@ -30,8 +30,11 @@ from .toolpath import Toolpath, ToolpathMove
 
 # A region narrower than this is no roughing work (mm): the mesh chords and the outline cleaning.
 MIN_WIDTH_MM = 0.01
-# Largest number of passes of one level roughing operation (raster lines and outlines of every level).
-MAX_PASSES = 4000
+# Largest number of paths of one level roughing operation (raster lines and outlines of every level). Each level is
+# one layer removal (``LayerReplay.cut_level``), so the paths cost moves, not material work.
+MAX_PASSES = 40000
+# Largest number of end mills of one level roughing: the largest that reaches, then smaller ones on what it leaves.
+MAX_ROUGHING_TOOLS = 3
 # Arc tolerance of the roughing offsets and the outline cleaning before them (mm). Roughing needs no sub-micrometre
 # arcs: the offsets of large part outlines by the cutter radius took minutes at 0.25 µm (NIST CTC-01). The cutter
 # radius gets the tolerance added, so the chords never bring the cutter nearer to the part.

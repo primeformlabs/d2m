@@ -186,7 +186,30 @@ class Stock:
         op = LevelRoughOp(part_shape=part_shape, keep=tuple(keep or ()), reach=reach, stepdown=stepdown, tool=tool,
                           tool_selection=selection,
                           face_selector=face, material=self._material)
-        return self._apply_op(op)
+        result = self._apply_op(op)
+        if selection is None:
+            return result
+        # Rest roughing: smaller end mills that reach the same depth cut what the larger one cannot enter (narrow
+        # waste between part walls), each on the material that the one before left.
+        from .level_roughing import MAX_ROUGHING_TOOLS
+        from .tool_selection import ToolRequirement, select_tool
+        for _ in range(MAX_ROUGHING_TOOLS - 1):
+            try:
+                smaller = select_tool(ToolRequirement("flat_endmill", max_diameter_mm=tool.diameter - 0.01,
+                                                      min_reach_mm=reach, prefer_largest=True, feature="level_rough_rest",
+                                                      reason="a smaller end mill for the waste that the larger one cannot enter"))
+            except ValueError:
+                break
+            if not smaller.ok:
+                break
+            tool = smaller.selected_tool
+            rest = LevelRoughOp(part_shape=part_shape, keep=tuple(keep or ()), reach=reach, stepdown=stepdown, tool=tool,
+                                tool_selection=smaller, face_selector=face, material=self._material)
+            following = result._apply_op(rest)
+            if not getattr(rest, "_pass_reports", None):
+                break  # no material left for this cutter: the operation recorded no work
+            result = following
+        return result
 
     def _feature_depths(self, face_selector: str, cx: float, cy: float, radius: float, depth: float,
                         through: bool) -> tuple[float, float]:
