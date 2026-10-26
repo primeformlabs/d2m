@@ -17,23 +17,26 @@ class _InventoryScope:
     tools: tuple[ToolSpec, ...]
     revision: str
     strict: bool
+    selector: object = None
 
 
 _inventory_scope: ContextVar[Optional[_InventoryScope]] = ContextVar("subcad_inventory", default=None)
 
 
 @contextmanager
-def tool_inventory(tools, *, revision: str = "", strict: bool = True):
+def tool_inventory(tools, *, revision: str = "", strict: bool = True, selector=None):
     """Use an isolated inventory snapshot without changing the shared catalog.
 
     Strict snapshots prohibit fallback tools and explicit tools with different
-    specifications. The caller must supply qualified physical assemblies.
+    specifications. The caller supplies qualified assemblies. An optional ``selector`` receives
+    the requirement and its feasible candidates. It must return one of those candidates; it
+    cannot bypass geometry, reach or availability checks. The policy is isolated to this context.
     """
     snapshot = tuple(deepcopy(tool) for tool in tools)
     ids = [tool.catalog_id for tool in snapshot]
     if any(not key for key in ids) or len(ids) != len(set(ids)):
         raise ValueError("Inventory tools require distinct catalog IDs.")
-    token = _inventory_scope.set(_InventoryScope(snapshot, revision, strict))
+    token = _inventory_scope.set(_InventoryScope(snapshot, revision, strict, selector))
     try:
         yield
     finally:
@@ -176,6 +179,14 @@ def select_tool(requirement: ToolRequirement) -> ToolSelectionResult:
         candidates.append(tool)
 
     if candidates:
+        if scope is not None and scope.selector is not None:
+            selected = scope.selector(requirement, tuple(deepcopy(tool) for tool in candidates))
+            matching = next((tool for tool in candidates if selected is not None
+                             and tool.to_dict() == selected.to_dict()), None)
+            if matching is None:
+                raise ValueError("The selection policy must return a feasible inventory candidate.")
+            result.selected_tool = deepcopy(matching)
+            return result
         candidates.sort(key=lambda tool: tool.diameter)
         result.selected_tool = deepcopy(candidates[-1] if requirement.prefer_largest else candidates[0])
         return result
