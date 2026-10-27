@@ -83,6 +83,11 @@ These states are for the player only. The checks do not use them.
 
 ## Accuracy
 
+The layer sampling budget can make slope layers thicker.
+Required mesh and cut heights remain separate intervals, even when their count exceeds the sampling budget.
+The slope loop uses that minimum interval count as its lower bound.
+Thus, many required heights cannot cause an infinite sampling loop.
+
 * A polygon chord is at most 0.25 µm inside its arc. The removed volume of a pass can differ from
   the exact sweep by at most 0.25 µm times the arc part of its boundary area.
 * The remaining-material and overcut figures do not count material thinner than 1 µm.
