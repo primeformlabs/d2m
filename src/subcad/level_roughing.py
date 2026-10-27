@@ -136,16 +136,29 @@ def keep_paths(profiles, face_selector: str):
 
 def roughing_layers(stock_shape, part_shape, face_selector: str, *, reach: float, divide: bool = True):
     """The setup layers of the incoming material and the part (``milling_opening.setup_layers``), down to the reach."""
-    stock_mesh, part_mesh = L.SolidMesh.of(stock_shape), L.SolidMesh.of(part_shape)
+    from .material_ledger import ATTRIBUTE
+    ledger = getattr(stock_shape, ATTRIBUTE, None)
+    stock_material = None
+    if ledger is not None:
+        import numpy as np
+        setup = Setup.of(face_selector)
+        stock_mesh = ledger.mesh((np.eye(3, dtype=np.int64), np.zeros(3)))
+        frame = (setup.rotation, np.zeros(3))
+        heights = setup.to_setup(stock_mesh.vertices)[:, 2]
+        stock_material = ledger.layered(frame, float(heights.min()), float(heights.max()))
+    else:
+        stock_mesh = L.SolidMesh.of(stock_shape.val() if hasattr(stock_shape, 'val') else stock_shape)
+    part_mesh = L.SolidMesh.of(part_shape)
     return setup_layers(stock_mesh, part_mesh, Setup.of(face_selector), reach_depths=[reach],
-                        divide_depth=reach if divide else 0.0)
+                        divide_depth=reach if divide else 0.0, stock_material=stock_material)
 
 
 def level_plan(stock_shape, part_shape, face_selector: str, *, radius: float, reach: float, keep=(),
                divide: bool = True, layers=None, previous=()) -> LevelPlan:
     """The bands that a flat cutter of the radius roughs from the setup face down to the reach.
 
-    ``stock_shape`` and ``part_shape``: CadQuery shapes in the part frame (the incoming material and the finished part).
+    ``stock_shape``: a CadQuery workplane with its material ledger, or a shape without a ledger. ``part_shape``:
+    the finished part shape. Both use the part frame.
     ``keep``: profiles that the roughing leaves for their own operations (``keep_paths``); they count as part.
     ``divide``: divide the layers that sloped or curved faces cross (the exact shadow); False is a quick probe of the
     planar levels only. ``layers``: the layers of an earlier plan of the same material (no new mesh and sections).
@@ -153,7 +166,15 @@ def level_plan(stock_shape, part_shape, face_selector: str, *, radius: float, re
     if layers is None:
         layers = roughing_layers(stock_shape, part_shape, face_selector, reach=reach, divide=divide)
     # All part sections, also those below the reach (the shadow skips them).
-    silhouette = filled(L.union([path for section in layers.part for path in section])) if layers.count else []
+    # The silhouette has no holes. Remove them before the union, and avoid repeating
+    # unchanged outlines at the many height limits of earlier ledger cuts.
+    silhouette, previous_outline = [], None
+    for section in layers.part:
+        outline = filled(section)
+        if outline != previous_outline:
+            silhouette = L.union(silhouette, outline)
+            previous_outline = outline
+    silhouette = filled(silhouette)
     kept = keep_paths(keep, face_selector)
     floor = layers.face - reach
     planar = sorted(set(round(value, 7) for value in layers.planar))
@@ -261,6 +282,7 @@ def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=Non
     ``reach``: the deepest level below the setup face (default: the reach of the tool)."""
     from .material_ledger import MaterialLedger
     from .milling_layers import LayerCheckUnavailable, LayerReplay
+    from . import milling_layers
     from .milling_replay import finite, validate_cutter
     from .profile_milling import _setup_plane
     from .tool_selection import tool_reach
@@ -279,7 +301,7 @@ def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=Non
     plane, mirror = _setup_plane(face_selector)
     local = cq.Workplane("XY").newObject([plane.toLocalCoords(shape.val())])
     bounds = local.val().BoundingBox()
-    plan = level_plan(shape.val(), part_shape, face_selector, radius=radius, reach=reach, keep=keep, layers=layers,
+    plan = level_plan(shape, part_shape, face_selector, radius=radius, reach=reach, keep=keep, layers=layers,
                       previous=previous)
     from .tool_selection import HOLDER_CLEARANCE_MM, holder_radius
     envelope = holder_radius(tool) + HOLDER_CLEARANCE_MM
@@ -301,9 +323,13 @@ def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=Non
                  "geometry_replay": {"no_work": True}}
         return shape, aggregate, [state], [], plan
     validate_cutter(tool, cutting_depth=plan.reach_for(tool), cut_length=stepdown)
+    ledger = MaterialLedger.of(shape)
+    cross_setup = any(abs(sum(float(cut.frame[0][axis, 2]) * normal[axis] for axis in range(3))) < 1 - 1e-9
+                      for cut in ledger.cuts)
     try:
         replay = LayerReplay(local, bounds.zmax, [path.moves[1].position[2] for path in paths], tool,
-                             ledger=MaterialLedger.of(shape), plane=plane, layer_brep=MaterialLedger.layer_brep(shape))
+                             ledger=ledger, plane=plane, layer_brep=MaterialLedger.layer_brep(shape)
+                             or (not milling_layers.PLAYER_BREP_STATES and cross_setup))
     except LayerCheckUnavailable as error:
         raise ValueError(f"Level roughing needs the layer model of the material: {error}") from error
     # The checks use the layers; the B-Rep result is for the display and the next B-Rep operations.
@@ -426,7 +452,7 @@ def select_roughing_tool(shape, part_shape, face_selector: str, *, max_depth: Op
     from .tool_selection import ToolRequirement, ToolUnavailableError, select_tool
     bounds = shape.val().BoundingBox()
     full = max_depth or max(bounds.xlen, bounds.ylen, bounds.zlen)
-    probe = level_plan(shape.val(), part_shape, face_selector, radius=0.5, reach=full, keep=keep, divide=False)
+    probe = level_plan(shape, part_shape, face_selector, radius=0.5, reach=full, keep=keep, divide=False)
     depths = sorted({round(probe.face - band[0], 6) for band in probe.bands}, reverse=True)
     if not depths:
         return None, None, 0.0
