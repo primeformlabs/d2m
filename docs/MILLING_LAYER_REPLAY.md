@@ -51,6 +51,11 @@ gets its layers from the ledger and is ready.
 
 ## Material result
 
+Profile pocket and outside profile planning clip the roughing paths once in the XY plane.
+Each depth uses the same paths with its cutting height.
+The rapid and retract moves keep the same safe height.
+The finishing pass keeps its separate clipping and allowance.
+
 The next operation and the display need a B-Rep. The operation result is the incoming solid less one
 prism for each cutting level. A level prism holds only the part of its sweep region that no deeper level
 covers. Most operations need one or two Booleans. The old replay needed one Boolean for each pass
