@@ -46,6 +46,48 @@ def test_the_plan_roughs_the_step_and_keeps_the_pocket_and_the_hole():
     assert plan.volume() == pytest.approx(30 * 40 * 20, rel=1e-3)
 
 
+def test_later_roughing_reads_the_ledger_instead_of_the_display_mesh(monkeypatch):
+    import numpy as np
+    from src.subcad import layers
+    from src.subcad.material_ledger import MaterialLedger, Cut
+
+    stock = cq.Workplane('XY').box(60, 40, 30)
+    base = stock.val()
+    # A previous operation removed half the waste above the lower step.
+    region = layers.to_paths([[(0, -20), (15, -20), (15, 20), (0, 20)]])
+    ledger = MaterialLedger(base).with_cuts([Cut((np.eye(3, dtype=np.int64), np.zeros(3)), -5, 15, region)])
+    display = cq.Workplane('XY').box(60, 40, 30)
+    ledger.attach(display)
+    original = layers.SolidMesh.of.__func__
+    def mesh(cls, shape, *args, **kwargs):
+        assert shape is not display.val(), 'The display mesh cannot supply the material ledger.'
+        return original(cls, shape, *args, **kwargs)
+    monkeypatch.setattr(layers.SolidMesh, 'of', classmethod(mesh))
+    plan = level_plan(display, _part(), '>Z', radius=5, reach=40)
+    assert plan.volume() == pytest.approx(15 * 40 * 20, rel=1e-3)
+
+
+def test_stock_roughing_keeps_the_ledger_through_selection_and_replay(monkeypatch):
+    import numpy as np
+    from src.subcad import layers
+    from src.subcad.material_ledger import MaterialLedger, Cut
+    stock = Stock.rectangular(60, 40, 30)
+    base = stock._shape.val()
+    region = layers.to_paths([[(0, -20), (15, -20), (15, 20), (0, 20)]])
+    removed = cq.Workplane('XY').box(15, 40, 20).translate((7.5, 0, 5))
+    incoming = stock._shape.cut(removed)
+    MaterialLedger(base).with_cuts([Cut((np.eye(3, dtype=np.int64), np.zeros(3)), -5, 15, region)]).attach(incoming)
+    stock._shape = incoming
+    original = layers.SolidMesh.of.__func__
+    def mesh(cls, shape, *args, **kwargs):
+        assert shape is not incoming.val(), 'Roughing must read the ledger instead of its display solid.'
+        return original(cls, shape, *args, **kwargs)
+    monkeypatch.setattr(layers.SolidMesh, 'of', classmethod(mesh))
+    with tool_inventory([_mill(10, 25, 45, 'EM10')], revision='ledger', strict=True):
+        result = stock.rough_levels(_part())
+    assert incoming.val().Volume() - result._shape.val().Volume() == pytest.approx(15 * 40 * 20, rel=2e-3)
+
+
 def test_level_roughing_then_a_drill_from_the_low_level():
     part = _part()
     tools = [_mill(10, 25, 45, "EM10"), _mill(16, 12, 30, "EM16S"), _drill(6, 14, 45, "D6")]
