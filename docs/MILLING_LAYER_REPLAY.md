@@ -65,6 +65,8 @@ If the Booleans fail or do not agree, the layers stay the result and the B-Rep c
 with the 2 µm outline of the player. The last pass report has `material_brep`: `chained_brep` or
 `layer_prisms`. A later layer operation on a layer B-Rep makes its result from the ledger at once.
 The layer B-Rep is a compound of stacked prisms: the nominal comparison (one solid) cannot use it.
+When the result uses ledger prisms, the replay makes them before it calculates cutter arcs for display Booleans.
+Those arcs are unnecessary for the ledger solid.
 If the layers cannot be made (an open mesh of a new ledger base), the operation uses the B-Rep replay.
 
 ## Operation player states

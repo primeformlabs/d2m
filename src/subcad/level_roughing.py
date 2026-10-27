@@ -166,7 +166,15 @@ def level_plan(stock_shape, part_shape, face_selector: str, *, radius: float, re
     if layers is None:
         layers = roughing_layers(stock_shape, part_shape, face_selector, reach=reach, divide=divide)
     # All part sections, also those below the reach (the shadow skips them).
-    silhouette = filled(L.union([path for section in layers.part for path in section])) if layers.count else []
+    # The silhouette has no holes. Remove them before the union, and avoid repeating
+    # unchanged outlines at the many height limits of earlier ledger cuts.
+    silhouette, previous_outline = [], None
+    for section in layers.part:
+        outline = filled(section)
+        if outline != previous_outline:
+            silhouette = L.union(silhouette, outline)
+            previous_outline = outline
+    silhouette = filled(silhouette)
     kept = keep_paths(keep, face_selector)
     floor = layers.face - reach
     planar = sorted(set(round(value, 7) for value in layers.planar))
@@ -274,6 +282,7 @@ def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=Non
     ``reach``: the deepest level below the setup face (default: the reach of the tool)."""
     from .material_ledger import MaterialLedger
     from .milling_layers import LayerCheckUnavailable, LayerReplay
+    from . import milling_layers
     from .milling_replay import finite, validate_cutter
     from .profile_milling import _setup_plane
     from .tool_selection import tool_reach
@@ -314,9 +323,13 @@ def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=Non
                  "geometry_replay": {"no_work": True}}
         return shape, aggregate, [state], [], plan
     validate_cutter(tool, cutting_depth=plan.reach_for(tool), cut_length=stepdown)
+    ledger = MaterialLedger.of(shape)
+    cross_setup = any(abs(sum(float(cut.frame[0][axis, 2]) * normal[axis] for axis in range(3))) < 1 - 1e-9
+                      for cut in ledger.cuts)
     try:
         replay = LayerReplay(local, bounds.zmax, [path.moves[1].position[2] for path in paths], tool,
-                             ledger=MaterialLedger.of(shape), plane=plane, layer_brep=MaterialLedger.layer_brep(shape))
+                             ledger=ledger, plane=plane, layer_brep=MaterialLedger.layer_brep(shape)
+                             or (not milling_layers.PLAYER_BREP_STATES and cross_setup))
     except LayerCheckUnavailable as error:
         raise ValueError(f"Level roughing needs the layer model of the material: {error}") from error
     # The checks use the layers; the B-Rep result is for the display and the next B-Rep operations.

@@ -88,6 +88,28 @@ def test_stock_roughing_keeps_the_ledger_through_selection_and_replay(monkeypatc
     assert incoming.val().Volume() - result._shape.val().Volume() == pytest.approx(15 * 40 * 20, rel=2e-3)
 
 
+def test_player_roughing_builds_the_display_from_ledger_layers(monkeypatch):
+    import numpy as np
+    from src.subcad import milling_layers, milling_replay, layers as L
+    from src.subcad.material_ledger import MaterialLedger, Cut
+    from src.subcad.milling_opening import Setup
+    monkeypatch.setattr(milling_layers, 'PLAYER_BREP_STATES', False)
+    stock = Stock.rectangular(60, 40, 30)
+    base = stock._shape.val()
+    removed = cq.Workplane('XY').box(15, 40, 20).translate((7.5, 0, 5))
+    stock._shape = stock._shape.cut(removed)
+    region = L.to_paths([[(-20, -5), (20, -5), (20, 15), (-20, 15)]])
+    MaterialLedger(base).with_cuts([Cut((Setup.of('>X').rotation, np.zeros(3)), 0, 15, region)]).attach(stock._shape)
+    def no_boolean(*args, **kwargs):
+        raise AssertionError('The layer-player preview does not need a display Boolean.')
+    monkeypatch.setattr(milling_replay, '_boolean', no_boolean)
+    monkeypatch.setattr(L, 'cutter_arcs', no_boolean)
+    with tool_inventory([_mill(10, 25, 45, 'EM10')], revision='player-ledger', strict=True):
+        result = stock.rough_levels(_part())
+    assert result._shape.val().Volume() == pytest.approx(60*40*30 - 30*40*20, rel=2e-3)
+    assert result._shape._subcad_material_ledger.brep_from_layers
+
+
 def test_level_roughing_then_a_drill_from_the_low_level():
     part = _part()
     tools = [_mill(10, 25, 45, "EM10"), _mill(16, 12, 30, "EM16S"), _drill(6, 14, 45, "D6")]
