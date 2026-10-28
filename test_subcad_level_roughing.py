@@ -46,6 +46,70 @@ def test_the_plan_roughs_the_step_and_keeps_the_pocket_and_the_hole():
     assert plan.volume() == pytest.approx(30 * 40 * 20, rel=1e-3)
 
 
+def test_later_roughing_reads_the_ledger_instead_of_the_display_mesh(monkeypatch):
+    import numpy as np
+    from src.subcad import layers
+    from src.subcad.material_ledger import MaterialLedger, Cut
+
+    stock = cq.Workplane('XY').box(60, 40, 30)
+    base = stock.val()
+    # A previous operation removed half the waste above the lower step.
+    region = layers.to_paths([[(0, -20), (15, -20), (15, 20), (0, 20)]])
+    ledger = MaterialLedger(base).with_cuts([Cut((np.eye(3, dtype=np.int64), np.zeros(3)), -5, 15, region)])
+    display = cq.Workplane('XY').box(60, 40, 30)
+    ledger.attach(display)
+    original = layers.SolidMesh.of.__func__
+    def mesh(cls, shape, *args, **kwargs):
+        assert shape is not display.val(), 'The display mesh cannot supply the material ledger.'
+        return original(cls, shape, *args, **kwargs)
+    monkeypatch.setattr(layers.SolidMesh, 'of', classmethod(mesh))
+    plan = level_plan(display, _part(), '>Z', radius=5, reach=40)
+    assert plan.volume() == pytest.approx(15 * 40 * 20, rel=1e-3)
+
+
+def test_stock_roughing_keeps_the_ledger_through_selection_and_replay(monkeypatch):
+    import numpy as np
+    from src.subcad import layers
+    from src.subcad.material_ledger import MaterialLedger, Cut
+    stock = Stock.rectangular(60, 40, 30)
+    base = stock._shape.val()
+    region = layers.to_paths([[(0, -20), (15, -20), (15, 20), (0, 20)]])
+    removed = cq.Workplane('XY').box(15, 40, 20).translate((7.5, 0, 5))
+    incoming = stock._shape.cut(removed)
+    MaterialLedger(base).with_cuts([Cut((np.eye(3, dtype=np.int64), np.zeros(3)), -5, 15, region)]).attach(incoming)
+    stock._shape = incoming
+    original = layers.SolidMesh.of.__func__
+    def mesh(cls, shape, *args, **kwargs):
+        assert shape is not incoming.val(), 'Roughing must read the ledger instead of its display solid.'
+        return original(cls, shape, *args, **kwargs)
+    monkeypatch.setattr(layers.SolidMesh, 'of', classmethod(mesh))
+    with tool_inventory([_mill(10, 25, 45, 'EM10')], revision='ledger', strict=True):
+        result = stock.rough_levels(_part())
+    assert incoming.val().Volume() - result._shape.val().Volume() == pytest.approx(15 * 40 * 20, rel=2e-3)
+
+
+def test_player_roughing_builds_the_display_from_ledger_layers(monkeypatch):
+    import numpy as np
+    from src.subcad import milling_layers, milling_replay, layers as L
+    from src.subcad.material_ledger import MaterialLedger, Cut
+    from src.subcad.milling_opening import Setup
+    monkeypatch.setattr(milling_layers, 'PLAYER_BREP_STATES', False)
+    stock = Stock.rectangular(60, 40, 30)
+    base = stock._shape.val()
+    removed = cq.Workplane('XY').box(15, 40, 20).translate((7.5, 0, 5))
+    stock._shape = stock._shape.cut(removed)
+    region = L.to_paths([[(-20, -5), (20, -5), (20, 15), (-20, 15)]])
+    MaterialLedger(base).with_cuts([Cut((Setup.of('>X').rotation, np.zeros(3)), 0, 15, region)]).attach(stock._shape)
+    def no_boolean(*args, **kwargs):
+        raise AssertionError('The layer-player preview does not need a display Boolean.')
+    monkeypatch.setattr(milling_replay, '_boolean', no_boolean)
+    monkeypatch.setattr(L, 'cutter_arcs', no_boolean)
+    with tool_inventory([_mill(10, 25, 45, 'EM10')], revision='player-ledger', strict=True):
+        result = stock.rough_levels(_part())
+    assert result._shape.val().Volume() == pytest.approx(60*40*30 - 30*40*20, rel=2e-3)
+    assert result._shape._subcad_material_ledger.brep_from_layers
+
+
 def test_level_roughing_then_a_drill_from_the_low_level():
     part = _part()
     tools = [_mill(10, 25, 45, "EM10"), _mill(16, 12, 30, "EM16S"), _drill(6, 14, 45, "D6")]
@@ -89,3 +153,81 @@ def test_a_large_pocket_path_set_replays_by_level(monkeypatch):
     passes = by_level.process_plan()["operations"][-1]["material_passes"]
     assert all(row["path_kind"] == "level" for row in passes)
     assert by_level._shape.val().Volume() == pytest.approx(per_pass._shape.val().Volume(), rel=1e-4)
+
+
+def _turned(profile):
+    return cq.Workplane("XZ").polyline(profile).close().revolve(360, (0, 0, 0), (0, 1, 0))
+
+
+def test_spanner_flats_under_a_cone_are_roughed():
+    # d2o#1322: a turned shaft, Ø10 to a 30 degree cone and Ø8 above it, with two flats 1 mm deep under the cone. The
+    # quick probe takes one section between the flat floor and the top (Ø8 there: no waste) and roughed nothing.
+    # The depth limit keeps the probe to the flat level (a deeper reach finds sliver bands below the flats).
+    from src.subcad.process_plan import ProcessPlan
+    turned = _turned([(0, 0), (5, 0), (5, 13.27), (4, 15), (4, 30), (0, 30)])
+    part = turned.cut(cq.Workplane("XY").box(2, 6, 5).translate((5, 0, 12.5))) \
+                 .cut(cq.Workplane("XY").box(2, 6, 5).translate((-5, 0, 12.5))).val()
+    waste = turned.val().Volume() - part.Volume()
+    dims = {"length": 10, "width": 10, "height": 30}
+    stock = Stock._from_parts(turned, "steel_a36", dims, ProcessPlan(material="steel_a36", stock_dimensions=dims), 1)
+    with tool_inventory([_mill(4, 11, 30, "EM4"), _mill(8, 19, 40, "EM8")], revision="flats"):
+        roughed = stock.rough_levels(part, face_selector=">Z", max_depth=20.5)
+    operation = roughed.process_plan()["operations"][-1]
+    assert operation["operation"] == "level_rough"
+    assert operation["removed_volume_mm3"] > 0.9 * waste
+
+
+IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+
+
+def _round_bar_flats(diameter):
+    """A round bar (60 mm long, axis Z) and the part: two flats 8 mm across and 5 mm long at the top end."""
+    stock = Stock.round_bar(60, diameter, "steel_1018", axis="Z")
+    bottom = stock._shape.val().BoundingBox().zmin
+    part = cq.Workplane("XY").circle(diameter / 2).extrude(60).translate((0, 0, bottom))
+    for side in (1, -1):
+        part = part.cut(cq.Workplane("XY").box(diameter, diameter, 5, centered=(True, True, False))
+                        .translate((side * (4 + diameter / 2), 0, bottom + 55)))
+    return stock, part.val()
+
+
+def _compare(roughed, part, tmp_path):
+    from src.subcad import compare_nominal_solids
+    path = tmp_path / "part.step"
+    cq.exporters.export(cq.Workplane().add(part), str(path))
+    return compare_nominal_solids(roughed, path, target_to_part_matrix=IDENTITY)
+
+
+@pytest.mark.parametrize("diameter", [10.0, 20.0])
+def test_flats_on_round_stock_keep_the_exact_brep(monkeypatch, tmp_path, diameter):
+    # d2o#1334: the 10 µm outline cleaning of the prisms and the mesh chords of the round stock made the exact B-Rep
+    # differ from the layer removal by more than 0.5 %. SubCAD took the layer prisms (many solids) and the nominal
+    # comparison refused the result. The check now allows the known errors of the two models.
+    from src.subcad import milling_layers
+    monkeypatch.setattr(milling_layers, "PLAYER_BREP_STATES", False)
+    stock, part = _round_bar_flats(diameter)
+    roughed = stock.rough_levels(part, face_selector=">Z")
+    last = roughed.process_plan()["operations"][-1]["material_passes"][-1]
+    assert last["material_brep"] == "chained_brep"
+    check = last["material_brep_check"]
+    assert 0 < check["brep_difference_mm3"] <= check["tolerance_mm3"]
+    # The tolerance stays far below one flat: a Boolean that misses a cut is still refused.
+    assert check["tolerance_mm3"] < 0.05 * check["layer_removed_mm3"]
+    assert len(roughed._shape.val().Solids()) == 1
+    removed = stock._shape.val().Volume() - roughed._shape.val().Volume()
+    assert removed == pytest.approx(check["layer_removed_mm3"], abs=check["tolerance_mm3"])
+    comparison = _compare(roughed, part, tmp_path)
+    assert comparison.report["missing_material_mm3"] < 1e-3
+
+
+def test_a_boolean_that_removes_nothing_falls_back_with_a_clear_comparison_error(monkeypatch, tmp_path):
+    from src.subcad import milling_layers, milling_replay
+    monkeypatch.setattr(milling_layers, "PLAYER_BREP_STATES", False)
+    stock, part = _round_bar_flats(10.0)
+    monkeypatch.setattr(milling_replay, "_boolean", lambda shape, tools, operation: shape)
+    roughed = stock.rough_levels(part, face_selector=">Z")
+    last = roughed.process_plan()["operations"][-1]["material_passes"][-1]
+    assert last["material_brep"] == "layer_prisms"
+    assert last["material_brep_check"]["brep_difference_mm3"] > last["material_brep_check"]["tolerance_mm3"]
+    with pytest.raises(ValueError, match="layer model of a milling operation"):
+        _compare(roughed, part, tmp_path)

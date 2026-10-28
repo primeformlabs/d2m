@@ -26,6 +26,16 @@ def _owned(diameter, flute, catalog_id):
 TOOLS = [_owned(6, 20, "EM6"), _owned(4, 12, "EM4")]
 
 
+def test_required_height_intervals_can_exceed_the_layer_sampling_budget(monkeypatch):
+    from src.subcad import layers as L
+    monkeypatch.setattr(L, "MAX_LAYERS", 4)
+    stock = cq.Workplane("XY").box(20, 10, 10).val()
+    material = L.LayeredMaterial.of_solid(stock, -5, 5, levels=range(-4, 5))
+    assert len(material.layers) == 10
+    assert [material.layers[0].z_low, *[layer.z_high for layer in material.layers]] == list(range(-5, 6))
+    assert material.volume() == pytest.approx(2000)
+
+
 def _ledger_volume(stock):
     ledger = ML.MaterialLedger.of(stock._shape)
     volume, _ = ledger.volume_in(ML.plane_frame(_setup_plane(">Z")[0]))

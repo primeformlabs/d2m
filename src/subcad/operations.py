@@ -2031,16 +2031,34 @@ class CountersinkOp(MachiningOperation):
 
     def __post_init__(self):
         if self.tool is None:
-            try:
-                self.tool = ToolCatalog.get_best_for("chamfer", 6.0)
-            except ValueError:
-                self.tool = ToolSpec("chamfer", 6.0, tip_angle=90.0, tip_diameter=1.0)
+            # The chamfer tool comes from the inventory, like a drill: a strict snapshot never takes a catalogue
+            # tool that the caller did not supply (d2o#1311).
+            fallback = ToolSpec("chamfer", 6.0, tip_angle=90.0, tip_diameter=1.0)
+            self.tool, self.tool_selection = _select_inventory_tool(
+                ToolRequirement(
+                    "chamfer",
+                    min_diameter_mm=self.countersink_diameter,
+                    min_flute_length_mm=self.sink_depth(),
+                    tip_angle_deg=self.countersink_angle,
+                    max_tip_diameter_mm=self.diameter,
+                    feature="countersink",
+                    reason="the chamfer must cover the countersink diameter at the countersink angle",
+                ),
+                fallback,
+            )
 
         tool_type_fs = _resolve_fs_tool_type(self.tool.tool_type)
         self.feeds_speeds = get_feeds_speeds(
             tool_type_fs, self.tool.diameter, self.material
         )
         self.position = (self.cx, self.cy)
+
+    def sink_depth(self) -> float:
+        """The depth of the cone below the face: ``depth``, else from the two diameters and the angle."""
+        if self.depth > 0:
+            return self.depth
+        angle_rad = math.radians(max(self.countersink_angle, 1.0) / 2.0)
+        return max(((self.countersink_diameter - self.diameter) / 2.0) / math.tan(angle_rad), 0.0)
 
     # ------------------------------------------------------------------
 
@@ -2071,12 +2089,7 @@ class CountersinkOp(MachiningOperation):
         }
 
     def to_toolpath(self) -> Toolpath:
-        if self.depth > 0:
-            sink_depth = self.depth
-        else:
-            angle_rad = math.radians(max(self.countersink_angle, 1.0) / 2.0)
-            sink_depth = ((self.countersink_diameter - self.diameter) / 2.0) / math.tan(angle_rad)
-            sink_depth = max(sink_depth, 0.0)
+        sink_depth = self.sink_depth()
 
         tp = _new_toolpath(
             "countersink",

@@ -40,7 +40,7 @@ MESH_DEFLECTION_MM = 0.001
 MESH_ANGLE_RAD = 0.1
 # Height of the thinner layers where a sloped or curved face crosses a layer (mm).
 SLOPED_LAYER_MM = 0.1
-# Largest number of layers of one operation; above it the sloped layers are made thicker.
+# Sampling budget of one operation. Required height intervals remain even when they exceed this budget.
 MAX_LAYERS = 400
 # Outline tolerance of the material shown after each pass (operation player only, not the checks) (mm).
 DISPLAY_MM = 0.0005
@@ -119,6 +119,21 @@ def offset(paths: Paths, distance_mm: float) -> Paths:
 def area(paths: Paths) -> float:
     """Net area in mm² (outer loops positive, holes negative)."""
     return sum(pyclipper.Area(path) for path in paths) / (SCALE * SCALE)
+
+
+def perimeter(paths: Paths) -> float:
+    """Total outline length of the loops in mm (holes included)."""
+    total = 0.0
+    for path in paths:
+        points = np.asarray(path, float)
+        if len(points) >= 2:
+            total += float(np.linalg.norm(points - np.roll(points, 1, axis=0), axis=1).sum())
+    return total / SCALE
+
+
+def xor(first: Paths, second: Paths) -> Paths:
+    """The region that is in one of the two regions only."""
+    return union(difference(first, second), difference(second, first))
 
 
 def bounds(paths: Paths):
@@ -583,9 +598,12 @@ class LayeredMaterial:
             crossed = bool(np.any((low < second - Z_MERGE_MM) & (high > first + Z_MERGE_MM)))
             intervals.append((first, second, crossed))
         step = SLOPED_LAYER_MM
+        # Thicker slope samples cannot remove required cut or mesh heights. If those
+        # intervals already exceed the budget, the old loop could never terminate.
+        budget = max(MAX_LAYERS, len(intervals))
         while True:
             count = sum(max(1, math.ceil((b - a) / step - 1e-9)) if crossed else 1 for a, b, crossed in intervals)
-            if count <= MAX_LAYERS:
+            if count <= budget:
                 break
             step *= 1.5
         layers = []

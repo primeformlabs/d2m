@@ -185,8 +185,10 @@ class Stock:
                 return self
         from .level_roughing import roughing_layers
         # One mesh and one set of sections for every cutter of this roughing.
-        layers = roughing_layers(self._shape.val(), part_shape, face, reach=reach or tool.flute_length)
         probe = getattr(selection, "probe", None)
+        # A divided probe already has the exact layers down to a deeper reach: the roughing uses them, not a second set.
+        layers = (probe.layers if getattr(probe, "divided", False)
+                  else roughing_layers(self._shape, part_shape, face, reach=reach or tool.flute_length))
         op = LevelRoughOp(part_shape=part_shape, keep=tuple(keep or ()), reach=reach, stepdown=stepdown, tool=tool,
                           tool_selection=selection, layers=layers,
                           reach_depth=probe.reach_for(tool, reach) if probe is not None else None,
