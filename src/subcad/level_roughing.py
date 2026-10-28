@@ -453,6 +453,12 @@ def select_roughing_tool(shape, part_shape, face_selector: str, *, max_depth: Op
     bounds = shape.val().BoundingBox()
     full = max_depth or max(bounds.xlen, bounds.ylen, bounds.zlen)
     probe = level_plan(shape, part_shape, face_selector, radius=0.5, reach=full, keep=keep, divide=False)
+    if not probe.bands:
+        # The quick probe takes one section for each layer between two planar levels. Waste that is only under a cone
+        # or a curved shoulder of that layer is not in it (d2o#1322: the spanner flats of a turned shaft below its
+        # Ø10-Ø8 cone). The divided layers see it; they cost more, so only when the quick probe finds no waste.
+        probe = level_plan(shape, part_shape, face_selector, radius=0.5, reach=full, keep=keep, divide=True)
+        probe.divided = True
     depths = sorted({round(probe.face - band[0], 6) for band in probe.bands}, reverse=True)
     if not depths:
         return None, None, 0.0

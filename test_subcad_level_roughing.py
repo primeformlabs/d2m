@@ -153,3 +153,25 @@ def test_a_large_pocket_path_set_replays_by_level(monkeypatch):
     passes = by_level.process_plan()["operations"][-1]["material_passes"]
     assert all(row["path_kind"] == "level" for row in passes)
     assert by_level._shape.val().Volume() == pytest.approx(per_pass._shape.val().Volume(), rel=1e-4)
+
+
+def _turned(profile):
+    return cq.Workplane("XZ").polyline(profile).close().revolve(360, (0, 0, 0), (0, 1, 0))
+
+
+def test_spanner_flats_under_a_cone_are_roughed():
+    # d2o#1322: a turned shaft, Ø10 to a 30 degree cone and Ø8 above it, with two flats 1 mm deep under the cone. The
+    # quick probe takes one section between the flat floor and the top (Ø8 there: no waste) and roughed nothing.
+    # The depth limit keeps the probe to the flat level (a deeper reach finds sliver bands below the flats).
+    from src.subcad.process_plan import ProcessPlan
+    turned = _turned([(0, 0), (5, 0), (5, 13.27), (4, 15), (4, 30), (0, 30)])
+    part = turned.cut(cq.Workplane("XY").box(2, 6, 5).translate((5, 0, 12.5))) \
+                 .cut(cq.Workplane("XY").box(2, 6, 5).translate((-5, 0, 12.5))).val()
+    waste = turned.val().Volume() - part.Volume()
+    dims = {"length": 10, "width": 10, "height": 30}
+    stock = Stock._from_parts(turned, "steel_a36", dims, ProcessPlan(material="steel_a36", stock_dimensions=dims), 1)
+    with tool_inventory([_mill(4, 11, 30, "EM4"), _mill(8, 19, 40, "EM8")], revision="flats"):
+        roughed = stock.rough_levels(part, face_selector=">Z", max_depth=20.5)
+    operation = roughed.process_plan()["operations"][-1]
+    assert operation["operation"] == "level_rough"
+    assert operation["removed_volume_mm3"] > 0.9 * waste
