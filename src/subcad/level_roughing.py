@@ -365,6 +365,8 @@ def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=Non
                        "label": f"After level roughing level {index + 1}", "geometry_replay": reports[index],
                        "player_layers": layers})
     reports[-1]["material_brep"] = replay.brep_source
+    if replay.brep_check:
+        reports[-1]["material_brep_check"] = {key: round(value, 6) for key, value in replay.brep_check.items()}
     replay.attach_ledger(states[-1]["shape"])
     aggregate.metadata.update(material_passes=reports, removed_volume_mm3=round(replay.material_removed(), 3))
     return states[-1]["shape"], aggregate, states, reports, plan

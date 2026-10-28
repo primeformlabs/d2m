@@ -66,6 +66,8 @@ class LayerReplay:
         self._after = None
         # The source of the B-Rep result: the chained Boolean, or the ledger when that Boolean fails.
         self.brep_source = None
+        # The volume check of the chained B-Rep against the layer removal (``brep_tolerance``), for the pass report.
+        self.brep_check: dict = {}
         # Outline cleaning of the B-Rep prisms (mm), with no exact arcs: an operation whose checks use only the layers
         # (level roughing of a large part) needs no Boolean of thousands of arc edges. None: exact arcs first.
         self.prism_clean_mm = None
@@ -166,10 +168,18 @@ class LayerReplay:
             return self.local.val()
         incoming = self.local.val().Volume()
         expected = incoming - self.material_removed()
+        clean_mm3 = 0.0
         if self.prism_clean_mm:
             import pyclipper
-            levels = [(z, [path for path in pyclipper.CleanPolygons(added, self.prism_clean_mm * L.SCALE) if len(path) >= 3], arcs)
-                      for z, added, arcs in levels]
+            cleaned = [(z, [path for path in pyclipper.CleanPolygons(added, self.prism_clean_mm * L.SCALE) if len(path) >= 3], arcs)
+                       for z, added, arcs in levels]
+            # The cleaned outline moves the prism walls: the area between the two outlines inside the material outline
+            # (the union of the incoming layers), over the material height above the level.
+            outline = L.union([path for material in self.before for path in material])
+            clean_mm3 = sum(L.area(L.intersection(L.xor(added, clean), outline)) * max(0.0, self.z_top - z)
+                            for (z, added, _), (_, clean, _) in zip(levels, cleaned))
+            levels = cleaned
+        tolerance = self.brep_tolerance(incoming - expected, clean_mm3)
         # Exact cutter arcs first; plain polygon prisms (chords within the arc tolerance) if the arcs fail.
         attempts = (False,) if self.prism_clean_mm else (True, False)
         for exact in (() if self.layer_brep else attempts):
@@ -180,14 +190,34 @@ class LayerReplay:
                         result = _boolean(result, [tool], "cut")
             except ValueError:
                 continue
-            # The B-Rep result and the layer removal must agree (mesh chords and layer midpoints: 0.5 %).
-            if result.Solids() and result.isValid() and abs(result.Volume() - expected) <= max(
-                    1e-3, 0.005 * max(incoming - expected, 0.0)):
+            # The B-Rep result and the layer removal must agree within the known errors of the two models.
+            if not result.Solids():
+                continue
+            difference = abs(result.Volume() - expected)
+            self.brep_check["brep_difference_mm3"] = difference
+            if difference <= tolerance and result.isValid():
                 self.brep_source = "chained_brep"
                 return result
         if self.ledger is None:
             raise LayerCheckUnavailable("The B-Rep result and the layer removal do not agree.")
         return self._ledger_result()
+
+    def brep_tolerance(self, removed: float, clean_mm3: float = 0.0) -> float:
+        """The largest volume difference (mm³) between the chained B-Rep and the layer removal from known model errors.
+
+        * Layer midpoints and polygon chords of the cutter arcs: 0.5 % of the removed volume (at least 0.001 mm³).
+        * Mesh chords: the layers cut a mesh whose chords are at most ``MESH_DEFLECTION_MM`` from the true faces. The
+          exact removed region can differ from the layer region only in that band along the outline of each removed
+          layer region: deflection x outline length x layer height.
+        * Prism outline cleaning (``prism_clean_mm``): the area between the raw and the cleaned outline of each level,
+          over the material height above the level.
+        A failed Boolean that keeps or removes a full cut (or a large part of it) is far outside these limits."""
+        base = max(1e-3, 0.005 * max(removed, 0.0))
+        mesh = L.MESH_DEFLECTION_MM * sum(L.perimeter(region) * (high - low)
+                                          for rows in self.removed for low, high, region in rows)
+        self.brep_check = {"layer_removed_mm3": removed, "base_mm3": base, "mesh_chord_mm3": mesh,
+                           "outline_clean_mm3": clean_mm3, "tolerance_mm3": base + mesh + clean_mm3}
+        return base + mesh + clean_mm3
 
     def _ledger_result(self):
         # The incoming B-Rep cannot take this cut (for example coincident walls of two cutter sweeps). The layers

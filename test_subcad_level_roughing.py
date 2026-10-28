@@ -175,3 +175,59 @@ def test_spanner_flats_under_a_cone_are_roughed():
     operation = roughed.process_plan()["operations"][-1]
     assert operation["operation"] == "level_rough"
     assert operation["removed_volume_mm3"] > 0.9 * waste
+
+
+IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+
+
+def _round_bar_flats(diameter):
+    """A round bar (60 mm long, axis Z) and the part: two flats 8 mm across and 5 mm long at the top end."""
+    stock = Stock.round_bar(60, diameter, "steel_1018", axis="Z")
+    bottom = stock._shape.val().BoundingBox().zmin
+    part = cq.Workplane("XY").circle(diameter / 2).extrude(60).translate((0, 0, bottom))
+    for side in (1, -1):
+        part = part.cut(cq.Workplane("XY").box(diameter, diameter, 5, centered=(True, True, False))
+                        .translate((side * (4 + diameter / 2), 0, bottom + 55)))
+    return stock, part.val()
+
+
+def _compare(roughed, part, tmp_path):
+    from src.subcad import compare_nominal_solids
+    path = tmp_path / "part.step"
+    cq.exporters.export(cq.Workplane().add(part), str(path))
+    return compare_nominal_solids(roughed, path, target_to_part_matrix=IDENTITY)
+
+
+@pytest.mark.parametrize("diameter", [10.0, 20.0])
+def test_flats_on_round_stock_keep_the_exact_brep(monkeypatch, tmp_path, diameter):
+    # d2o#1334: the 10 µm outline cleaning of the prisms and the mesh chords of the round stock made the exact B-Rep
+    # differ from the layer removal by more than 0.5 %. SubCAD took the layer prisms (many solids) and the nominal
+    # comparison refused the result. The check now allows the known errors of the two models.
+    from src.subcad import milling_layers
+    monkeypatch.setattr(milling_layers, "PLAYER_BREP_STATES", False)
+    stock, part = _round_bar_flats(diameter)
+    roughed = stock.rough_levels(part, face_selector=">Z")
+    last = roughed.process_plan()["operations"][-1]["material_passes"][-1]
+    assert last["material_brep"] == "chained_brep"
+    check = last["material_brep_check"]
+    assert 0 < check["brep_difference_mm3"] <= check["tolerance_mm3"]
+    # The tolerance stays far below one flat: a Boolean that misses a cut is still refused.
+    assert check["tolerance_mm3"] < 0.05 * check["layer_removed_mm3"]
+    assert len(roughed._shape.val().Solids()) == 1
+    removed = stock._shape.val().Volume() - roughed._shape.val().Volume()
+    assert removed == pytest.approx(check["layer_removed_mm3"], abs=check["tolerance_mm3"])
+    comparison = _compare(roughed, part, tmp_path)
+    assert comparison.report["missing_material_mm3"] < 1e-3
+
+
+def test_a_boolean_that_removes_nothing_falls_back_with_a_clear_comparison_error(monkeypatch, tmp_path):
+    from src.subcad import milling_layers, milling_replay
+    monkeypatch.setattr(milling_layers, "PLAYER_BREP_STATES", False)
+    stock, part = _round_bar_flats(10.0)
+    monkeypatch.setattr(milling_replay, "_boolean", lambda shape, tools, operation: shape)
+    roughed = stock.rough_levels(part, face_selector=">Z")
+    last = roughed.process_plan()["operations"][-1]["material_passes"][-1]
+    assert last["material_brep"] == "layer_prisms"
+    assert last["material_brep_check"]["brep_difference_mm3"] > last["material_brep_check"]["tolerance_mm3"]
+    with pytest.raises(ValueError, match="layer model of a milling operation"):
+        _compare(roughed, part, tmp_path)

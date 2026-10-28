@@ -18,11 +18,16 @@ def _solid(source, name):
     import cadquery as cq
     source = getattr(source, "native", source)
     source = getattr(source, "_shape", source)
+    from .material_ledger import MaterialLedger
+    layer_solid = MaterialLedger.layer_brep(source)
     source = source.val() if hasattr(source, "val") else source
     if not isinstance(source, cq.Shape):
         raise ValueError(f"The {name} does not contain valid native geometry.")
     # Count the solids first: the check of a large compound (a layer solid, material_ledger.py) is slow.
     solids = source.Solids()
+    if len(solids) != 1 and layer_solid:
+        raise ValueError(f"The {name} is the layer model of a milling operation ({len(solids)} stacked layer prisms): "
+                         "the B-Rep Boolean of the cut failed. The nominal comparison requires one exact solid.")
     if len(solids) != 1:
         raise ValueError(f"The {name} requires one closed part solid. It contains {len(solids)} solids.")
     if not source.isValid():

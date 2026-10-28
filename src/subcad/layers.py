@@ -121,6 +121,21 @@ def area(paths: Paths) -> float:
     return sum(pyclipper.Area(path) for path in paths) / (SCALE * SCALE)
 
 
+def perimeter(paths: Paths) -> float:
+    """Total outline length of the loops in mm (holes included)."""
+    total = 0.0
+    for path in paths:
+        points = np.asarray(path, float)
+        if len(points) >= 2:
+            total += float(np.linalg.norm(points - np.roll(points, 1, axis=0), axis=1).sum())
+    return total / SCALE
+
+
+def xor(first: Paths, second: Paths) -> Paths:
+    """The region that is in one of the two regions only."""
+    return union(difference(first, second), difference(second, first))
+
+
 def bounds(paths: Paths):
     if not paths:
         return None
