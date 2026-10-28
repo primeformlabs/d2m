@@ -185,7 +185,7 @@ class Stock:
                 return self
         from .level_roughing import roughing_layers
         # One mesh and one set of sections for every cutter of this roughing.
-        layers = roughing_layers(self._shape.val(), part_shape, face, reach=reach or tool.flute_length)
+        layers = roughing_layers(self._shape, part_shape, face, reach=reach or tool.flute_length)
         probe = getattr(selection, "probe", None)
         op = LevelRoughOp(part_shape=part_shape, keep=tuple(keep or ()), reach=reach, stepdown=stepdown, tool=tool,
                           tool_selection=selection, layers=layers,

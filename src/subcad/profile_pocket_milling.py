@@ -83,6 +83,13 @@ def _path(points, z, safe, tool, feed, rpm, role, kind):
     return path
 
 
+def _paths_at_level(paths, z):
+    """Reuse the clipped XY paths at another cutting level, with the same safe-plane moves."""
+    return [replace(path, metadata=dict(path.metadata), moves=[
+        replace(move, position=(*move.position[:2], z)) if move.move_type in {"plunge", "feed"} else replace(move)
+        for move in path.moves]) for path in paths]
+
+
 def _replay_raster(shape, path, tool):
     """The entry and horizontal line share one exact flat-cutter capsule."""
     cutting = [move for move in path.moves if move.move_type in {"plunge", "feed"}]
@@ -479,11 +486,14 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
     safe = bounds.zmax + max(2, tool.radius)
     paths = []
     floor_allowance = min(allowance, stepdown, (depth - start) / 2)
+    # The roughing region, offsets and clipped XY segments are the same at every depth.
+    # Clip once; only the plunge and feed heights change between levels.
+    rough_paths = _clearing_paths(rough_center, outer, keep, z=0, safe=safe, tool=tool, feed=feed, rpm=rpm,
+                                 role="roughing", allowance=allowance, chord=chord)
     for level in range(1, count + 1):
         # Leave a floor allowance for the independently retained finish passes.
         z = bounds.zmax - start - min((depth - start) * level / count, depth - start - floor_allowance)
-        paths.extend(_clearing_paths(rough_center, outer, keep, z=z, safe=safe, tool=tool, feed=feed, rpm=rpm,
-            role="roughing", allowance=allowance, chord=chord))
+        paths.extend(_paths_at_level(rough_paths, z))
     paths.extend(_clearing_paths(center, outer, keep, z=bounds.zmax - depth, safe=safe, tool=tool, feed=feed, rpm=rpm,
         role="finishing", allowance=0, chord=chord))
     if not paths or len(paths) > (MAX_LEVEL_PATHS if layers else PER_PASS_PATHS):

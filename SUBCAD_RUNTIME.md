@@ -1,6 +1,11 @@
 # SubCAD runtime package
 
 SubCAD is the geometry and operation simulation engine for D2O process cards.
+
+Version 0.2.30 keeps the incoming material ledger through level-roughing tool selection, layer planning, and
+replay. Its setup layers use the ledger sections and their height limits. The display B-Rep supplies no material
+sections when a ledger is available. This preserves the cuts of earlier setups when the display mesh has touching
+faces or cannot produce closed section loops.
 The `d2o-subcad` package contains SubCAD, its simulation modules, and its manufacturing material rules.
 It excludes training code, model files, generated data, and web applications.
 

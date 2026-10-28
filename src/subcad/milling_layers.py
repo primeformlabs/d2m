@@ -147,6 +147,8 @@ class LayerReplay:
         A level sweep reaches up to the flute top, so a higher level adds only the part of its region that no
         deeper level covers (2D difference). Most operations need one or two Booleans."""
         from .milling_replay import _boolean
+        if self.layer_brep and self.ledger is not None and self.sweeps_by_level:
+            return self._ledger_result()
         top = self.z_top + 1.0
         radius = self.tool.radius
         levels = []
@@ -185,6 +187,9 @@ class LayerReplay:
                 return result
         if self.ledger is None:
             raise LayerCheckUnavailable("The B-Rep result and the layer removal do not agree.")
+        return self._ledger_result()
+
+    def _ledger_result(self):
         # The incoming B-Rep cannot take this cut (for example coincident walls of two cutter sweeps). The layers
         # are the material; the B-Rep comes from the ledger (material_ledger.MaterialLedger.solid).
         try:

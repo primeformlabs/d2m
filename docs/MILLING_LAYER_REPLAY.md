@@ -51,6 +51,11 @@ gets its layers from the ledger and is ready.
 
 ## Material result
 
+Profile pocket and outside profile planning clip the roughing paths once in the XY plane.
+Each depth uses the same paths with its cutting height.
+The rapid and retract moves keep the same safe height.
+The finishing pass keeps its separate clipping and allowance.
+
 The next operation and the display need a B-Rep. The operation result is the incoming solid less one
 prism for each cutting level. A level prism holds only the part of its sweep region that no deeper level
 covers. Most operations need one or two Booleans. The old replay needed one Boolean for each pass
@@ -65,6 +70,8 @@ If the Booleans fail or do not agree, the layers stay the result and the B-Rep c
 with the 2 µm outline of the player. The last pass report has `material_brep`: `chained_brep` or
 `layer_prisms`. A later layer operation on a layer B-Rep makes its result from the ledger at once.
 The layer B-Rep is a compound of stacked prisms: the nominal comparison (one solid) cannot use it.
+When the result uses ledger prisms, the replay makes them before it calculates cutter arcs for display Booleans.
+Those arcs are unnecessary for the ledger solid.
 If the layers cannot be made (an open mesh of a new ledger base), the operation uses the B-Rep replay.
 
 ## Operation player states
@@ -75,6 +82,11 @@ their middle layer. The outline tolerance of these display prisms is 2 µm.
 These states are for the player only. The checks do not use them.
 
 ## Accuracy
+
+The layer sampling budget can make slope layers thicker.
+Required mesh and cut heights remain separate intervals, even when their count exceeds the sampling budget.
+The slope loop uses that minimum interval count as its lower bound.
+Thus, many required heights cannot cause an infinite sampling loop.
 
 * A polygon chord is at most 0.25 µm inside its arc. The removed volume of a pass can differ from
   the exact sweep by at most 0.25 µm times the arc part of its boundary area.

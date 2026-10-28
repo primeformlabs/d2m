@@ -309,7 +309,7 @@ def _divide(first: float, second: float, low, high, rate, chord: float) -> list[
 
 def setup_layers(stock_mesh: L.SolidMesh, part_mesh: L.SolidMesh, setup, chord: float = CHORD_MM,
                  extra_meshes: Sequence = (), reach_depths: Sequence = (), divide_depth: float | None = None,
-                 divide_ranges: Sequence | None = None) -> SetupLayers:
+                 divide_ranges: Sequence | None = None, stock_material: L.LayeredMaterial | None = None) -> SetupLayers:
     """The 2D layers of the stock and the part in the setup frame.
 
     ``extra_meshes``: more solids whose faces add layer limits (a comparison with another material state).
@@ -317,7 +317,9 @@ def setup_layers(stock_mesh: L.SolidMesh, part_mesh: L.SolidMesh, setup, chord: 
     ``divide_depth``: divide the sloped intervals only down to this depth below the setup face (the deepest cutter
     reach). Deeper, no cutter of the setup cuts, and the layers of the planar faces are enough.
     ``divide_ranges``: (low, high) height ranges of the setup frame where the sloped intervals are divided (the reach
-    of every setup of a combination, seen from the reference setup); it replaces ``divide_depth``."""
+    of every setup of a combination, seen from the reference setup); it replaces ``divide_depth``.
+    ``stock_material``: incoming ledger layers in this setup. Their boundaries add layer limits and their sections
+    replace the stock mesh sections; the stock mesh then supplies only the original stock bounds."""
     setup = Setup.of(setup)
     stock, part = rotated_mesh(stock_mesh, setup), rotated_mesh(part_mesh, setup)
     extra = [rotated_mesh(mesh, setup) for mesh in extra_meshes]
@@ -325,6 +327,9 @@ def setup_layers(stock_mesh: L.SolidMesh, part_mesh: L.SolidMesh, setup, chord: 
     face = min(float(part.vertices[:, 2].max()), z_high)
     planar = [z for z in np.concatenate([_horizontal_heights(mesh) for mesh in (stock, part, *extra)]) if z_low < z < z_high]
     planar += [face - depth for depth in reach_depths if z_low < face - depth < z_high]
+    if stock_material is not None:
+        planar += [height for layer in stock_material.layers for height in (layer.z_low, layer.z_high)
+                   if z_low < height < z_high]
     base = L._merged([z_low, z_high, *planar])
     rates = [np.concatenate(values) for values in zip(*[_slope_rates(mesh, chord) for mesh in (stock, part, *extra)])]
     if divide_ranges is None:
@@ -363,10 +368,17 @@ def setup_layers(stock_mesh: L.SolidMesh, part_mesh: L.SolidMesh, setup, chord: 
     # Below the deepest reach no cutter of the setup works: those layers need only their middle sections (for the
     # material and the setup combination), no edge sections and no shadow.
     deep = face - max(reach_depths) if reach_depths else -math.inf
+    stock_index = 0
     for a, b in zip(limits, limits[1:]):
         middle = (a + b) / 2
         edge = min(1e-6, (b - a) / 4)
-        result.stock.append(_section(stock, middle, b - a))
+        if stock_material is None:
+            result.stock.append(_section(stock, middle, b - a))
+        else:
+            while stock_index < len(stock_material.layers) and stock_material.layers[stock_index].z_high <= middle:
+                stock_index += 1
+            layer = stock_material.layers[stock_index] if stock_index < len(stock_material.layers) else None
+            result.stock.append(layer.material if layer is not None and layer.z_low <= middle else [])
         mid = _section(part, middle, b - a)
         if b <= deep + L.Z_MERGE_MM:
             low = high = band = mid

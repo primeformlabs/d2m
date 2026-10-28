@@ -1,6 +1,6 @@
 # Level roughing
 
-Version 0.2.28. Module `src/subcad/level_roughing.py`, operation `LevelRoughOp`, method `Stock.rough_levels`.
+Version 0.2.30. Module `src/subcad/level_roughing.py`, operation `LevelRoughOp`, method `Stock.rough_levels`.
 
 ## Why
 
@@ -25,12 +25,23 @@ For one setup (one fixed tool axis) and a flat end mill of radius r:
 - The shadow grows downward. So the region at the bottom of a band (two planar heights) is safe for the whole band.
   Two bands with the same region become one band.
 
+The incoming material comes from the material ledger throughout tool selection and replay.
+The ledger supplies the stock sections and their height limits, including cuts from other setups.
+The target part still supplies its own sections.
+The silhouette combines filled outer outlines once for each change of outline.
+Repeated sections from earlier cuts do not enter one large polygon union.
+
 ## Passes
 
 At each stepdown level of each band, from the band top to its floor: a raster of the free cutter centres (stepover
 0.4 × diameter, or the tool's `max_stepover_mm`), then the outline of the centres. The stepdown is the tool's
 `max_stepdown_mm`, else its flute length. The layer replay (`milling_layers.LayerReplay`) removes the material,
 writes the material ledger and makes the B-Rep result and the player states, as for a profile pocket.
+
+In a layer-player preview, roughing after cuts from another setup makes its display solid directly from the ledger.
+It does not calculate display Booleans or cutter arcs for that solid.
+The material checks still use the ledger layers.
+Program mode and the default B-Rep player keep their existing result path.
 
 ## Tool
 
