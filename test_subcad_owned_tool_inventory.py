@@ -161,3 +161,30 @@ def test_duplicate_inventory_ids_fail_before_selection():
     with pytest.raises(ValueError, match="distinct catalog IDs"):
         with tool_inventory([cutter(), cutter()]):
             pass
+
+
+def chamfer(key, diameter, angle=90.0, tip=0.0):
+    return ToolSpec("chamfer", diameter, catalog_id=key, flute_length=8, stickout_mm=30, reach_mm=8,
+        tip_angle=angle, tip_diameter=tip, inventory_count=1)
+
+
+def test_a_countersink_takes_its_chamfer_tool_from_the_owned_inventory():
+    # d2o#1311: the countersink took the catalogue CH_6mm_90deg, which a strict snapshot refuses.
+    owned = [chamfer("small", 6), chamfer("owned-12", 12), chamfer("wrong-angle", 16, angle=60), chamfer("big-tip", 20, tip=8)]
+    with tool_inventory(owned, revision="owned"):
+        result = Stock.rectangular(40, 40, 10).countersink(5, 10, depth=2, countersink_angle=90, cx=5, cy=5)
+    operation = result.process_plan()["operations"][-1]
+    assert operation["operation"] == "countersink"
+    assert operation["tool"]["catalog_id"] == "owned-12"
+
+
+def test_a_countersink_with_no_fitting_chamfer_tool_names_the_missing_tool():
+    with tool_inventory([chamfer("small", 6), chamfer("wrong-angle", 16, angle=60)], revision="owned"):
+        with pytest.raises(ToolUnavailableError, match="No available chamfer satisfies diameter 10.*at 90 degrees"):
+            Stock.rectangular(40, 40, 10).countersink(5, 10, depth=2, countersink_angle=90)
+
+
+def test_a_chamfer_tool_with_no_recorded_angle_is_assumed_to_fit():
+    with tool_inventory([chamfer("no-angle", 12, angle=0)], revision="owned"):
+        result = Stock.rectangular(40, 40, 10).countersink(5, 10, depth=2, countersink_angle=82)
+    assert result.process_plan()["operations"][-1]["tool"]["catalog_id"] == "no-angle"

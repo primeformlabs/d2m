@@ -110,6 +110,10 @@ class ToolRequirement:
     alternative_tool_types: tuple[str, ...] = ()
     require_point_geometry: bool = False
     include_point_length_in_reach: bool = False
+    tip_angle_deg: Optional[float] = None
+    """The included angle that the tool tip must have (a countersink); a tool with no recorded angle is assumed to fit."""
+    max_tip_diameter_mm: Optional[float] = None
+    """The largest tip that fits (the hole under a countersink)."""
 
     @property
     def reach_mm(self) -> float:
@@ -132,6 +136,8 @@ class ToolRequirement:
             "alternative_tool_types": list(self.alternative_tool_types),
             "require_point_geometry": self.require_point_geometry,
             "include_point_length_in_reach": self.include_point_length_in_reach,
+            "tip_angle_deg": self.tip_angle_deg,
+            "max_tip_diameter_mm": self.max_tip_diameter_mm,
         }
 
 
@@ -194,6 +200,10 @@ def select_tool(requirement: ToolRequirement) -> ToolSelectionResult:
             reasons.append("diameter_too_large")
         if requirement.min_flute_length_mm and tool.flute_length < requirement.min_flute_length_mm:
             reasons.append("flute_length_too_short")
+        if requirement.tip_angle_deg is not None and tool.tip_angle > 0 and abs(tool.tip_angle - requirement.tip_angle_deg) > 0.5:
+            reasons.append("wrong_tip_angle")
+        if requirement.max_tip_diameter_mm is not None and tool.tip_diameter > requirement.max_tip_diameter_mm + 1e-9:
+            reasons.append("tip_too_large")
         needed_reach = requirement.reach_for(tool) if tool.tool_type in allowed_types else requirement.reach_mm
         if needed_reach and scope and scope.strict and tool_reach(tool) < needed_reach - 1e-9:
             reasons.append("reach_too_short")
@@ -244,6 +254,8 @@ def select_tool(requirement: ToolRequirement) -> ToolSelectionResult:
         message += f" and flute length {requirement.min_flute_length_mm:g} mm"
     if requirement.reach_mm > requirement.min_flute_length_mm + 1e-9:
         message += f" with reach {requirement.reach_mm:g} mm"
+    if requirement.tip_angle_deg is not None:
+        message += f" at {requirement.tip_angle_deg:g} degrees"
     result.errors.append(message)
     if requirement.require_point_geometry:
         result.errors.append("Reaming requires a recorded lead angle, a positive lead tip diameter, and complete lead reach." if requirement.tool_type == "reamer"
