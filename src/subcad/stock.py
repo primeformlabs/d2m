@@ -233,6 +233,22 @@ class Stock:
         return LocalReach(self._shape, face_selector, cx=cx, cy=cy, hole_radius=radius, depth=depth,
                           entry=start_depth, path=path)
 
+    def _pocket_wall(self, profile, face_selector: str, depth: float):
+        """(wall start, local reach) of a pocket from the incoming material (``feature_depth.pocket_wall_start``,
+        ``PocketLocalReach``); (None, None) without native geometry or a closed outline."""
+        if not _HAS_CADQUERY:
+            return None, None
+        from .feature_depth import PocketLocalReach, pocket_wall_start
+        from .profiles import normalize_profile_points
+        try:
+            points = normalize_profile_points(profile)
+            wall = pocket_wall_start(self._shape, face_selector, points, depth) if len(points) >= 3 else None
+        except (ValueError, TypeError):
+            return None, None
+        if wall is None:
+            return None, None
+        return wall, PocketLocalReach(self._shape, face_selector, points, depth=depth, wall=wall)
+
     def _feature_depths(self, face_selector: str, cx: float, cy: float, radius: float, depth: float,
                         through: bool) -> tuple[float, float]:
         """(start_depth, depth) of a round feature from the incoming material (``feature_depth``); a through
@@ -254,8 +270,9 @@ class Stock:
         tool = getattr(op, "tool", None)
         # The reach of the tool from the highest material near the feature (feature_depth.LocalReach).
         op.reach_depth = local(tool) if local is not None and tool is not None else getattr(op, "reach_depth", None)
-        validate_inventory_tool(tool, depth=depth if op.reach_depth is None else op.reach_depth,
-                                cut_length=depth - getattr(op, "start_depth", 0.0))
+        # A pocket wall can start lower than the material (``wall_start_depth``): the flutes cut from the higher one.
+        start = max(getattr(op, "start_depth", 0.0) or 0.0, getattr(op, "wall_start_depth", None) or 0.0)
+        validate_inventory_tool(tool, depth=depth if op.reach_depth is None else op.reach_depth, cut_length=depth - start)
         if getattr(op, "sequence_number", 0) == 0:
             op.sequence_number = self._next_op_number
 
@@ -1850,11 +1867,13 @@ class Stock:
         width, length = _profile_bounds_for_stock(profile)
         if through:
             depth = _profile_through_depth(self, face_selector)
+        wall, reach = self._pocket_wall(profile, face_selector, depth)
         return self._apply_op(ProfilePocketOp(
             profile=profile, islands=islands, width=width, length=length,
             depth=depth, through=through, face_selector=face_selector,
             tool=tool, material=self._material, stepdown=stepdown, finish_allowance=finish_allowance, chord_error=chord_error,
             max_tool_diameter=max_tool_diameter, rest_from_diameter=rest_from_diameter,
+            wall_start_depth=wall, local_reach=reach,
         ))
 
     def profile_cutout(self, profile, *, depth: Optional[float] = None,

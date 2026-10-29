@@ -2902,6 +2902,11 @@ class ProfilePocketOp(PocketOp):
     # whose left material this pass cuts (only near the corners that it could not reach).
     max_tool_diameter: Optional[float] = None
     rest_from_diameter: Optional[float] = None
+    # Where the pocket wall starts below the setup face (``feature_depth.pocket_wall_start``): the flutes cut only the
+    # wall below it. None: the wall starts at the setup face.
+    wall_start_depth: Optional[float] = None
+    local_reach: Any = field(default=None, repr=False, compare=False)
+    """The reach that a tool needs (``feature_depth.PocketLocalReach``); None: the depth from the setup face."""
 
     def __post_init__(self):
         from .milling_replay import finite
@@ -2915,7 +2920,8 @@ class ProfilePocketOp(PocketOp):
             if self.max_tool_diameter is not None:
                 maximum = min(maximum, finite(self.max_tool_diameter, "maximum cutter diameter", positive=True))
             self.tool, self.tool_selection = _select_inventory_tool(
-                ToolRequirement("flat_endmill", max_diameter_mm=maximum, min_flute_length_mm=self.depth,
+                ToolRequirement("flat_endmill", max_diameter_mm=maximum, min_flute_length_mm=self.depth - (self.wall_start_depth or 0.0),
+                    min_reach_mm=self.depth, local_reach=self.local_reach,
                     feature="profile_pocket", reason="selected cutter for the profile opening and island clearances", prefer_largest=True),
                 ToolSpec("flat_endmill", maximum))
         self.feeds_speeds = get_feeds_speeds(_resolve_fs_tool_type(self.tool.tool_type), self.tool.diameter, self.material)
@@ -2931,7 +2937,8 @@ class ProfilePocketOp(PocketOp):
             shape, self.profile, tool=self.tool, depth=self.depth, islands=self.islands, through=self.through,
             face_selector=self.face_selector, stepdown=self.stepdown, finish_allowance=self.finish_allowance,
             chord_error=self.chord_error, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds), outside=outside,
-            rest_from_diameter=self.rest_from_diameter)
+            rest_from_diameter=self.rest_from_diameter, wall_start_depth=self.wall_start_depth,
+            reach_depth=getattr(self, "reach_depth", None))
         self._pocket_toolpath.metadata.update(tool=_tool_dict(self.tool), tool_selection=_tool_selection_dict(self.tool_selection),
             width_mm=self.width, length_mm=self.length)
         return result

@@ -406,7 +406,7 @@ def _layer_pocket_replay(shape, local, plane, paths, aggregate, tool, bounds, de
 def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=False,
                        face_selector=">Z", stepdown=1, finish_allowance=0.1, chord_error=0.01,
                        feed=100, rpm=None, outside=False, rest_from_diameter=None, layers=True, start_depth=0.0,
-                       reach_depth=None):
+                       reach_depth=None, wall_start_depth=None):
     """Return material, actual toolpath, retained pass states and target comparison.
 
     ``rest_from_diameter``: rest machining. The passes cut only near the material that a previous flat end mill
@@ -414,7 +414,9 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
     ``layers``: replay the passes on 2.5D layers (``milling_layers.py``); False keeps the B-Rep replay
     (the loft operation compares its levels with the exact loft by B-Rep).
     ``start_depth``: where the material starts below the setup face (``feature_depth``): the depth passes start
-    there, the flutes cut the material height and the reach covers the full depth."""
+    there, the flutes cut the material height and the reach covers the full depth.
+    ``wall_start_depth``: where the pocket wall starts (``feature_depth.pocket_wall_start``): the flutes cut only the
+    wall below it."""
     import cadquery as cq
     if tool is None or tool.tool_type != "flat_endmill":
         raise ValueError("Native profile pocket replay requires a selected flat end mill.")
@@ -434,7 +436,8 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
         raise ValueError("The pocket depth exceeds the incoming material thickness along its cutter axis.")
     start = min(max(finite(start_depth, "profile pocket start depth"), 0.0), depth)
     # ``reach_depth``: the depth below the highest material near the cut (feature_depth.LocalReach).
-    validate_cutter(tool, cutting_depth=depth if reach_depth is None else min(reach_depth, depth), cut_length=depth - start)
+    wall = max(start, min(max(float(wall_start_depth or 0.0), 0.0), depth))
+    validate_cutter(tool, cutting_depth=depth if reach_depth is None else min(reach_depth, depth), cut_length=depth - wall)
     outer, sampled = _profile_wire(profile)
     keep = []
     for item in islands or []:
@@ -480,7 +483,8 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
             center, rough_center = rest, rest
     maximum = finite((tool.safe_limits or {}).get("max_stepdown_mm", tool.diameter / 2), "maximum pocket stepdown", positive=True)
     stepdown = min(stepdown, maximum, tool.diameter / 2)
-    count = max(1, math.ceil((depth - start) / stepdown))
+    # The tolerance keeps a rounding error of the depth (100.00000000000001 mm) from adding a pass.
+    count = max(1, math.ceil((depth - start) / stepdown - 1e-9))
     if count > 100:
         raise ValueError("The pocket exceeds the depth-pass limit. Divide the operation into smaller regions.")
     safe = bounds.zmax + max(2, tool.radius)
