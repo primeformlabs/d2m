@@ -483,7 +483,8 @@ def run_profile_pocket(shape, profile, *, tool, depth, islands=None, through=Fal
             center, rough_center = rest, rest
     maximum = finite((tool.safe_limits or {}).get("max_stepdown_mm", tool.diameter / 2), "maximum pocket stepdown", positive=True)
     stepdown = min(stepdown, maximum, tool.diameter / 2)
-    count = max(1, math.ceil((depth - start) / stepdown))
+    # The tolerance keeps a rounding error of the depth (100.00000000000001 mm) from adding a pass.
+    count = max(1, math.ceil((depth - start) / stepdown - 1e-9))
     if count > 100:
         raise ValueError("The pocket exceeds the depth-pass limit. Divide the operation into smaller regions.")
     safe = bounds.zmax + max(2, tool.radius)

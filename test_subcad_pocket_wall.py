@@ -88,3 +88,10 @@ def test_the_fit_skin_beside_a_long_kept_column_is_no_wall():
     assert hasattr(roughed._shape, ATTRIBUTE)
     points = [(-75, -10), (55, -10), (55, 10), (-75, 10)]
     assert pocket_wall_start(roughed._shape, ">Z", points, 60) == pytest.approx(30, abs=0.5)
+
+
+def test_a_rounding_error_of_the_depth_adds_no_pass():
+    # PT-002311: 100.00000000000001 mm at a 1 mm stepdown counted 101 passes, over the limit of 100.
+    with tool_inventory([_mill(10, 32, 40, "EM10")], revision="round", strict=True):
+        cut = Stock.rectangular(80, 60, 60).profile_pocket(OUTLINE, 10.000000000000002, stepdown=0.1, finish_allowance=0)
+    assert cut.process_plan()["operations"][-1]["tool"]["catalog_id"] == "EM10"
