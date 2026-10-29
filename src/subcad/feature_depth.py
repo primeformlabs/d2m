@@ -94,6 +94,9 @@ WALL_BAND_MM = 1.0
 # Material in the band counts from this area: 2 mm of wall in the 1 mm band. The rounded joins of the layer outlines
 # leave slivers of less than 1 mm² at the corners of a kept outline; they are not a wall.
 BAND_MIN_AREA_MM2 = 2.0
+# The band starts this far outside the outline (mm): level roughing stops its cutter a fit clearance (about 0.01 mm)
+# from a kept column, and along a long outline that skin has more area than BAND_MIN_AREA_MM2. It is not a wall.
+WALL_SKIN_MM = 0.1
 
 
 def _offset_rings(points, distance: float) -> list[list[tuple[float, float]]]:
@@ -111,7 +114,7 @@ def _ring_area(ring) -> float:
 
 def band_span(shape, face_selector: str, points, *, width: float) -> tuple[float, float] | None:
     """(entry, far) depths below the setup face of the incoming material in the band ``width`` wide outside the closed
-    outline ``points`` (setup frame); None when the band has no material."""
+    outline ``points`` (setup frame), from ``WALL_SKIN_MM`` outside it; None when the band has no material."""
     import cadquery as cq
     from .milling_replay import _boolean, finite
     from .profile_milling import _setup_plane
@@ -125,7 +128,8 @@ def band_span(shape, face_selector: str, points, *, width: float) -> tuple[float
     if len(outline) < 3 or not rings:
         return None
     outer = max(rings, key=_ring_area)
-    ledgered = _ledger_band_span(shape, plane, bounds, outer, outline)
+    inner = max(_offset_rings(outline, WALL_SKIN_MM), key=_ring_area, default=outline) if width > WALL_SKIN_MM else outline
+    ledgered = _ledger_band_span(shape, plane, bounds, outer, inner)
     if ledgered is not False:
         return ledgered
     base = bounds.zmin - 1.0
@@ -133,7 +137,7 @@ def band_span(shape, face_selector: str, points, *, width: float) -> tuple[float
     def wire(ring):
         return cq.Wire.makePolygon([cq.Vector(x, y, base) for x, y in ring], close=True)
     try:
-        face = cq.Face.makeFromWires(wire(outer), [wire(list(reversed(outline)))])
+        face = cq.Face.makeFromWires(wire(outer), [wire(list(reversed(inner)))])
         probe = cq.Solid.extrudeLinear(face, cq.Vector(0, 0, bounds.zlen + 2.0))
         common = _boolean(local, [probe], "common")
     except (ValueError, RuntimeError):
@@ -145,7 +149,7 @@ def band_span(shape, face_selector: str, points, *, width: float) -> tuple[float
     return bounds.zmax - top, bounds.zmax - bottom
 
 
-def _ledger_band_span(shape, plane, bounds, outer, outline):
+def _ledger_band_span(shape, plane, bounds, outer, inner):
     """``band_span`` from the material ledger of the workplane (``material_ledger.py``): the layers of the setup frame
     that meet the band. After level roughing the B-Rep is the layer solid of the ledger, and a Boolean on it can fail
     or be slow. False: the workplane has no ledger (the Boolean probe decides)."""
@@ -158,7 +162,7 @@ def _ledger_band_span(shape, plane, bounds, outer, outline):
         material = ledger.layered(plane_frame(plane), bounds.zmin, bounds.zmax)
     except ValueError:
         return False
-    band = L.difference(L.to_paths([outer]), L.to_paths([outline]))
+    band = L.difference(L.to_paths([outer]), L.to_paths([inner]))
     hits = [layer for layer in material.layers if L.area(L.intersection(layer.material, band)) >= BAND_MIN_AREA_MM2]
     if not hits:
         return None

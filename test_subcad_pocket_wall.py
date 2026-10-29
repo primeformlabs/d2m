@@ -73,3 +73,18 @@ def test_after_level_roughing_the_wall_comes_from_the_material_ledger():
     # The assumed 50 mm holder passes over the bar: the reach is the full 60 mm, which the 40 mm tool does not have.
     with tool_inventory([_mill(10, 32, 40, "EM10W")], revision="wide", strict=True), pytest.raises(ToolUnavailableError):
         roughed.profile_pocket(OUTLINE, 60, through=True, finish_allowance=0)
+
+
+def test_the_fit_skin_beside_a_long_kept_column_is_no_wall():
+    # Level roughing stops its cutter a fit clearance (about 0.01 mm) from a kept column. Along a long outline that
+    # skin has more area than the corner slivers (PT-002311: 100 and 120 mm pockets); it is not a wall.
+    from src.subcad.material_ledger import ATTRIBUTE
+    outline = {"type": "rectangle", "length": 130, "width": 20, "cx": -10, "cy": 0}
+    web = (cq.Workplane("XY").box(200, 60, 30).translate((0, 0, -15))
+           .union(cq.Workplane("XY").box(15, 60, 30).translate((92.5, 0, 15)))
+           .cut(cq.Workplane("XY").box(130, 20, 30).translate((-10, 0, -15))).val())
+    with tool_inventory([_mill(12, 40, 50, "EM12")], revision="long", strict=True):
+        roughed = Stock.rectangular(200, 60, 60).rough_levels(web, face_selector=">Z", keep=[outline])
+    assert hasattr(roughed._shape, ATTRIBUTE)
+    points = [(-75, -10), (55, -10), (55, 10), (-75, 10)]
+    assert pocket_wall_start(roughed._shape, ">Z", points, 60) == pytest.approx(30, abs=0.5)
