@@ -91,6 +91,9 @@ class LocalReach:
 
 # A pocket wall is the material just outside the pocket outline: its top is where the flutes start to cut a wall.
 WALL_BAND_MM = 1.0
+# Material in the band counts from this area: 2 mm of wall in the 1 mm band. The rounded joins of the layer outlines
+# leave slivers of less than 1 mm² at the corners of a kept outline; they are not a wall.
+BAND_MIN_AREA_MM2 = 2.0
 
 
 def _offset_rings(points, distance: float) -> list[list[tuple[float, float]]]:
@@ -122,6 +125,9 @@ def band_span(shape, face_selector: str, points, *, width: float) -> tuple[float
     if len(outline) < 3 or not rings:
         return None
     outer = max(rings, key=_ring_area)
+    ledgered = _ledger_band_span(shape, plane, bounds, outer, outline)
+    if ledgered is not False:
+        return ledgered
     base = bounds.zmin - 1.0
 
     def wire(ring):
@@ -137,6 +143,27 @@ def band_span(shape, face_selector: str, points, *, width: float) -> tuple[float
     column = common.BoundingBox()
     top, bottom = min(column.zmax, bounds.zmax), max(column.zmin, bounds.zmin)
     return bounds.zmax - top, bounds.zmax - bottom
+
+
+def _ledger_band_span(shape, plane, bounds, outer, outline):
+    """``band_span`` from the material ledger of the workplane (``material_ledger.py``): the layers of the setup frame
+    that meet the band. After level roughing the B-Rep is the layer solid of the ledger, and a Boolean on it can fail
+    or be slow. False: the workplane has no ledger (the Boolean probe decides)."""
+    from . import layers as L
+    from .material_ledger import ATTRIBUTE, MaterialLedger, plane_frame
+    ledger = getattr(shape, ATTRIBUTE, None)
+    if not isinstance(ledger, MaterialLedger):
+        return False
+    try:
+        material = ledger.layered(plane_frame(plane), bounds.zmin, bounds.zmax)
+    except ValueError:
+        return False
+    band = L.difference(L.to_paths([outer]), L.to_paths([outline]))
+    hits = [layer for layer in material.layers if L.area(L.intersection(layer.material, band)) >= BAND_MIN_AREA_MM2]
+    if not hits:
+        return None
+    top, bottom = max(layer.z_high for layer in hits), min(layer.z_low for layer in hits)
+    return bounds.zmax - min(top, bounds.zmax), bounds.zmax - max(bottom, bounds.zmin)
 
 
 def pocket_wall_start(shape, face_selector: str, points, depth: float) -> float | None:
