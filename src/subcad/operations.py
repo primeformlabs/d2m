@@ -2064,12 +2064,25 @@ class CountersinkOp(MachiningOperation):
     # ------------------------------------------------------------------
 
     def apply(self, shape):
+        # The setup plane and the top of the material around the hole: the toolpath is in the part frame (d2o#878).
+        from .feature_depth import material_span
+        from .profile_milling import _setup_plane
+        plane, mirror = _setup_plane(self.face_selector)
+        bounds = plane.toLocalCoords(shape.val()).BoundingBox()
+        span = material_span(shape, self.face_selector, cx=self.cx, cy=self.cy, radius=self.countersink_diameter / 2)
+        self._frame = (plane, mirror, bounds.zmax, bounds.zmax - (span[0] if span else 0.0))
         return countersink_cut(
             shape, self.cx, self.cy, self.diameter,
             self.countersink_diameter, self.depth,
             self.countersink_angle,
             face_selector=self.face_selector,
         )
+
+    def tip_depth(self) -> float:
+        """How deep the chamfer tip goes below the material top: its cone is the countersink diameter at the top."""
+        angle = self.tool.tip_angle if self.tool.tip_angle > 0 else self.countersink_angle
+        tip = min(self.tool.tip_diameter or 0.0, self.countersink_diameter)
+        return max((self.countersink_diameter - tip) / 2.0 / math.tan(math.radians(max(angle, 1.0) / 2.0)), 0.0)
 
     def to_dict(self) -> dict:
         return {
@@ -2103,6 +2116,25 @@ class CountersinkOp(MachiningOperation):
             },
         )
         feed = _feed_rate(self.feeds_speeds)
+        if getattr(self, "_frame", None) is not None:
+            # In the part frame (d2o#878): from the safe height of the setup down to the tip depth below the material
+            # top around the hole, as the drilling paths (drilling_replay).
+            from dataclasses import replace
+            plane, mirror, face, top = self._frame
+            safe = face + max(2.0, self.tool.radius)
+            tip = top - self.tip_depth()
+            local = Toolpath("countersink", safe_z=safe, tool_type=self.tool.tool_type, tool_diameter_mm=self.tool.diameter,
+                             feed_mm_min=feed, spindle_rpm=tp.spindle_rpm)
+            _move(local, "rapid", self.cx, self.cy * mirror, safe)
+            _move(local, "plunge", self.cx, self.cy * mirror, tip, feed=feed)
+            _move(local, "dwell", self.cx, self.cy * mirror, tip, dwell_seconds=0.2)
+            _move(local, "retract", self.cx, self.cy * mirror, safe)
+            tp.safe_z = safe
+            tp.moves = [replace(move, position=plane.toWorldCoords(move.position).toTuple()) for move in local.moves]
+            tp.metadata.update(coordinate_system="part_mm", tool_axis=list(plane.zDir.toTuple()),
+                               face_selector=self.face_selector, tip_depth_mm=round(self.tip_depth(), 6),
+                               material_top_mm=round(top, 6))
+            return tp
         _move(tp, "rapid", self.cx, self.cy, tp.safe_z)
         _move(tp, "plunge", self.cx, self.cy, -abs(sink_depth), feed=feed)
         _move(tp, "dwell", self.cx, self.cy, -abs(sink_depth), dwell_seconds=0.2)

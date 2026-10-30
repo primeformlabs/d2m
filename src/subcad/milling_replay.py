@@ -71,8 +71,9 @@ def validate_cutter(tool, *, cutting_depth: float, cut_length: float | None = No
     reach = finite(tool.reach_mm or flute, "cutter reach", positive=True)
     if tool.tool_type == "ball_endmill" and flute < diameter:
         raise ValueError("The ball end mill requires a flute length at least equal to its diameter.")
+    from .tool_selection import FLUTE_TOLERANCE_MM
     cut = cutting_depth if cut_length is None else cut_length
-    if cut > flute + 1e-8 or cutting_depth > min(projection, reach) + 1e-8:
+    if cut > flute + FLUTE_TOLERANCE_MM or cutting_depth > min(projection, reach) + 1e-8:
         raise ValueError("The selected cutter cannot reach the required surface depth.")
 
 
