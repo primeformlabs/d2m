@@ -82,3 +82,14 @@ def test_a_pocket_under_the_same_opening_of_an_upper_flange_cuts_only_its_own_wa
     assert pocket_wall_start(block, ">Z", points, 60) == pytest.approx(48, abs=1e-6)
     # A full block: the wall starts at the top.
     assert pocket_wall_start(cq.Workplane("XY").box(80, 60, 60), ">Z", points, 60) == pytest.approx(0, abs=1e-6)
+
+
+def test_air_beside_the_pocket_between_two_flanges_is_no_wall():
+    # Level roughing cleared the waste between the flanges round the opening (Z -18 to 18): only the lower flange
+    # beside the outline is a wall of the second pocket.
+    from src.subcad.feature_depth import pocket_wall_start
+    block = (cq.Workplane("XY").box(80, 60, 60)
+             .cut(cq.Workplane("XY").box(50, 40, 36))
+             .cut(cq.Workplane("XY").box(30, 20, 12).translate((0, 0, 24))))
+    points = [(-15, -10), (15, -10), (15, 10), (-15, 10)]
+    assert pocket_wall_start(block, ">Z", points, 60) == pytest.approx(48, abs=1e-6)

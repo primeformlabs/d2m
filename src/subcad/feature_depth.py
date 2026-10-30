@@ -112,9 +112,10 @@ def _ring_area(ring) -> float:
     return abs(sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in zip(ring, ring[1:] + ring[:1]))) / 2
 
 
-def band_span(shape, face_selector: str, points, *, width: float) -> tuple[float, float] | None:
+def band_span(shape, face_selector: str, points, *, width: float, below: float = 0.0) -> tuple[float, float] | None:
     """(entry, far) depths below the setup face of the incoming material in the band ``width`` wide outside the closed
-    outline ``points`` (setup frame), from ``WALL_SKIN_MM`` outside it; None when the band has no material."""
+    outline ``points`` (setup frame), from ``WALL_SKIN_MM`` outside it, at ``below`` mm or deeper; None when the band
+    has no material there."""
     import cadquery as cq
     from .milling_replay import _boolean, finite
     from .profile_milling import _setup_plane
@@ -129,7 +130,7 @@ def band_span(shape, face_selector: str, points, *, width: float) -> tuple[float
         return None
     outer = max(rings, key=_ring_area)
     inner = max(_offset_rings(outline, WALL_SKIN_MM), key=_ring_area, default=outline) if width > WALL_SKIN_MM else outline
-    ledgered = _ledger_band_span(shape, plane, bounds, outer, inner)
+    ledgered = _ledger_band_span(shape, plane, bounds, outer, inner, below)
     if ledgered is not False:
         return ledgered
     base = bounds.zmin - 1.0
@@ -138,7 +139,10 @@ def band_span(shape, face_selector: str, points, *, width: float) -> tuple[float
         return cq.Wire.makePolygon([cq.Vector(x, y, base) for x, y in ring], close=True)
     try:
         face = cq.Face.makeFromWires(wire(outer), [wire(list(reversed(inner)))])
-        probe = cq.Solid.extrudeLinear(face, cq.Vector(0, 0, bounds.zlen + 2.0))
+        height = bounds.zmax - below - base
+        if height <= 1e-6:
+            return None
+        probe = cq.Solid.extrudeLinear(face, cq.Vector(0, 0, height))
         common = _boolean(local, [probe], "common")
     except (ValueError, RuntimeError):
         return None
@@ -149,7 +153,7 @@ def band_span(shape, face_selector: str, points, *, width: float) -> tuple[float
     return bounds.zmax - top, bounds.zmax - bottom
 
 
-def _ledger_band_span(shape, plane, bounds, outer, inner):
+def _ledger_band_span(shape, plane, bounds, outer, inner, below: float = 0.0):
     """``band_span`` from the material ledger of the workplane (``material_ledger.py``): the layers of the setup frame
     that meet the band. After level roughing the B-Rep is the layer solid of the ledger, and a Boolean on it can fail
     or be slow. False: the workplane has no ledger (the Boolean probe decides)."""
@@ -163,10 +167,12 @@ def _ledger_band_span(shape, plane, bounds, outer, inner):
     except ValueError:
         return False
     band = L.difference(L.to_paths([outer]), L.to_paths([inner]))
-    hits = [layer for layer in material.layers if L.area(L.intersection(layer.material, band)) >= BAND_MIN_AREA_MM2]
+    limit = bounds.zmax - below
+    hits = [layer for layer in material.layers if layer.z_low < limit - 1e-6
+            and L.area(L.intersection(layer.material, band)) >= BAND_MIN_AREA_MM2]
     if not hits:
         return None
-    top, bottom = max(layer.z_high for layer in hits), min(layer.z_low for layer in hits)
+    top, bottom = min(max(layer.z_high for layer in hits), limit), min(layer.z_low for layer in hits)
     return bounds.zmax - min(top, bounds.zmax), bounds.zmax - max(bottom, bounds.zmin)
 
 
@@ -218,10 +224,12 @@ def pocket_wall_start(shape, face_selector: str, points, depth: float) -> float 
     nothing beside it (the waste over a part level that level roughing kept in the pocket column); above the column top
     it passes a finished wall of the same outline (the same through pocket in two flanges, d2o#878), so the flutes cut
     only the wall below the lower one. None: no material beside the outline, or no geometry."""
-    span = band_span(shape, face_selector, points, width=WALL_BAND_MM)
+    column = column_span(shape, face_selector, points)
+    # Beside the cut (from the column top down) only: band material above the column top is a finished wall of the
+    # same outline, and air beside the column (waste that level roughing cleared around it) is no wall.
+    span = band_span(shape, face_selector, points, width=WALL_BAND_MM, below=column[0] if column else 0.0)
     if span is None:
         return None
-    column = column_span(shape, face_selector, points)
     return min(span[0] if column is None else max(span[0], column[0]), depth)
 
 
