@@ -60,3 +60,25 @@ def test_an_insert_cutter_cuts_the_outside_wall_to_size_at_each_level():
         levels[round(z, 4)] = min(levels.get(round(z, 4), math.inf), gap)
     assert len(levels) >= 3
     assert all(value == pytest.approx(6.0, abs=1e-6) for value in levels.values())
+
+
+def test_the_outside_profile_of_a_narrow_part_takes_a_wide_cutter():
+    # An 18 mm wide part: the cutter goes outside the outline, so a Ø20 end mill fits (PT-002402).
+    mill = ToolSpec("flat_endmill", 20.0, flute_length=30.0, reach_mm=45.0, stickout_mm=45.0, num_flutes=4,
+                    catalog_id="EM20", physical_assembly={"owned": True})
+    with tool_inventory([mill], revision="outside-wide", strict=True):
+        result = Stock.rectangular(40, 30, 20).profile_cutout({"type": "rectangle", "length": 21, "width": 18}, depth=15,
+                                                             stepdown=5)
+    assert result.process_plan()["operations"][-1]["tool"]["catalog_id"] == "EM20"
+    assert Stock.rectangular(40, 30, 20).volume - result.volume == pytest.approx((40 * 30 - 21 * 18) * 15, rel=1e-4)
+
+
+def test_a_pocket_under_the_same_opening_of_an_upper_flange_cuts_only_its_own_wall():
+    # An 80 x 60 x 60 block (Z -30 to 30) with a 30 x 20 opening cut from the top down to Z -18: the lower 12 mm is
+    # the second flange (PT-002421). The material beside the outline is at the top, but inside it starts at -18.
+    from src.subcad.feature_depth import pocket_wall_start
+    block = cq.Workplane("XY").box(80, 60, 60).cut(cq.Workplane("XY").box(30, 20, 48).translate((0, 0, 6)))
+    points = [(-15, -10), (15, -10), (15, 10), (-15, 10)]
+    assert pocket_wall_start(block, ">Z", points, 60) == pytest.approx(48, abs=1e-6)
+    # A full block: the wall starts at the top.
+    assert pocket_wall_start(cq.Workplane("XY").box(80, 60, 60), ">Z", points, 60) == pytest.approx(0, abs=1e-6)

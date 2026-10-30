@@ -2942,6 +2942,8 @@ class ProfilePocketOp(PocketOp):
     """The reach that a tool needs (``feature_depth.PocketLocalReach``); None: the depth from the setup face."""
     # The insert cutters that may cut this profile (``tool_library.INSERT_CUTTER_TYPES``): none for a pocket.
     insert_cutters: ClassVar[tuple[str, ...]] = ()
+    # The cutter goes inside the outline (a pocket) or outside it (the outside profile).
+    outside: ClassVar[bool] = False
 
     def __post_init__(self):
         from .milling_replay import finite
@@ -2951,14 +2953,17 @@ class ProfilePocketOp(PocketOp):
         if self.rest_from_diameter is not None:
             finite(self.rest_from_diameter, "rest machining previous cutter diameter", positive=True)
         if self.tool is None:
-            maximum = pocket_tool_limit(self.profile, self.islands, finish_allowance=self.finish_allowance)
+            # A pocket limits the cutter by its opening; the outside profile cuts outside the outline, so only the
+            # caller's limit holds (the inside corners of the outline, rest machining, d2o#878).
+            maximum = None if self.outside else pocket_tool_limit(self.profile, self.islands, finish_allowance=self.finish_allowance)
             if self.max_tool_diameter is not None:
-                maximum = min(maximum, finite(self.max_tool_diameter, "maximum cutter diameter", positive=True))
+                limit = finite(self.max_tool_diameter, "maximum cutter diameter", positive=True)
+                maximum = limit if maximum is None else min(maximum, limit)
             self.tool, self.tool_selection = _select_inventory_tool(
                 ToolRequirement("flat_endmill", max_diameter_mm=maximum, min_flute_length_mm=self.depth - (self.wall_start_depth or 0.0),
                     min_reach_mm=self.depth, local_reach=self.local_reach, alternative_tool_types=self.insert_cutters,
                     feature="profile_pocket", reason="selected cutter for the profile opening and island clearances", prefer_largest=True),
-                ToolSpec("flat_endmill", maximum))
+                ToolSpec("flat_endmill", maximum or 10.0))
         self.feeds_speeds = get_feeds_speeds(_resolve_fs_tool_type(self.tool.tool_type), self.tool.diameter, self.material)
         self.position = None
         self.finish_op = None
@@ -3039,6 +3044,7 @@ class ProfileCutoutOp(ProfilePocketOp):
     through: bool = False
     # The outside profile is a 90° wall: an indexable end mill cuts it in passes.
     insert_cutters: ClassVar[tuple[str, ...]] = ("indexable_end_mill",)
+    outside: ClassVar[bool] = True
 
     def apply(self, shape):
         return self._apply_native_profile(shape, outside=True)

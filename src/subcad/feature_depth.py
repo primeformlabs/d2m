@@ -170,13 +170,59 @@ def _ledger_band_span(shape, plane, bounds, outer, inner):
     return bounds.zmax - min(top, bounds.zmax), bounds.zmax - max(bottom, bounds.zmin)
 
 
+def column_span(shape, face_selector: str, points) -> tuple[float, float] | None:
+    """(entry, far) depths below the setup face of the incoming material inside the closed outline ``points`` (setup
+    frame), from ``WALL_SKIN_MM`` inside it; None when the outline has no material."""
+    import cadquery as cq
+    from .milling_replay import _boolean
+    from .profile_milling import _setup_plane
+
+    plane, mirror = _setup_plane(face_selector)
+    local = plane.toLocalCoords(shape.val())
+    bounds = local.BoundingBox()
+    outline = [(float(x), float(y) * mirror) for x, y in points]
+    rings = _offset_rings(outline, -WALL_SKIN_MM) if len(outline) >= 3 else []
+    if not rings:
+        return None
+    inner = max(rings, key=_ring_area)
+    from . import layers as L
+    from .material_ledger import ATTRIBUTE, MaterialLedger, plane_frame
+    ledger = getattr(shape, ATTRIBUTE, None)
+    if isinstance(ledger, MaterialLedger):
+        try:
+            material = ledger.layered(plane_frame(plane), bounds.zmin, bounds.zmax)
+        except ValueError:
+            material = None
+        if material is not None:
+            region = L.to_paths([inner])
+            hits = [layer for layer in material.layers if L.area(L.intersection(layer.material, region)) >= BAND_MIN_AREA_MM2]
+            if not hits:
+                return None
+            top, bottom = max(layer.z_high for layer in hits), min(layer.z_low for layer in hits)
+            return bounds.zmax - min(top, bounds.zmax), bounds.zmax - max(bottom, bounds.zmin)
+    base = bounds.zmin - 1.0
+    try:
+        face = cq.Face.makeFromWires(cq.Wire.makePolygon([cq.Vector(x, y, base) for x, y in inner], close=True))
+        common = _boolean(local, [cq.Solid.extrudeLinear(face, cq.Vector(0, 0, bounds.zlen + 2.0))], "common")
+    except (ValueError, RuntimeError):
+        return None
+    if not common.isValid() or not common.Solids() or common.Volume() <= 1e-6:
+        return None
+    column = common.BoundingBox()
+    return bounds.zmax - min(column.zmax, bounds.zmax), bounds.zmax - max(column.zmin, bounds.zmin)
+
+
 def pocket_wall_start(shape, face_selector: str, points, depth: float) -> float | None:
-    """Where the wall of a pocket starts below the setup face: the top of the material just outside its outline
-    (``WALL_BAND_MM``). Above it the cutter cuts material with nothing beside it (the waste over a part level that
-    level roughing kept in the pocket column), so the flutes cut only the wall below it. None: no material beside
-    the outline, or no geometry."""
+    """Where the wall of a pocket starts below the setup face: the lower of the top of the material just outside its
+    outline (``WALL_BAND_MM``) and the top of the material inside it. Above the band top the cutter cuts material with
+    nothing beside it (the waste over a part level that level roughing kept in the pocket column); above the column top
+    it passes a finished wall of the same outline (the same through pocket in two flanges, d2o#878), so the flutes cut
+    only the wall below the lower one. None: no material beside the outline, or no geometry."""
     span = band_span(shape, face_selector, points, width=WALL_BAND_MM)
-    return None if span is None else min(span[0], depth)
+    if span is None:
+        return None
+    column = column_span(shape, face_selector, points)
+    return min(span[0] if column is None else max(span[0], column[0]), depth)
 
 
 class PocketLocalReach:
