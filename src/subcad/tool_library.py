@@ -134,6 +134,41 @@ class ToolSpec:
         )
 
 
+# =========================================================================
+#   Insert cutters (d2o#878)
+# =========================================================================
+
+# An insert cutter cuts with short insert edges: one pass cuts at most its ``flute_length`` (the largest depth of cut
+# of its inserts), and the body behind the inserts is not wider than the cut, so it follows the inserts down into the
+# cut. It cuts a wall in passes: the reach covers the depth, the inserts need not cover the wall. A solid end mill
+# cuts the whole wall with its flutes (d2o#878).
+#   indexable_end_mill: 90° shoulder inserts (APMT): facing, level roughing and the outside profile.
+#   high_feed_mill: shallow cuts with a large effective corner radius, which stays at a wall: facing only.
+#   face_mill: 45° inserts (SEKT), no 90° wall: facing only.
+INSERT_CUTTER_TYPES = ("indexable_end_mill", "high_feed_mill", "face_mill")
+# The cutters that leave a 90° wall: level roughing and wall profiles.
+WALL_CUTTER_TYPES = ("flat_endmill", "indexable_end_mill")
+
+
+def cuts_in_passes(tool) -> bool:
+    """True for an insert cutter (``INSERT_CUTTER_TYPES``)."""
+    return getattr(tool, "tool_type", None) in INSERT_CUTTER_TYPES
+
+
+def envelope_cutter(tool):
+    """The cutter that the material model sweeps: an insert cutter is a flat cylinder of its cutting diameter down to
+    its reach (inserts and body), and each of its passes cuts at most its insert depth (``max_stepdown_mm``).
+    Another tool is the tool itself."""
+    if not cuts_in_passes(tool):
+        return tool
+    from dataclasses import replace
+    reach = min(tool.stickout_mm, tool.reach_mm or tool.flute_length)
+    limits = dict(tool.safe_limits or {})
+    limits["max_stepdown_mm"] = min(float(limits.get("max_stepdown_mm", tool.flute_length)), tool.flute_length)
+    return replace(tool, tool_type="flat_endmill", corner_radius=0.0, flute_length=max(reach, tool.flute_length),
+                   safe_limits=limits)
+
+
 @dataclass
 class ToolAssembly:
     """Physical cutting tool assembly: cutter, shank, holder, and pocket."""

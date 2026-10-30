@@ -22,7 +22,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import math
-from typing import Any, Optional, Tuple
+from typing import Any, ClassVar, Optional, Tuple
 
 from .geometry import (
     face_mill_cut,
@@ -49,7 +49,7 @@ from .geometry import (
     press_brake_bend as apply_press_brake_bend,
 )
 from .profiles import normalize_profile_points, profile_span_yx
-from .tool_library import ToolSpec, ToolCatalog
+from .tool_library import INSERT_CUTTER_TYPES, ToolSpec, ToolCatalog, cuts_in_passes, envelope_cutter
 from .tool_selection import ToolRequirement, ToolSelectionResult, ToolUnavailableError, select_or_fallback, select_tool
 from .material import get_feeds_speeds
 from .toolpath import Toolpath, ToolpathMove
@@ -576,7 +576,7 @@ class FaceMillOp(MachiningOperation):
                     min_diameter_mm=10.0,
                     min_flute_length_mm=self.depth,
                     feature="face_mill",
-                    alternative_tool_types=("face_mill",),
+                    alternative_tool_types=INSERT_CUTTER_TYPES,
                     reason="prefer widest available tool for facing",
                     prefer_largest=True,
                 ),
@@ -601,9 +601,10 @@ class FaceMillOp(MachiningOperation):
         bounds = plane.toLocalCoords(shape.val()).BoundingBox()
         profile = {"type": "rectangle", "length": bounds.xlen, "width": bounds.ylen,
             "cx": (bounds.xmin + bounds.xmax) / 2, "cy": (bounds.ymin + bounds.ymax) / 2 * mirror}
-        if self.tool.tool_type not in {"flat_endmill", "face_mill"}:
-            raise ValueError("Native facing requires a flat end mill or a face mill cutting envelope.")
-        cutter = replace(self.tool, tool_type="flat_endmill", corner_radius=0) if self.tool.tool_type == "face_mill" else self.tool
+        if self.tool.tool_type not in {"flat_endmill", *INSERT_CUTTER_TYPES}:
+            raise ValueError("Native facing requires a flat end mill or an insert cutter (face, shoulder or high-feed mill).")
+        # An insert cutter faces with its envelope, each pass at most its insert depth (tool_library.envelope_cutter).
+        cutter = envelope_cutter(self.tool)
         if self.stepover is not None:
             stepover = finite(self.stepover, "facing stepover", positive=True)
             saved_maximum = (cutter.safe_limits or {}).get("max_stepover_mm")
@@ -613,7 +614,7 @@ class FaceMillOp(MachiningOperation):
                 "max_stepover_mm": stepover})
         result, self._face_toolpath, self._material_pass_states, self._pass_reports, self._target_comparison = run_profile_pocket(
             shape, profile, tool=cutter, depth=self.depth, face_selector=self.face_selector,
-            stepdown=min(self.tool.diameter / 2, 2), finish_allowance=0,
+            stepdown=min(self.tool.diameter / 2, 2, self.tool.flute_length if cuts_in_passes(self.tool) else 2), finish_allowance=0,
             feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds))
         self._face_toolpath.operation = "face_mill"
         self._face_toolpath.tool_type = self.tool.tool_type
@@ -640,11 +641,11 @@ class FaceMillOp(MachiningOperation):
             "material_passes": getattr(self, "_pass_reports", []),
             "operation_target_comparison": getattr(self, "_target_comparison", {}),
             "geometry_status": "requires_review",
-            "geometry_fidelity": "nominal_face_mill_envelope" if self.tool.tool_type == "face_mill" else "exact_cutter_sweep",
+            "geometry_fidelity": "nominal_face_mill_envelope" if cuts_in_passes(self.tool) else "exact_cutter_sweep",
             "achieved_tolerance_estimate_mm": None,
             "toolpath_status": "unverified",
             "review_reasons": ["The facing plan requires fixture, feed, spindle, and complete target verification."] +
-                (["The face mill uses its nominal cutting envelope. Insert geometry and runout require verification."] if self.tool.tool_type == "face_mill" else []),
+                (["The face mill uses its nominal cutting envelope. Insert geometry and runout require verification."] if cuts_in_passes(self.tool) else []),
         }
 
     def to_toolpath(self) -> Toolpath:
@@ -2907,6 +2908,8 @@ class ProfilePocketOp(PocketOp):
     wall_start_depth: Optional[float] = None
     local_reach: Any = field(default=None, repr=False, compare=False)
     """The reach that a tool needs (``feature_depth.PocketLocalReach``); None: the depth from the setup face."""
+    # The insert cutters that may cut this profile (``tool_library.INSERT_CUTTER_TYPES``): none for a pocket.
+    insert_cutters: ClassVar[tuple[str, ...]] = ()
 
     def __post_init__(self):
         from .milling_replay import finite
@@ -2921,7 +2924,7 @@ class ProfilePocketOp(PocketOp):
                 maximum = min(maximum, finite(self.max_tool_diameter, "maximum cutter diameter", positive=True))
             self.tool, self.tool_selection = _select_inventory_tool(
                 ToolRequirement("flat_endmill", max_diameter_mm=maximum, min_flute_length_mm=self.depth - (self.wall_start_depth or 0.0),
-                    min_reach_mm=self.depth, local_reach=self.local_reach,
+                    min_reach_mm=self.depth, local_reach=self.local_reach, alternative_tool_types=self.insert_cutters,
                     feature="profile_pocket", reason="selected cutter for the profile opening and island clearances", prefer_largest=True),
                 ToolSpec("flat_endmill", maximum))
         self.feeds_speeds = get_feeds_speeds(_resolve_fs_tool_type(self.tool.tool_type), self.tool.diameter, self.material)
@@ -2933,12 +2936,16 @@ class ProfilePocketOp(PocketOp):
 
     def _apply_native_profile(self, shape, *, outside=False):
         from .profile_pocket_milling import run_profile_pocket
+        if cuts_in_passes(self.tool) and self.tool.tool_type not in self.insert_cutters:
+            raise ValueError(f"This profile cannot be cut with a {self.tool.tool_type.replace('_', ' ')}.")
+        # An insert cutter cuts the wall in passes of its insert depth with its envelope (tool_library.envelope_cutter).
         result, self._pocket_toolpath, self._material_pass_states, self._pass_reports, self._target_comparison = run_profile_pocket(
-            shape, self.profile, tool=self.tool, depth=self.depth, islands=self.islands, through=self.through,
+            shape, self.profile, tool=envelope_cutter(self.tool), depth=self.depth, islands=self.islands, through=self.through,
             face_selector=self.face_selector, stepdown=self.stepdown, finish_allowance=self.finish_allowance,
             chord_error=self.chord_error, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds), outside=outside,
             rest_from_diameter=self.rest_from_diameter, wall_start_depth=self.wall_start_depth,
             reach_depth=getattr(self, "reach_depth", None))
+        self._pocket_toolpath.tool_type = self.tool.tool_type
         self._pocket_toolpath.metadata.update(tool=_tool_dict(self.tool), tool_selection=_tool_selection_dict(self.tool_selection),
             width_mm=self.width, length_mm=self.length)
         return result
@@ -2995,6 +3002,8 @@ class ProfileCutoutOp(ProfilePocketOp):
     """Arbitrary through/depth cutout operation."""
 
     through: bool = False
+    # The outside profile is a 90° wall: an indexable end mill cuts it in passes.
+    insert_cutters: ClassVar[tuple[str, ...]] = ("indexable_end_mill",)
 
     def apply(self, shape):
         return self._apply_native_profile(shape, outside=True)

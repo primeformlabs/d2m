@@ -204,6 +204,7 @@ class Stock:
         for _ in range(MAX_ROUGHING_TOOLS - 1):
             try:
                 smaller = select_tool(ToolRequirement("flat_endmill", max_diameter_mm=tool.diameter - 0.01,
+                                                      alternative_tool_types=("indexable_end_mill",),
                                                       min_reach_mm=reach, prefer_largest=True, feature="level_rough_rest",
                                                       local_reach=lambda candidate: probe.reach_for(candidate, reach)
                                                       if probe is not None else reach,

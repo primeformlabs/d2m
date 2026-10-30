@@ -288,8 +288,9 @@ def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=Non
     from .tool_selection import tool_reach
     import cadquery as cq
 
-    if tool is None or tool.tool_type != "flat_endmill":
-        raise ValueError("Level roughing requires a selected flat end mill.")
+    from .tool_library import WALL_CUTTER_TYPES, envelope_cutter
+    if tool is None or tool.tool_type not in WALL_CUTTER_TYPES:
+        raise ValueError("Level roughing requires a selected flat end mill or an indexable end mill (90° inserts).")
     radius = finite(tool.diameter, "cutter diameter", positive=True) / 2
     # ``reach``: the deepest level below the setup face; the tool reach is checked locally for each band below.
     reach = finite(reach, "level roughing reach", positive=True) if reach else tool_reach(tool)
@@ -327,7 +328,8 @@ def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=Non
     cross_setup = any(abs(sum(float(cut.frame[0][axis, 2]) * normal[axis] for axis in range(3))) < 1 - 1e-9
                       for cut in ledger.cuts)
     try:
-        replay = LayerReplay(local, bounds.zmax, [path.moves[1].position[2] for path in paths], tool,
+        # An insert cutter sweeps its envelope: the inserts and the body that follows them down (tool_library).
+        replay = LayerReplay(local, bounds.zmax, [path.moves[1].position[2] for path in paths], envelope_cutter(tool),
                              ledger=ledger, plane=plane, layer_brep=MaterialLedger.layer_brep(shape)
                              or (not milling_layers.PLAYER_BREP_STATES and cross_setup))
     except LayerCheckUnavailable as error:
@@ -468,6 +470,7 @@ def select_roughing_tool(shape, part_shape, face_selector: str, *, max_depth: Op
     for depth in depths:
         try:
             selection = select_tool(ToolRequirement("flat_endmill", min_reach_mm=depth, prefer_largest=True,
+                                                    alternative_tool_types=("indexable_end_mill",),
                                                     local_reach=lambda tool, depth=depth: probe.reach_for(tool, depth),
                                                     feature="level_rough",
                                                     reason="the end mill must reach the deepest level with waste above it"))
