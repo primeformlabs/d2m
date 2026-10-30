@@ -59,6 +59,8 @@ def finite(value: Any, name: str, *, positive: bool = False) -> float:
 def validate_cutter(tool, *, cutting_depth: float, cut_length: float | None = None) -> None:
     """``cutting_depth``: from the setup face to the deepest cut (``tool_selection.tool_reach``); ``cut_length``:
     the material height that the flutes cut (the default is the depth)."""
+    from .tool_library import envelope_cutter
+    tool = envelope_cutter(tool)
     if tool.tool_type not in {"flat_endmill", "ball_endmill"}:
         raise ValueError("Native surface replay requires a flat end mill or a ball end mill.")
     diameter = finite(tool.diameter, "cutter diameter", positive=True)

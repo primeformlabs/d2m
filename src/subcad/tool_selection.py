@@ -9,7 +9,7 @@ from copy import deepcopy
 import math
 from typing import Callable, Optional
 
-from .tool_library import ToolCatalog, ToolSpec
+from .tool_library import ToolCatalog, ToolSpec, cuts_in_passes
 
 
 @dataclass(frozen=True)
@@ -86,6 +86,9 @@ def validate_inventory_tool(tool: Optional[ToolSpec], *, depth: float = 0.0, cut
     if matching is None or matching.inventory_count <= 0 or matching.to_dict() != tool.to_dict():
         raise ValueError(f"Tool {tool.catalog_id or tool.tool_type} does not match the owned inventory snapshot.")
     cut = abs(depth) if cut_length is None else abs(cut_length)
+    if cuts_in_passes(tool):
+        # The operation cuts in passes of at most the insert depth (``tool_library.envelope_cutter``).
+        cut = min(cut, tool.flute_length)
     if cut > tool.flute_length + 1e-8 or abs(depth) > tool_reach(tool) + 1e-8:
         raise ValueError(f"Tool {tool.catalog_id} cannot reach the required cutting depth.")
 
@@ -198,7 +201,8 @@ def select_tool(requirement: ToolRequirement) -> ToolSelectionResult:
             and tool.diameter > requirement.max_diameter_mm
         ):
             reasons.append("diameter_too_large")
-        if requirement.min_flute_length_mm and tool.flute_length < requirement.min_flute_length_mm:
+        # An insert cutter cuts the material height in passes of its insert depth (``tool_library.cuts_in_passes``).
+        if requirement.min_flute_length_mm and tool.flute_length < requirement.min_flute_length_mm and not cuts_in_passes(tool):
             reasons.append("flute_length_too_short")
         if requirement.tip_angle_deg is not None and tool.tip_angle > 0 and abs(tool.tip_angle - requirement.tip_angle_deg) > 0.5:
             reasons.append("wrong_tip_angle")
