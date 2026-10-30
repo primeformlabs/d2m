@@ -2064,12 +2064,25 @@ class CountersinkOp(MachiningOperation):
     # ------------------------------------------------------------------
 
     def apply(self, shape):
+        # The setup plane and the top of the material around the hole: the toolpath is in the part frame (d2o#878).
+        from .feature_depth import material_span
+        from .profile_milling import _setup_plane
+        plane, mirror = _setup_plane(self.face_selector)
+        bounds = plane.toLocalCoords(shape.val()).BoundingBox()
+        span = material_span(shape, self.face_selector, cx=self.cx, cy=self.cy, radius=self.countersink_diameter / 2)
+        self._frame = (plane, mirror, bounds.zmax, bounds.zmax - (span[0] if span else 0.0))
         return countersink_cut(
             shape, self.cx, self.cy, self.diameter,
             self.countersink_diameter, self.depth,
             self.countersink_angle,
             face_selector=self.face_selector,
         )
+
+    def tip_depth(self) -> float:
+        """How deep the chamfer tip goes below the material top: its cone is the countersink diameter at the top."""
+        angle = self.tool.tip_angle if self.tool.tip_angle > 0 else self.countersink_angle
+        tip = min(self.tool.tip_diameter or 0.0, self.countersink_diameter)
+        return max((self.countersink_diameter - tip) / 2.0 / math.tan(math.radians(max(angle, 1.0) / 2.0)), 0.0)
 
     def to_dict(self) -> dict:
         return {
@@ -2103,6 +2116,25 @@ class CountersinkOp(MachiningOperation):
             },
         )
         feed = _feed_rate(self.feeds_speeds)
+        if getattr(self, "_frame", None) is not None:
+            # In the part frame (d2o#878): from the safe height of the setup down to the tip depth below the material
+            # top around the hole, as the drilling paths (drilling_replay).
+            from dataclasses import replace
+            plane, mirror, face, top = self._frame
+            safe = face + max(2.0, self.tool.radius)
+            tip = top - self.tip_depth()
+            local = Toolpath("countersink", safe_z=safe, tool_type=self.tool.tool_type, tool_diameter_mm=self.tool.diameter,
+                             feed_mm_min=feed, spindle_rpm=tp.spindle_rpm)
+            _move(local, "rapid", self.cx, self.cy * mirror, safe)
+            _move(local, "plunge", self.cx, self.cy * mirror, tip, feed=feed)
+            _move(local, "dwell", self.cx, self.cy * mirror, tip, dwell_seconds=0.2)
+            _move(local, "retract", self.cx, self.cy * mirror, safe)
+            tp.safe_z = safe
+            tp.moves = [replace(move, position=plane.toWorldCoords(move.position).toTuple()) for move in local.moves]
+            tp.metadata.update(coordinate_system="part_mm", tool_axis=list(plane.zDir.toTuple()),
+                               face_selector=self.face_selector, tip_depth_mm=round(self.tip_depth(), 6),
+                               material_top_mm=round(top, 6))
+            return tp
         _move(tp, "rapid", self.cx, self.cy, tp.safe_z)
         _move(tp, "plunge", self.cx, self.cy, -abs(sink_depth), feed=feed)
         _move(tp, "dwell", self.cx, self.cy, -abs(sink_depth), dwell_seconds=0.2)
@@ -2910,6 +2942,8 @@ class ProfilePocketOp(PocketOp):
     """The reach that a tool needs (``feature_depth.PocketLocalReach``); None: the depth from the setup face."""
     # The insert cutters that may cut this profile (``tool_library.INSERT_CUTTER_TYPES``): none for a pocket.
     insert_cutters: ClassVar[tuple[str, ...]] = ()
+    # The cutter goes inside the outline (a pocket) or outside it (the outside profile).
+    outside: ClassVar[bool] = False
 
     def __post_init__(self):
         from .milling_replay import finite
@@ -2919,14 +2953,17 @@ class ProfilePocketOp(PocketOp):
         if self.rest_from_diameter is not None:
             finite(self.rest_from_diameter, "rest machining previous cutter diameter", positive=True)
         if self.tool is None:
-            maximum = pocket_tool_limit(self.profile, self.islands, finish_allowance=self.finish_allowance)
+            # A pocket limits the cutter by its opening; the outside profile cuts outside the outline, so only the
+            # caller's limit holds (the inside corners of the outline, rest machining, d2o#878).
+            maximum = None if self.outside else pocket_tool_limit(self.profile, self.islands, finish_allowance=self.finish_allowance)
             if self.max_tool_diameter is not None:
-                maximum = min(maximum, finite(self.max_tool_diameter, "maximum cutter diameter", positive=True))
+                limit = finite(self.max_tool_diameter, "maximum cutter diameter", positive=True)
+                maximum = limit if maximum is None else min(maximum, limit)
             self.tool, self.tool_selection = _select_inventory_tool(
                 ToolRequirement("flat_endmill", max_diameter_mm=maximum, min_flute_length_mm=self.depth - (self.wall_start_depth or 0.0),
                     min_reach_mm=self.depth, local_reach=self.local_reach, alternative_tool_types=self.insert_cutters,
                     feature="profile_pocket", reason="selected cutter for the profile opening and island clearances", prefer_largest=True),
-                ToolSpec("flat_endmill", maximum))
+                ToolSpec("flat_endmill", maximum or 10.0))
         self.feeds_speeds = get_feeds_speeds(_resolve_fs_tool_type(self.tool.tool_type), self.tool.diameter, self.material)
         self.position = None
         self.finish_op = None
@@ -2941,7 +2978,10 @@ class ProfilePocketOp(PocketOp):
         # An insert cutter cuts the wall in passes of its insert depth with its envelope (tool_library.envelope_cutter).
         result, self._pocket_toolpath, self._material_pass_states, self._pass_reports, self._target_comparison = run_profile_pocket(
             shape, self.profile, tool=envelope_cutter(self.tool), depth=self.depth, islands=self.islands, through=self.through,
-            face_selector=self.face_selector, stepdown=self.stepdown, finish_allowance=self.finish_allowance,
+            # An insert cutter cuts the wall to size in each pass: one finishing pass at the full depth would put the
+            # body above its inserts on the allowance (d2o#878).
+            face_selector=self.face_selector, stepdown=self.stepdown,
+            finish_allowance=0.0 if cuts_in_passes(self.tool) else self.finish_allowance,
             chord_error=self.chord_error, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds), outside=outside,
             rest_from_diameter=self.rest_from_diameter, wall_start_depth=self.wall_start_depth,
             reach_depth=getattr(self, "reach_depth", None))
@@ -3004,6 +3044,7 @@ class ProfileCutoutOp(ProfilePocketOp):
     through: bool = False
     # The outside profile is a 90° wall: an indexable end mill cuts it in passes.
     insert_cutters: ClassVar[tuple[str, ...]] = ("indexable_end_mill",)
+    outside: ClassVar[bool] = True
 
     def apply(self, shape):
         return self._apply_native_profile(shape, outside=True)

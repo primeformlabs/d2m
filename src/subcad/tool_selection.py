@@ -55,6 +55,9 @@ class ToolUnavailableError(ValueError):
 # (milling_holding_solids.TOOL_DEFAULTS), never smaller than the cutter. The clearance keeps the holder off the material.
 ASSUMED_HOLDER_DIAMETER_MM = 50.0
 HOLDER_CLEARANCE_MM = 2.0
+# A flute length equal to the wall height covers it: the computed height can be a rounding error above the flute length
+# (a 20 mm wall from 20.00004 mm of depth, d2o#878).
+FLUTE_TOLERANCE_MM = 0.01
 
 
 def holder_radius(tool: ToolSpec) -> float:
@@ -89,7 +92,7 @@ def validate_inventory_tool(tool: Optional[ToolSpec], *, depth: float = 0.0, cut
     if cuts_in_passes(tool):
         # The operation cuts in passes of at most the insert depth (``tool_library.envelope_cutter``).
         cut = min(cut, tool.flute_length)
-    if cut > tool.flute_length + 1e-8 or abs(depth) > tool_reach(tool) + 1e-8:
+    if cut > tool.flute_length + FLUTE_TOLERANCE_MM or abs(depth) > tool_reach(tool) + 1e-8:
         raise ValueError(f"Tool {tool.catalog_id} cannot reach the required cutting depth.")
 
 
@@ -202,7 +205,8 @@ def select_tool(requirement: ToolRequirement) -> ToolSelectionResult:
         ):
             reasons.append("diameter_too_large")
         # An insert cutter cuts the material height in passes of its insert depth (``tool_library.cuts_in_passes``).
-        if requirement.min_flute_length_mm and tool.flute_length < requirement.min_flute_length_mm and not cuts_in_passes(tool):
+        if (requirement.min_flute_length_mm and tool.flute_length < requirement.min_flute_length_mm - FLUTE_TOLERANCE_MM
+                and not cuts_in_passes(tool)):
             reasons.append("flute_length_too_short")
         if requirement.tip_angle_deg is not None and tool.tip_angle > 0 and abs(tool.tip_angle - requirement.tip_angle_deg) > 0.5:
             reasons.append("wrong_tip_angle")

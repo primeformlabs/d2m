@@ -113,10 +113,16 @@ class LevelPlan:
 
     def reach_for(self, tool, depth: float | None = None) -> float:
         """The reach that the tool needs for the bands down to ``depth`` below the setup face (default: all)."""
-        from .tool_selection import HOLDER_CLEARANCE_MM, holder_radius
-        envelope = holder_radius(tool) + HOLDER_CLEARANCE_MM
+        envelope = holder_envelope(tool)
         bands = [band for band in self.bands if depth is None or self.face - band[0] <= depth + 1e-6]
         return max((self.band_reach(band, envelope) for band in bands), default=0.0)
+
+
+def holder_envelope(tool) -> float:
+    """How far the holder passes the edge of a band region: the cutter centre stays one cutter radius inside the region,
+    so the holder radius less the cutter radius, and the clearance (d2o#878; D2O ``local_reach_region``)."""
+    from .tool_selection import HOLDER_CLEARANCE_MM, holder_radius
+    return max(holder_radius(tool) - tool.diameter / 2, 0.0) + HOLDER_CLEARANCE_MM
 
 
 def keep_paths(profiles, face_selector: str):
@@ -304,8 +310,7 @@ def run_level_roughing(shape, part_shape, *, tool, face_selector=">Z", reach=Non
     bounds = local.val().BoundingBox()
     plan = level_plan(shape, part_shape, face_selector, radius=radius, reach=reach, keep=keep, layers=layers,
                       previous=previous)
-    from .tool_selection import HOLDER_CLEARANCE_MM, holder_radius
-    envelope = holder_radius(tool) + HOLDER_CLEARANCE_MM
+    envelope = holder_envelope(tool)
     # A band whose local reach is more than the tool reach stays for another cutter.
     plan.bands = [band for band in plan.bands if plan.band_reach(band, envelope) <= tool_reach(tool) + 1e-6]
     safe = bounds.zmax + max(2, radius)
