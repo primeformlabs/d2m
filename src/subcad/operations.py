@@ -2973,7 +2973,10 @@ class ProfilePocketOp(PocketOp):
         # An insert cutter cuts the wall in passes of its insert depth with its envelope (tool_library.envelope_cutter).
         result, self._pocket_toolpath, self._material_pass_states, self._pass_reports, self._target_comparison = run_profile_pocket(
             shape, self.profile, tool=envelope_cutter(self.tool), depth=self.depth, islands=self.islands, through=self.through,
-            face_selector=self.face_selector, stepdown=self.stepdown, finish_allowance=self.finish_allowance,
+            # An insert cutter cuts the wall to size in each pass: one finishing pass at the full depth would put the
+            # body above its inserts on the allowance (d2o#878).
+            face_selector=self.face_selector, stepdown=self.stepdown,
+            finish_allowance=0.0 if cuts_in_passes(self.tool) else self.finish_allowance,
             chord_error=self.chord_error, feed=_feed_rate(self.feeds_speeds), rpm=_spindle_rpm(self.feeds_speeds), outside=outside,
             rest_from_diameter=self.rest_from_diameter, wall_start_depth=self.wall_start_depth,
             reach_depth=getattr(self, "reach_depth", None))

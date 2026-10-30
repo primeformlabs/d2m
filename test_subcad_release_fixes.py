@@ -42,3 +42,21 @@ def test_a_flute_length_equal_to_the_wall_cuts_it():
         result = Stock.rectangular(60, 40, 30).profile_pocket({"type": "rectangle", "length": 20, "width": 12}, 20.00004,
                                                                stepdown=5)
     assert result.process_plan()["operations"][-1]["tool"]["catalog_id"] == "EM08"
+
+
+def test_an_insert_cutter_cuts_the_outside_wall_to_size_at_each_level():
+    # Ø12 cutter, 40 x 20 outline: at the wall the cutter centre is 6 mm from the outline. A 10 mm insert cuts a 25 mm
+    # wall in passes; each pass must reach the wall, not leave an allowance for one finishing pass at the bottom.
+    tool = ToolSpec("indexable_end_mill", 12.0, flute_length=10.0, reach_mm=45.0, stickout_mm=45.0, num_flutes=2,
+                    catalog_id="IEM12", physical_assembly={"owned": True})
+    with tool_inventory([tool], revision="insert-wall", strict=True):
+        result = Stock.rectangular(60, 40, 30).profile_cutout({"type": "rectangle", "length": 40, "width": 20}, depth=25,
+                                                             stepdown=10)
+    moves = [move for move in result.process_plan()["operations"][-1]["toolpath"]["moves"] if move["type"] == "feed"]
+    levels: dict[float, float] = {}
+    for move in moves:
+        x, y, z = move["position"]
+        gap = math.hypot(max(abs(x) - 20.0, 0.0), max(abs(y) - 10.0, 0.0))
+        levels[round(z, 4)] = min(levels.get(round(z, 4), math.inf), gap)
+    assert len(levels) >= 3
+    assert all(value == pytest.approx(6.0, abs=1e-6) for value in levels.values())
